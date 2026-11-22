@@ -201,13 +201,17 @@ Any OpenAI SDK client works by pointing `base_url` at `http://127.0.0.1:8080/v1`
 
 ## HTTP Endpoints & Prometheus Metrics
 
+Both `/v1/*` and root OpenAI aliases (`/models`, `/chat/completions`, `/completions`) are served so clients that append either `/v1/...` or `/models` directly work out of the box:
+
 | Endpoint | Method | Description |
 | --- | --- | --- |
 | `/health` | `GET` | JSON readiness check (`status`, `model`, `max_context`) |
-| `/v1/models` | `GET` | OpenAI model list |
-| `/v1/chat/completions` | `POST` | OpenAI chat completions (`stream: false` and SSE `stream: true`) with exact prefix KV reuse and per-request `usage` + `timings` |
-| `/v1/completions` | `POST` | Raw prompt completion (`stream: false` and SSE `stream: true`) |
+| `/v1/models`, `/models` | `GET` | OpenAI model list (includes `context_length`) |
+| `/v1/chat/completions`, `/chat/completions` | `POST` | OpenAI chat completions (`stream: false` and SSE `stream: true`) with exact prefix KV reuse, `reasoning_content`, OpenAI `tools`/`tool_choice`/`tool_calls`, and per-request `usage` + `timings` |
+| `/v1/completions`, `/completions` | `POST` | Raw prompt completion (`stream: false` and SSE `stream: true`) |
 | `/metrics` | `GET` | Prometheus text exposition format |
+
+Tool calling (`tools`, `tool_choice`: `"auto"` | `"none"` | `"required"` | `{"type":"function","function":{"name":"..."}}`, and multi-turn `tool` role responses) is natively formatted and parsed for both **GLM-5.3-Flash** (`<tool_call>...<arg_key>...<arg_value>...`) and **Inkling-2-Mini** (`<|content_invoke_tool_json|>`).
 
 Exported `/metrics` series:
 - `ampllm_requests_total`, `ampllm_tokens_prefilled_total`, `ampllm_tokens_generated_total`, `ampllm_prefix_reuse_tokens_total`

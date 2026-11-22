@@ -267,6 +267,17 @@ impl BpeTokenizer {
     }
 
     pub fn decode(&self, ids: &[u32], skip_special: bool) -> String {
+        self.decode_with(ids, skip_special, !skip_special)
+    }
+
+    /// Decode token IDs skipping only `token_type == 3` (`CONTROL`) while preserving
+    /// `token_type == 4` (`USER_DEFINED` tags such as `<think>`, `</think>`, `<tool_call>`,
+    /// `<arg_key>`, and `<arg_value>`).
+    pub fn decode_skip_control(&self, ids: &[u32]) -> String {
+        self.decode_with(ids, true, true)
+    }
+
+    fn decode_with(&self, ids: &[u32], skip_control: bool, keep_user_defined: bool) -> String {
         let mut raw_bytes = Vec::new();
         let mut out = String::new();
         let flush_bytes = |bytes: &mut Vec<u8>, s: &mut String| {
@@ -283,7 +294,12 @@ impl BpeTokenizer {
             let ttype = self.token_types[idx];
             if ttype == 3 || ttype == 4 {
                 flush_bytes(&mut raw_bytes, &mut out);
-                if !skip_special {
+                let keep = if ttype == 3 {
+                    !skip_control
+                } else {
+                    keep_user_defined
+                };
+                if keep {
                     out.push_str(&self.vocab[idx]);
                 }
                 continue;
