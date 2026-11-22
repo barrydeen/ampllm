@@ -1,0 +1,12 @@
+[package]
+name = "ampllm-cpu-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ampllm-gguf = { path = "../gguf" }
+anyhow.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+libc.workspace = true

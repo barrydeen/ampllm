@@ -1,0 +1,13 @@
+[package]
+name = "ampllm-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ampllm-cuda-kernels = { path = "../cuda-kernels" }
+ampllm-gguf = { path = "../gguf" }
+anyhow.workspace = true
+bytemuck.workspace = true
+serde.workspace = true
+serde_json.workspace = true

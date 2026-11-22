@@ -1,0 +1,17 @@
+[package]
+name = "ampllm-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ampllm-cache = { path = "../cache" }
+ampllm-cpu-kernels = { path = "../cpu-kernels" }
+ampllm-cuda-kernels = { path = "../cuda-kernels" }
+ampllm-gguf = { path = "../gguf" }
+ampllm-tokenizer = { path = "../tokenizer" }
+anyhow.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+libc.workspace = true
+tracing.workspace = true

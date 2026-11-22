@@ -1,0 +1,9 @@
+target/
+*.log
+*.prof
+*.bin
+*.gguf
+.DS_Store
+*.swp
+*.swo
+!.gitignore

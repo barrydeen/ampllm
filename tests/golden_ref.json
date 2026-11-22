@@ -1,0 +1,20 @@
+{
+  "model": "Inkling-2-Mini-IQ4_NL.gguf",
+  "n_vocab_unpadded": 200058,
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "input_tokens": [371, 151451, 149879, 151194, 149884],
+      "generated_tokens": [152717, 13, 68014, 32, 13, 161721, 198, 33, 13, 150287, 3310, 198, 34, 13, 164357, 198, 35, 13, 150287, 3310, 12, 41404, 68014, 3269, 150039, 150893, 25, 198, 1377, 220, 1377, 220],
+      "step0_top5": [{"id": 152717, "logit": 27.299994}, {"id": 149881, "logit": 25.833706}, {"id": 167815, "logit": 25.808619}, {"id": 149876, "logit": 25.667036}, {"id": 145038, "logit": 25.456709}],
+      "generated_text": " Paris.\n\nA. Simple\nB. Compound\nC. Complex\nD. Compound-Complex\n\nSelect your answer:\n    "
+    },
+    {
+      "prompt": "Write a Rust function to compute fibonacci:",
+      "input_tokens": [3711, 149878, 179358, 150131, 149882, 155262, 220, 46389, 25],
+      "generated_tokens": [68014, 68790, 198, 3446, 220, 46389, 7, 77, 25, 150021, 68341, 8, 197005, 150021, 68341, 196983, 198, 149862, 197034, 150039, 150406, 150522, 198, 92, 198, 68790, 68014, 371, 150131, 150201, 150583, 149876],
+      "step0_top5": [{"id": 68014, "logit": 27.359331}, {"id": 220, "logit": 25.714598}, {"id": 198, "logit": 25.235769}, {"id": 149934, "logit": 24.927534}, {"id": 68019, "logit": 24.853073}],
+      "generated_text": "\n\n```\nfn fibonacci(n: u32) -> u32 {\n    // your code here\n}\n```\n\nThe function should return the"
+    }
+  ]
+}

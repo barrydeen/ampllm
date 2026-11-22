@@ -1,0 +1,10 @@
+[package]
+name = "ampllm-tokenizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ampllm-gguf = { path = "../gguf" }
+anyhow.workspace = true
+fancy-regex.workspace = true

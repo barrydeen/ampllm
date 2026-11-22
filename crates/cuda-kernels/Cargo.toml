@@ -1,0 +1,15 @@
+[package]
+name = "ampllm-cuda-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ampllm-gguf = { path = "../gguf" }
+anyhow.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+bytemuck.workspace = true
+half.workspace = true

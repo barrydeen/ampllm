@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gguf",
+    "crates/tokenizer",
+    "crates/cuda-kernels",
+    "crates/cpu-kernels",
+    "crates/cache",
+    "crates/engine",
+    "crates/server",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pure Rust + CUDA MoE LLM inference engine for Inkling-2-Mini and GLM-5.3-Flash"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+memmap2 = "0.9"
+half = "2.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+fancy-regex = "0.14"
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytemuck = { version = "1", features = ["derive"] }
