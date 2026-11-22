@@ -16,6 +16,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Pure Rust + CUDA MoE LLM inference engine for Inkling-2-Mini and GLM-5.3-Flash"
+repository = "https://github.com/barrydeen/ampllm"
 
 [workspace.dependencies]
 anyhow = "1"

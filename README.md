@@ -31,7 +31,7 @@ Pure Rust + custom CUDA (`sm_86`) + AVX-512/AVX2 Mixture-of-Experts (MoE) infere
 ### Build & Test
 
 ```bash
-git clone <your-repo-url> ampllm
+git clone https://github.com/barrydeen/ampllm.git
 cd ampllm
 
 # Standard release build
