@@ -15,7 +15,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Pure Rust + CUDA MoE LLM inference engine for Inkling-2-Mini, GLM-5.3-Flash, and Hy4-Flash"
+description = "AmpLLM: Pure Rust + CUDA (sm_86) MoE LLM inference engine built for NVIDIA RTX 30-series GPUs"
 repository = "https://github.com/barrydeen/ampllm"
 
 [workspace.dependencies]

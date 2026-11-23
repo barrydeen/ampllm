@@ -1,8 +1,8 @@
-# ampllm
+# AmpLLM
 
 Pure Rust + custom CUDA (`sm_86`) + AVX-512/AVX2 Mixture-of-Experts (MoE) inference engine **built specifically for the NVIDIA RTX 30-series (Ampere `sm_86`) GPU generation** paired with DDR4/DDR5 host RAM and x86-64 CPUs.
 
-Designed for consumer and workstation Ampere GPUs — **RTX 3090 / 3090 Ti (24 GB)**, **RTX 3080 Ti / 3080 (10–12 GB)**, **RTX 3070 / 3070 Ti (8 GB)**, and **RTX 3060 (12 GB)** (plus RTX A6000 / A40 / A10) — `ampllm` combines custom Tensor-Core MMQ/GEMV kernels with physical-core CPU MoE offloading so frontier 100B–300B+ MoE models run comfortably on 1× or 2× RTX 30-series cards even without NVLink (`cudaDeviceCanAccessPeer == 0`).
+Designed for consumer and workstation Ampere GPUs — **RTX 3090 / 3090 Ti (24 GB)**, **RTX 3080 Ti / 3080 (10–12 GB)**, **RTX 3070 / 3070 Ti (8 GB)**, and **RTX 3060 (12 GB)** (plus RTX A6000 / A40 / A10) — **AmpLLM** combines custom Tensor-Core MMQ/GEMV kernels with physical-core CPU MoE offloading so frontier 100B–300B+ MoE models run comfortably on 1× or 2× RTX 30-series cards even without NVLink (`cudaDeviceCanAccessPeer == 0`).
 
 **Highlights:**
 - **Zero cuBLAS & zero Python runtime dependencies:** standalone `nvcc` kernels compiled for `sm_86`, orchestrated from Rust over mapped pinned host RAM and lock-free system-scope doorbells.
@@ -13,7 +13,7 @@ Designed for consumer and workstation Ampere GPUs — **RTX 3090 / 3090 Ti (24 G
 
 ## Supported Models & Hugging Face GGUF Links
 
-> **Scope:** `ampllm` is an **architecture-specialized engine** (not a generic llama.cpp wrapper). Only the 5 MoE architectures below are supported — unrelated GGUF architectures (Llama, dense Qwen2/3, Mistral, Gemma, DeepSeek) will be rejected cleanly at load time.
+> **Scope:** **AmpLLM** is an **architecture-specialized engine** (not a generic llama.cpp wrapper). Only the 5 MoE architectures below are supported — unrelated GGUF architectures (Llama, dense Qwen2/3, Mistral, Gemma, DeepSeek) will be rejected cleanly at load time.
 
 | Model | GGUF `general.architecture` | Recommended Hugging Face GGUF Repos | GPUs & CPU ISA | Supported GGUF Weight Quants | Key Engine Features |
 | --- | --- | --- | --- | --- | --- |
@@ -33,7 +33,7 @@ Designed for consumer and workstation Ampere GPUs — **RTX 3090 / 3090 Ti (24 G
 
 ## Recommended Quant Size by VRAM + Host RAM (RTX 30-Series Guide)
 
-In `ampllm`, **non-expert layers, KV cache, and as many hot MoE experts as fit live in RTX 30-series VRAM**, while remaining cold experts stay pinned/staged in **host RAM** (and massive static embedding tables like Hy4's `59.0 GiB` Engram and Qwen3.8's `26.8 GiB` PLE shard stay **zero-copy disk-mmap'd**, consuming only hot OS page cache). When running multiple subagents (`--parallel 4`), paused slot snapshots use host RAM (capped by `AMPLLM_SLOT_CACHE_MB`, default `8192` MiB), leaving **0 MiB stolen from VRAM**.
+In **AmpLLM**, **non-expert layers, KV cache, and as many hot MoE experts as fit live in RTX 30-series VRAM**, while remaining cold experts stay pinned/staged in **host RAM** (and massive static embedding tables like Hy4's `59.0 GiB` Engram and Qwen3.8's `26.8 GiB` PLE shard stay **zero-copy disk-mmap'd**, consuming only hot OS page cache). When running multiple subagents (`--parallel 4`), paused slot snapshots use host RAM (capped by `AMPLLM_SLOT_CACHE_MB`, default `8192` MiB), leaving **0 MiB stolen from VRAM**.
 
 | Hardware Tier (RTX 30-Series + System RAM) | Inkling-2-Mini | Qwen3.8-Flash-Next *(Unsloth GGUF)* | Hy4-Flash | GLM-5.3-Flash | MiniMax M3.1 Flash |
 | --- | --- | --- | --- | --- | --- |
@@ -320,7 +320,7 @@ Configured with `max_ctx=16384` across 2× RTX 3090 pipeline (`dspark` Markov sp
 - [`crates/cache`](crates/cache): Mapped pinned host arenas, VRAM expert LRU/LFU cache planning, and `CacheProfile` / `STRP` v1 persistence.
 - [`crates/engine`](crates/engine): Unified `AnyEngine` backends (`Inkling2Engine`, `Glm5Engine`, `Hy4Engine`, `Qwen4Engine`, `Mm3Engine`), `SequenceSnapshot` host-RAM state pooling ([`snapshot.rs`](crates/engine/src/snapshot.rs)), and speculative MTP/DSpark sampling.
 - [`crates/server`](crates/server): `axum` OpenAI-compatible HTTP/SSE multimodal & tool-calling server, multi-slot round-robin `SlotScheduler` ([`scheduler.rs`](crates/server/src/scheduler.rs)), image preprocessing ([`vision.rs`](crates/server/src/vision.rs)), and Prometheus `/metrics`.
-- [`crates/cli`](crates/cli): `ampllm` CLI (`inspect`, `tokenize`, `verify`, `run`, `serve`).
+- [`crates/cli`](crates/cli): AmpLLM CLI (`ampllm` binary: `inspect`, `tokenize`, `verify`, `run`, `serve`).
 - [`docs/INKLING2_SPEC.md`](docs/INKLING2_SPEC.md): Exact Inkling-2-Mini GGUF tensor and forward-pass specification.
 
 ---
