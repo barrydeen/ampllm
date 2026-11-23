@@ -19,6 +19,10 @@ use crate::sampling::{
     build_top_p_probs, leviathan_verify_sample, sample_from_probs, sample_next_token,
     SamplingParams,
 };
+use crate::snapshot::{
+    d2h_full, d2h_prefix, h2d_bytes, EngineSnapshotData, Glm5DsaSnap, Glm5KdaSnap, Glm5Snapshot,
+    QuantumGenerateResult, QuantumOptions, SequenceSnapshot,
+};
 use ampllm_cache::{CacheProfile, CacheStats};
 use ampllm_cpu_kernels::CpuThreadPool;
 use ampllm_cuda_kernels::set_device;
@@ -129,6 +133,198 @@ impl Glm5Engine {
         )?;
         self.state.expert_cache.on_new_prompt();
         self.state.reset()
+    }
+
+    pub fn capture_snapshot(&mut self, has_images: bool) -> Result<SequenceSnapshot> {
+        {
+            let db0 = &mut self.state.doorbell.db0.as_mut_slice()[0];
+            let db1 = &mut self.state.doorbell.db1.as_mut_slice()[0];
+            self.state.expert_cache.drain_all(
+                &self.weights,
+                &self.weights.cold_arena,
+                &self.state.sc0.stream,
+                &self.state.sc1.stream,
+                db0,
+                db1,
+            )?;
+        }
+        set_device(0)?;
+        self.state.sc0.stream.sync()?;
+        self.state.sc0.pf_stream.sync()?;
+        self.state.sc0.d2h_stream.sync()?;
+        set_device(1)?;
+        self.state.sc1.stream.sync()?;
+        self.state.sc1.pf_stream.sync()?;
+        self.state.sc1.d2h_stream.sync()?;
+
+        let pos = self.state.cur_pos;
+        anyhow::ensure!(
+            self.committed_tokens.len() == pos,
+            "Glm5 snapshot invariant violated: committed={} != pos={pos}",
+            self.committed_tokens.len()
+        );
+        let cfg = &self.weights.cfg;
+        let lat_stride = cfg.kv_lora_rank + cfg.kv_lora_rank / 16;
+        let res_rows = pos.min(self.weights.dsa_res_cap);
+        let dsa_blocks = (pos / 4) + 1;
+        let mut byte_len = 0usize;
+
+        let head_x_row0 = if self.state.head_x_pos.is_some() {
+            let b = d2h_prefix(&self.state.head_x, cfg.n_embd * 4)?;
+            byte_len += b.len();
+            Some(b)
+        } else {
+            None
+        };
+
+        let mut kda = Vec::with_capacity(self.state.kda.len());
+        for k_opt in &self.state.kda {
+            match k_opt {
+                Some(k) => {
+                    let s_mat = d2h_full(&k.s_mat)?;
+                    let conv_q = d2h_full(&k.conv_q)?;
+                    let conv_k = d2h_full(&k.conv_k)?;
+                    let conv_v = d2h_full(&k.conv_v)?;
+                    byte_len += s_mat.len() + conv_q.len() + conv_k.len() + conv_v.len();
+                    kda.push(Some(Glm5KdaSnap {
+                        s_mat,
+                        conv_q,
+                        conv_k,
+                        conv_v,
+                    }));
+                }
+                None => kda.push(None),
+            }
+        }
+
+        let mut dsa = Vec::with_capacity(self.state.dsa.len());
+        for d_opt in &self.state.dsa {
+            match d_opt {
+                Some(d) => {
+                    let vram_lat8 = d2h_prefix(&d.vram_lat8, res_rows * lat_stride)?;
+                    let ram_lat8_tail = if let Some(ref rl) = d.ram_lat8 {
+                        if pos > self.weights.dsa_res_cap {
+                            let s0 = self.weights.dsa_res_cap * lat_stride;
+                            let s1 = pos * lat_stride;
+                            rl.as_slice()[s0..s1].to_vec()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let ik_ring = d2h_full(&d.ik_ring)?;
+                    let ig_ring = d2h_full(&d.ig_ring)?;
+                    let pooled_f16 = d2h_prefix(&d.pooled_f16, dsa_blocks * cfg.idx_key_dim * 2)?;
+                    byte_len += vram_lat8.len()
+                        + ram_lat8_tail.len()
+                        + ik_ring.len()
+                        + ig_ring.len()
+                        + pooled_f16.len();
+                    dsa.push(Some(Glm5DsaSnap {
+                        vram_lat8,
+                        ram_lat8_tail,
+                        ik_ring,
+                        ig_ring,
+                        pooled_f16,
+                    }));
+                }
+                None => dsa.push(None),
+            }
+        }
+
+        Ok(SequenceSnapshot {
+            tokens: self.committed_tokens.clone(),
+            has_images,
+            allow_lcp_truncate: false,
+            max_safe_rollback_delta: None,
+            rollback_align: 1,
+            byte_len,
+            inner: EngineSnapshotData::Glm5(Glm5Snapshot {
+                head_x_pos: self.state.head_x_pos,
+                mtp_cached_pos: self.state.mtp_cached_pos,
+                head_x_row0,
+                kda,
+                dsa,
+            }),
+        })
+    }
+
+    pub fn restore_snapshot(
+        &mut self,
+        snap: &SequenceSnapshot,
+        _truncate_to: Option<usize>,
+    ) -> Result<()> {
+        let EngineSnapshotData::Glm5(ref gs) = snap.inner else {
+            anyhow::bail!("expected Glm5 snapshot");
+        };
+        {
+            let db0 = &mut self.state.doorbell.db0.as_mut_slice()[0];
+            let db1 = &mut self.state.doorbell.db1.as_mut_slice()[0];
+            self.state.expert_cache.drain_all(
+                &self.weights,
+                &self.weights.cold_arena,
+                &self.state.sc0.stream,
+                &self.state.sc1.stream,
+                db0,
+                db1,
+            )?;
+        }
+        set_device(0)?;
+        self.state.sc0.stream.sync()?;
+        self.state.sc0.pf_stream.sync()?;
+        self.state.sc0.d2h_stream.sync()?;
+        self.state.sc0.skip_flag_dev.zero()?;
+        set_device(1)?;
+        self.state.sc1.stream.sync()?;
+        self.state.sc1.pf_stream.sync()?;
+        self.state.sc1.d2h_stream.sync()?;
+        self.state.sc1.skip_flag_dev.zero()?;
+
+        {
+            let db0 = &mut self.state.doorbell.db0.as_mut_slice()[0];
+            db0.cancel_flag = 0;
+        }
+        {
+            let db1 = &mut self.state.doorbell.db1.as_mut_slice()[0];
+            db1.cancel_flag = 0;
+        }
+
+        if let Some(ref hx) = gs.head_x_row0 {
+            h2d_bytes(&self.state.head_x, hx)?;
+        }
+        for (dst_opt, src_opt) in self.state.kda.iter().zip(gs.kda.iter()) {
+            if let (Some(dst), Some(src)) = (dst_opt, src_opt) {
+                h2d_bytes(&dst.s_mat, &src.s_mat)?;
+                h2d_bytes(&dst.conv_q, &src.conv_q)?;
+                h2d_bytes(&dst.conv_k, &src.conv_k)?;
+                h2d_bytes(&dst.conv_v, &src.conv_v)?;
+            }
+        }
+        let cfg = &self.weights.cfg;
+        let lat_stride = cfg.kv_lora_rank + cfg.kv_lora_rank / 16;
+        for (dst_opt, src_opt) in self.state.dsa.iter_mut().zip(gs.dsa.iter()) {
+            if let (Some(dst), Some(src)) = (dst_opt, src_opt) {
+                h2d_bytes(&dst.vram_lat8, &src.vram_lat8)?;
+                if let Some(ref mut rl) = dst.ram_lat8 {
+                    if !src.ram_lat8_tail.is_empty() {
+                        let s0 = self.weights.dsa_res_cap * lat_stride;
+                        let s1 = s0 + src.ram_lat8_tail.len();
+                        rl.as_mut_slice()[s0..s1].copy_from_slice(&src.ram_lat8_tail);
+                    }
+                }
+                h2d_bytes(&dst.ik_ring, &src.ik_ring)?;
+                h2d_bytes(&dst.ig_ring, &src.ig_ring)?;
+                h2d_bytes(&dst.pooled_f16, &src.pooled_f16)?;
+            }
+        }
+
+        self.state.cur_pos = snap.tokens.len();
+        self.state.head_x_pos = gs.head_x_pos;
+        self.state.mtp_cached_pos = gs.mtp_cached_pos;
+        self.committed_tokens.clear();
+        self.committed_tokens.extend_from_slice(&snap.tokens);
+        Ok(())
     }
 
     pub fn cache_stats(&self) -> CacheStats {
@@ -349,8 +545,28 @@ impl Glm5Engine {
         &mut self,
         prompt_tokens: &[u32],
         params: &SamplingParams,
-        mut on_token: F,
+        on_token: F,
     ) -> Result<StreamGenerateResult>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        let mut no_yield = |_: usize| false;
+        let qres = self.generate_stream_quantum(
+            prompt_tokens,
+            params,
+            QuantumOptions::no_yield(&mut no_yield),
+            on_token,
+        )?;
+        Ok(qres.result)
+    }
+
+    pub fn generate_stream_quantum<F>(
+        &mut self,
+        prompt_tokens: &[u32],
+        params: &SamplingParams,
+        opts: QuantumOptions<'_>,
+        mut on_token: F,
+    ) -> Result<QuantumGenerateResult>
     where
         F: FnMut(u32) -> bool,
     {
@@ -359,6 +575,7 @@ impl Glm5Engine {
         }
 
         let reused = if !self.committed_tokens.is_empty()
+            && self.committed_tokens.len() == self.state.cur_pos
             && prompt_tokens.len() > self.committed_tokens.len()
             && prompt_tokens.starts_with(&self.committed_tokens)
         {
@@ -369,29 +586,41 @@ impl Glm5Engine {
             }
             0
         };
-        if reused > 0 {
+        if reused > 0 && !opts.resume_active {
             self.prefix_reuse_tokens_total += reused as u64;
         }
 
         let suffix = &prompt_tokens[reused..];
         let need_logits = params.temperature > 0.0;
         let mut rng = params.seed.max(1);
+        let resuming_decode = opts.resume_active && reused > 0 && suffix.len() == 1;
 
-        let t0 = Instant::now();
-        let (greedy_first, logits_opt) = self.prefill_slice(suffix, need_logits)?;
-        let prefill_s = t0.elapsed().as_secs_f64();
-        // Activate doorbell busy-spinners only after prefill completes so CPU cores stay free for prefill.
-        let _active_guard = DoorbellActiveGuard::new(&self.state.doorbell.active);
-
-        let first_tok = if let Some(ref logits) = logits_opt {
-            sample_next_token(logits, params, &mut rng)
+        let (first_tok, prompt_tokens_evaluated, prefill_s, prefill_snapshot) = if resuming_decode {
+            (suffix[0], 0usize, 0.0f64, None)
         } else {
-            greedy_first
+            let t0 = Instant::now();
+            let (greedy_first, logits_opt) = self.prefill_slice(suffix, need_logits)?;
+            let prefill_s = t0.elapsed().as_secs_f64();
+            let first_tok = if let Some(ref logits) = logits_opt {
+                sample_next_token(logits, params, &mut rng)
+            } else {
+                greedy_first
+            };
+            let prefill_snapshot = if opts.capture_prefill_snap {
+                Some(self.capture_snapshot(false)?)
+            } else {
+                None
+            };
+            (first_tok, suffix.len(), prefill_s, prefill_snapshot)
         };
+
+        // Activate doorbell busy-spinners only after prefill (and any prefill snapshot) complete so CPU cores stay free.
+        let _active_guard = DoorbellActiveGuard::new(&self.state.doorbell.active);
 
         let mut generated = Vec::new();
         let mut draft_n = 0usize;
         let mut draft_accepted = 0usize;
+        let mut yielded = false;
         let t_dec = Instant::now();
         let prof = std::env::var_os("AMPLLM_PROFILE").is_some();
         let mut g0_ns = 0u128;
@@ -442,14 +671,26 @@ impl Glm5Engine {
             .map(|v| v != "0")
             .unwrap_or(verify_m >= 3);
 
-        if params.max_tokens > 0 && !params.stop_token_ids.contains(&first_tok) {
+        let enter_decode = if resuming_decode {
+            params.max_tokens > 0
+        } else if params.max_tokens > 0 && !params.stop_token_ids.contains(&first_tok) {
             generated.push(first_tok);
             let keep = on_token(first_tok);
-            if keep && generated.len() < params.max_tokens {
+            keep && generated.len() < params.max_tokens
+        } else {
+            false
+        };
+
+        if enter_decode {
+            {
                 let use_graph = self.use_cuda_graph && self.state.phase_prof.is_none();
                 if !self.use_spec || mtp_l_opt.is_none() {
                     let mut cur_tok = first_tok;
                     while generated.len() < params.max_tokens {
+                        if (opts.should_yield)(generated.len()) {
+                            yielded = true;
+                            break;
+                        }
                         let ts = Instant::now();
                         let pos = self.state.cur_pos;
                         run_gpu0_half_m1(
@@ -545,6 +786,10 @@ impl Glm5Engine {
                     let mut draft_probs: Vec<Vec<(u32, f32)>> = Vec::with_capacity(verify_m - 1);
 
                     while generated.len() < params.max_tokens {
+                        if (opts.should_yield)(generated.len()) {
+                            yielded = true;
+                            break;
+                        }
                         let rem = params.max_tokens - generated.len();
                         if rem == 1 {
                             let ts_1 = Instant::now();
@@ -1046,12 +1291,19 @@ impl Glm5Engine {
                             g_nxt
                         };
 
-                        let exit_now = if params.stop_token_ids.contains(&sampled_tok) {
-                            true
+                        let mut exit_now = false;
+                        if params.stop_token_ids.contains(&sampled_tok) {
+                            exit_now = true;
                         } else {
                             generated.push(sampled_tok);
-                            !on_token(sampled_tok) || generated.len() >= params.max_tokens
-                        };
+                            let keep = on_token(sampled_tok);
+                            if !keep || generated.len() >= params.max_tokens {
+                                exit_now = true;
+                            } else if (opts.should_yield)(generated.len()) {
+                                yielded = true;
+                                exit_now = true;
+                            }
+                        }
                         if exit_now {
                             if will_spec {
                                 write_cancel(1);
@@ -1446,17 +1698,29 @@ impl Glm5Engine {
         if let Some(ref mut pp) = self.state.phase_prof {
             pp.print_and_reset();
         }
-        let prefill_tps = suffix.len() as f64 / prefill_s.max(1e-6);
-        let decode_tps = (generated.len().saturating_sub(1).max(1)) as f64 / decode_s.max(1e-6);
+        let prefill_tps = if prefill_s > 0.0 {
+            prompt_tokens_evaluated as f64 / prefill_s.max(1e-6)
+        } else {
+            0.0
+        };
+        let decode_denom = generated
+            .len()
+            .saturating_sub(if resuming_decode { 0 } else { 1 })
+            .max(1) as f64;
+        let decode_tps = decode_denom / decode_s.max(1e-6);
 
-        Ok(StreamGenerateResult {
-            prompt_tokens_evaluated: suffix.len(),
-            prefix_reused_tokens: reused,
-            generated_tokens: generated,
-            prefill_tps,
-            decode_tps,
-            draft_n,
-            draft_accepted,
+        Ok(QuantumGenerateResult {
+            result: StreamGenerateResult {
+                prompt_tokens_evaluated,
+                prefix_reused_tokens: reused,
+                generated_tokens: generated,
+                prefill_tps,
+                decode_tps,
+                draft_n,
+                draft_accepted,
+            },
+            yielded,
+            prefill_snapshot,
         })
     }
 

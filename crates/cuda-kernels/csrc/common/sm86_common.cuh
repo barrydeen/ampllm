@@ -11,25 +11,33 @@ enum AmpllmGgmlType : int32_t {
     GGML_TYPE_F32     = 0,
     GGML_TYPE_F16     = 1,
     GGML_TYPE_Q4_0    = 2,
+    GGML_TYPE_Q5_1    = 7,
     GGML_TYPE_Q8_0    = 8,
     GGML_TYPE_Q8_1    = 9,
     GGML_TYPE_Q3_K    = 11,
     GGML_TYPE_Q4_K    = 12,
     GGML_TYPE_Q5_K    = 13,
     GGML_TYPE_Q6_K    = 14,
+    GGML_TYPE_IQ2_XXS = 16,
+    GGML_TYPE_IQ2_XS  = 17,
     GGML_TYPE_IQ3_XXS = 18,
+    GGML_TYPE_IQ1_S   = 19,
     GGML_TYPE_IQ4_NL  = 20,
     GGML_TYPE_IQ3_S   = 21,
     GGML_TYPE_IQ2_S   = 22,
     GGML_TYPE_IQ4_XS  = 23,
     GGML_TYPE_BF16    = 30,
     GGML_TYPE_NVFP4   = 40,
+    GGML_TYPE_Q2_0    = 42,
+    GGML_TYPE_F8_E4M3 = 43,
 };
 
 #define QK4_0 32
+#define QK5_1 32
 #define QK8_0 32
 #define QK8_1 32
 #define QK4_NL 32
+#define QK2_0 64
 #define QK_NVFP4 64
 #define QK_K 256
 #define K_SCALE_SIZE 12
@@ -37,6 +45,18 @@ enum AmpllmGgmlType : int32_t {
 struct __attribute__((packed)) block_q4_0 {
     uint16_t d;
     uint8_t qs[QK4_0 / 2];
+};
+
+struct __attribute__((packed)) block_q5_1 {
+    uint16_t d;
+    uint16_t m;
+    uint8_t qh[4];
+    uint8_t qs[QK5_1 / 2];
+};
+
+struct __attribute__((packed)) block_q2_0 {
+    uint16_t d;
+    uint8_t qs[QK2_0 / 4];
 };
 
 struct __attribute__((packed)) block_q8_0 {
@@ -372,6 +392,7 @@ __device__ __forceinline__ void dot_pair_nvfp4_sub(
     out1 = warp_reduce_sum(acc1);
 }
 
+
 __device__ __forceinline__ float dot_row_q8_0_sub(
     const block_q8_0* __restrict__ w_row,
     const block_q8_1* __restrict__ x_q8,
@@ -427,6 +448,7 @@ __device__ __forceinline__ void dot_pair_q8_0_sub(
     out1 = warp_reduce_sum(acc1);
 }
 
+
 __device__ __forceinline__ float dot_row_iq4_nl_sub(
     const block_iq4_nl* __restrict__ w_row,
     const block_q8_1* __restrict__ x_q8,
@@ -443,6 +465,32 @@ __device__ __forceinline__ float dot_row_iq4_nl_sub(
         uint32_t q4 = (uint32_t)load_i32_align2(wb->qs + sub * 4);
         int lo = lut_iq4nl_x4(q4 & 0x0F0F0F0Fu);
         int hi = lut_iq4nl_x4((q4 >> 4) & 0x0F0F0F0Fu);
+        int xlo = load_i32_align4(xb->qs + sub * 4);
+        int xhi = load_i32_align4(xb->qs + 16 + sub * 4);
+        int sumi = dp4a_packed(lo, xlo, 0);
+        sumi = dp4a_packed(hi, xhi, sumi);
+        float sc = fp16_bits_to_f32(load_u16_align2(&wb->d)) * fp16_bits_to_f32(load_u16_align2(&xb->d));
+        acc += sc * (float)sumi;
+    }
+    return warp_reduce_sum(acc);
+}
+
+__device__ __forceinline__ float dot_row_q4_0_sub(
+    const block_q4_0* __restrict__ w_row,
+    const block_q8_1* __restrict__ x_q8,
+    int K,
+    int lane
+) {
+    int nb = K >> 5;
+    int sub = lane & 3;
+    int blk0 = lane >> 2;
+    float acc = 0.0f;
+    for (int b = blk0; b < nb; b += 8) {
+        const block_q4_0* wb = w_row + b;
+        const block_q8_1* xb = x_q8 + b;
+        uint32_t q4 = (uint32_t)load_i32_align2(wb->qs + sub * 4);
+        int lo = (int)__vsub4(q4 & 0x0F0F0F0Fu, 0x08080808u);
+        int hi = (int)__vsub4((q4 >> 4) & 0x0F0F0F0Fu, 0x08080808u);
         int xlo = load_i32_align4(xb->qs + sub * 4);
         int xhi = load_i32_align4(xb->qs + 16 + sub * 4);
         int sumi = dp4a_packed(lo, xlo, 0);
@@ -487,6 +535,248 @@ __device__ __forceinline__ void dot_pair_iq4_nl_sub(
     }
     out0 = warp_reduce_sum(acc0);
     out1 = warp_reduce_sum(acc1);
+}
+
+__device__ __forceinline__ uint32_t expand_q5_1_hi4(uint32_t hb) {
+    return (((hb & 0xFu) * 0x00204081u) & 0x01010101u) << 4;
+}
+
+__device__ __forceinline__ int unpack_q2_0_x4(uint32_t raw_byte) {
+    uint32_t e = (raw_byte & 0x03u)
+               | ((raw_byte & 0x0Cu) << 6)
+               | ((raw_byte & 0x30u) << 12)
+               | ((raw_byte & 0xC0u) << 18);
+    return (int)__vsub4(e, 0x01010101u);
+}
+
+__device__ __forceinline__ float dot_sub_q5_1_blk(
+    const block_q5_1* wb,
+    int xlo,
+    int xhi,
+    float2 ds8,
+    int sub
+) {
+    uint32_t qh = (uint32_t)load_i32_align2(wb->qh);
+    uint32_t q4 = (uint32_t)load_i32_align2(wb->qs + sub * 4);
+    uint32_t lo = (q4 & 0x0F0F0F0Fu) | expand_q5_1_hi4(qh >> (sub * 4));
+    uint32_t hi = ((q4 >> 4) & 0x0F0F0F0Fu) | expand_q5_1_hi4(qh >> (16 + sub * 4));
+    int sumi = dp4a_packed((int)lo, xlo, 0);
+    sumi = dp4a_packed((int)hi, xhi, sumi);
+    float dw = fp16_bits_to_f32(load_u16_align2(&wb->d));
+    float res = dw * ds8.x * (float)sumi;
+    if (sub == 0) {
+        res += fp16_bits_to_f32(load_u16_align2(&wb->m)) * ds8.y;
+    }
+    return res;
+}
+
+__device__ __forceinline__ float dot_row_q5_1_sub(
+    const block_q5_1* __restrict__ w_row,
+    const block_q8_1* __restrict__ x_q8,
+    int K,
+    int lane
+) {
+    int nb = K >> 5;
+    int sub = lane & 3;
+    int blk0 = lane >> 2;
+    float acc = 0.0f;
+    for (int b = blk0; b < nb; b += 8) {
+        const block_q8_1* xb = x_q8 + b;
+        int xlo = load_i32_align4(xb->qs + sub * 4);
+        int xhi = load_i32_align4(xb->qs + 16 + sub * 4);
+        float2 ds8 = fp16x2_bits_to_f32(&xb->d);
+        acc += dot_sub_q5_1_blk(w_row + b, xlo, xhi, ds8, sub);
+    }
+    return warp_reduce_sum(acc);
+}
+
+__device__ __forceinline__ void dot_pair_q5_1_sub(
+    const block_q5_1* __restrict__ w_row0,
+    const block_q5_1* __restrict__ w_row1,
+    const block_q8_1* __restrict__ x_q8,
+    int K,
+    int lane,
+    float& out0,
+    float& out1
+) {
+    int nb = K >> 5;
+    int sub = lane & 3;
+    int blk0 = lane >> 2;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (int b = blk0; b < nb; b += 8) {
+        const block_q8_1* xb = x_q8 + b;
+        int xlo = load_i32_align4(xb->qs + sub * 4);
+        int xhi = load_i32_align4(xb->qs + 16 + sub * 4);
+        float2 ds8 = fp16x2_bits_to_f32(&xb->d);
+        acc0 += dot_sub_q5_1_blk(w_row0 + b, xlo, xhi, ds8, sub);
+        acc1 += dot_sub_q5_1_blk(w_row1 + b, xlo, xhi, ds8, sub);
+    }
+    out0 = warp_reduce_sum(acc0);
+    out1 = warp_reduce_sum(acc1);
+}
+
+__device__ __forceinline__ void dot_quad_q5_1_sub(
+    const block_q5_1* __restrict__ w0,
+    const block_q5_1* __restrict__ w1,
+    const block_q5_1* __restrict__ w2,
+    const block_q5_1* __restrict__ w3,
+    const block_q8_1* __restrict__ x_q8,
+    int K,
+    int lane,
+    float& o0,
+    float& o1,
+    float& o2,
+    float& o3
+) {
+    int nb = K >> 5;
+    int sub = lane & 3;
+    int blk0 = lane >> 2;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int b = blk0; b < nb; b += 8) {
+        const block_q8_1* xb = x_q8 + b;
+        int xlo = load_i32_align4(xb->qs + sub * 4);
+        int xhi = load_i32_align4(xb->qs + 16 + sub * 4);
+        float2 ds8 = fp16x2_bits_to_f32(&xb->d);
+        a0 += dot_sub_q5_1_blk(w0 + b, xlo, xhi, ds8, sub);
+        a1 += dot_sub_q5_1_blk(w1 + b, xlo, xhi, ds8, sub);
+        a2 += dot_sub_q5_1_blk(w2 + b, xlo, xhi, ds8, sub);
+        a3 += dot_sub_q5_1_blk(w3 + b, xlo, xhi, ds8, sub);
+    }
+    o0 = warp_reduce_sum(a0);
+    o1 = warp_reduce_sum(a1);
+    o2 = warp_reduce_sum(a2);
+    o3 = warp_reduce_sum(a3);
+}
+
+__device__ __forceinline__ float dot_sub_q2_0_blk(
+    const block_q2_0* wb,
+    const int (&x4)[4],
+    float xd,
+    int sub
+) {
+    uint32_t q4 = (uint32_t)load_i32_align2(wb->qs + sub * 4);
+    int sumi = 0;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        sumi = dp4a_packed(unpack_q2_0_x4((q4 >> (8 * j)) & 0xFFu), x4[j], sumi);
+    }
+    return fp16_bits_to_f32(load_u16_align2(&wb->d)) * xd * (float)sumi;
+}
+
+__device__ __forceinline__ float dot_row_q2_0_sub(
+    const block_q2_0* __restrict__ w_row,
+    const block_q8_1* __restrict__ x_q8,
+    int K,
+    int lane
+) {
+    int nb = K >> 6;
+    int sub = lane & 3;
+    int blk0 = lane >> 2;
+    int xoff = (sub & 1) * 16;
+    float acc = 0.0f;
+    for (int b = blk0; b < nb; b += 8) {
+        const block_q8_1* xb = x_q8 + b * 2 + (sub >> 1);
+        int x4[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) x4[j] = load_i32_align4(xb->qs + xoff + j * 4);
+        float xd = fp16_bits_to_f32(load_u16_align2(&xb->d));
+        acc += dot_sub_q2_0_blk(w_row + b, x4, xd, sub);
+    }
+    return warp_reduce_sum(acc);
+}
+
+__device__ __forceinline__ void dot_pair_q2_0_sub(
+    const block_q2_0* __restrict__ w_row0,
+    const block_q2_0* __restrict__ w_row1,
+    const block_q8_1* __restrict__ x_q8,
+    int K,
+    int lane,
+    float& out0,
+    float& out1
+) {
+    int nb = K >> 6;
+    int sub = lane & 3;
+    int blk0 = lane >> 2;
+    int xoff = (sub & 1) * 16;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (int b = blk0; b < nb; b += 8) {
+        const block_q8_1* xb = x_q8 + b * 2 + (sub >> 1);
+        int x4[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) x4[j] = load_i32_align4(xb->qs + xoff + j * 4);
+        float xd = fp16_bits_to_f32(load_u16_align2(&xb->d));
+        acc0 += dot_sub_q2_0_blk(w_row0 + b, x4, xd, sub);
+        acc1 += dot_sub_q2_0_blk(w_row1 + b, x4, xd, sub);
+    }
+    out0 = warp_reduce_sum(acc0);
+    out1 = warp_reduce_sum(acc1);
+}
+
+__device__ __forceinline__ void dot_quad_q2_0_sub(
+    const block_q2_0* __restrict__ w0,
+    const block_q2_0* __restrict__ w1,
+    const block_q2_0* __restrict__ w2,
+    const block_q2_0* __restrict__ w3,
+    const block_q8_1* __restrict__ x_q8,
+    int K,
+    int lane,
+    float& o0,
+    float& o1,
+    float& o2,
+    float& o3
+) {
+    int nb = K >> 6;
+    int sub = lane & 3;
+    int blk0 = lane >> 2;
+    int xoff = (sub & 1) * 16;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int b = blk0; b < nb; b += 8) {
+        const block_q8_1* xb = x_q8 + b * 2 + (sub >> 1);
+        int x4[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) x4[j] = load_i32_align4(xb->qs + xoff + j * 4);
+        float xd = fp16_bits_to_f32(load_u16_align2(&xb->d));
+        a0 += dot_sub_q2_0_blk(w0 + b, x4, xd, sub);
+        a1 += dot_sub_q2_0_blk(w1 + b, x4, xd, sub);
+        a2 += dot_sub_q2_0_blk(w2 + b, x4, xd, sub);
+        a3 += dot_sub_q2_0_blk(w3 + b, x4, xd, sub);
+    }
+    o0 = warp_reduce_sum(a0);
+    o1 = warp_reduce_sum(a1);
+    o2 = warp_reduce_sum(a2);
+    o3 = warp_reduce_sum(a3);
+}
+
+__device__ __forceinline__ float dot_q5_1_q8_1(const block_q5_1* w, const block_q8_1* x) {
+    uint32_t qh = (uint32_t)load_i32_align2(w->qh);
+    int sumi = 0;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        uint32_t q4 = (uint32_t)load_i32_align2(w->qs + j * 4);
+        uint32_t lo = (q4 & 0x0F0F0F0Fu) | expand_q5_1_hi4(qh >> (4 * j));
+        uint32_t hi = ((q4 >> 4) & 0x0F0F0F0Fu) | expand_q5_1_hi4(qh >> (16 + 4 * j));
+        int xlo = load_i32_align4(x->qs + j * 4);
+        int xhi = load_i32_align4(x->qs + 16 + j * 4);
+        sumi = dp4a_packed((int)lo, xlo, sumi);
+        sumi = dp4a_packed((int)hi, xhi, sumi);
+    }
+    float dw = fp16_bits_to_f32(load_u16_align2(&w->d));
+    float mw = fp16_bits_to_f32(load_u16_align2(&w->m));
+    float2 dsx = fp16x2_bits_to_f32(&x->d);
+    return dw * dsx.x * (float)sumi + mw * dsx.y;
+}
+
+__device__ __forceinline__ float dot_q2_0_q8_1(const block_q2_0* w, const block_q8_1* x) {
+    int sum0 = 0, sum1 = 0;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        sum0 = dp4a_packed(unpack_q2_0_x4(w->qs[j]),     load_i32_align4(x[0].qs + j * 4), sum0);
+        sum1 = dp4a_packed(unpack_q2_0_x4(w->qs[j + 8]), load_i32_align4(x[1].qs + j * 4), sum1);
+    }
+    float dw = fp16_bits_to_f32(load_u16_align2(&w->d));
+    float d8_0 = fp16_bits_to_f32(load_u16_align2(&x[0].d));
+    float d8_1 = fp16_bits_to_f32(load_u16_align2(&x[1].d));
+    return dw * (d8_0 * (float)sum0 + d8_1 * (float)sum1);
 }
 
 // Dot product helpers between 1 weight block and matching block_q8_1 activations.
@@ -720,6 +1010,33 @@ struct __attribute__((packed)) block_iq3_s {
 };
 static_assert(sizeof(block_iq3_s) == 110, "block_iq3_s size");
 
+struct __attribute__((packed)) block_iq2_xxs {
+    uint16_t d;
+    uint8_t qs[QK_K / 4];
+};
+static_assert(sizeof(block_iq2_xxs) == 66, "block_iq2_xxs size");
+
+struct __attribute__((packed)) block_iq2_xs {
+    uint16_t d;
+    uint8_t qs[QK_K / 4];
+    uint8_t scales[QK_K / 32];
+};
+static_assert(sizeof(block_iq2_xs) == 74, "block_iq2_xs size");
+
+struct __attribute__((packed)) block_iq1_s {
+    uint16_t d;
+    uint8_t qs[QK_K / 8];
+    uint16_t qh[QK_K / 32];
+};
+static_assert(sizeof(block_iq1_s) == 50, "block_iq1_s size");
+
+struct block_q8_K {
+    float d;
+    int8_t qs[QK_K];
+    int16_t bsums[QK_K / 16];
+};
+static_assert(sizeof(block_q8_K) == 292, "block_q8_K size");
+
 struct __attribute__((packed)) block_iq2_s {
     uint16_t d;
     uint8_t qs[QK_K / 4];
@@ -729,9 +1046,12 @@ struct __attribute__((packed)) block_iq2_s {
 static_assert(sizeof(block_iq2_s) == 82, "block_iq2_s size");
 
 __device__ __forceinline__ float glm_swiglu_clamp_val(float g, float u, float lim) {
-    float gc = fminf(g, lim);
-    float uc = fminf(fmaxf(u, -lim), lim);
-    return (gc / (1.0f + expf(-gc))) * uc;
+    if (lim > 0.0f) {
+        float gc = fminf(g, lim);
+        float uc = fminf(fmaxf(u, -lim), lim);
+        return (gc / (1.0f + expf(-gc))) * uc;
+    }
+    return (g / (1.0f + expf(-g))) * u;
 }
 
 __device__ __forceinline__ void warp_quantize_q8_1_store(float val, block_q8_1* dst, int lane) {
@@ -1015,6 +1335,7 @@ __device__ __forceinline__ void dot_pair_q6_K_sub(const block_q6_K* w0, const bl
     out1 = warp_reduce_sum(acc1);
 }
 
+
 __device__ __forceinline__ float dot_row_q4_K_sub(const block_q4_K* w_row, const block_q8_1* x_q8, int K, int lane) {
     int nb = K >> 8, sub = lane & 7, b0 = lane >> 3;
     float acc = 0.0f;
@@ -1037,6 +1358,7 @@ __device__ __forceinline__ void dot_pair_q4_K_sub(const block_q4_K* w0, const bl
     out0 = warp_reduce_sum(acc0);
     out1 = warp_reduce_sum(acc1);
 }
+
 
 __device__ __forceinline__ float dot_row_q3_K_sub(const block_q3_K* w_row, const block_q8_1* x_q8, int K, int lane) {
     int nb = K >> 8, sub = lane & 7, b0 = lane >> 3;
@@ -1061,6 +1383,7 @@ __device__ __forceinline__ void dot_pair_q3_K_sub(const block_q3_K* w0, const bl
     out1 = warp_reduce_sum(acc1);
 }
 
+
 __device__ __forceinline__ float dot_row_iq2_s_sub(const block_iq2_s* w_row, const block_q8_1* x_q8, int K, int lane, const uint64_t* grid_lut = nullptr) {
     int nb = K >> 8, sub = lane & 7, b0 = lane >> 3;
     float acc = 0.0f;
@@ -1083,6 +1406,7 @@ __device__ __forceinline__ void dot_pair_iq2_s_sub(const block_iq2_s* w0, const 
     out0 = warp_reduce_sum(acc0);
     out1 = warp_reduce_sum(acc1);
 }
+
 
 __device__ __forceinline__ float dot_row_iq3_xxs_sub(const block_iq3_xxs* w_row, const block_q8_1* x_q8, int K, int lane, const uint32_t* grid_lut = nullptr) {
     int nb = K >> 8, sub = lane & 7, b0 = lane >> 3;
@@ -1172,6 +1496,156 @@ __device__ __forceinline__ void dot_quad_q3_K_sub(
     o3 = warp_reduce_sum(a3);
 }
 
+__device__ __forceinline__ float dot_sub_iq2_xxs(
+    const block_iq2_xxs* blk,
+    const int (&u)[8],
+    float d8,
+    int sub,
+    const uint64_t* grid_lut = nullptr
+) {
+    const float dw = fp16_bits_to_f32(load_u16_align2(&blk->d));
+    const uint32_t aux0 = (uint32_t)load_i32_align2(blk->qs + 8 * sub);
+    const uint32_t aux1 = (uint32_t)load_i32_align2(blk->qs + 8 * sub + 4);
+    const int ls = (int)(aux1 >> 28);
+    const uint64_t* lut = grid_lut ? grid_lut : d_iq2xxs_grid;
+    int sumi = 0;
+    #pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t g_idx = (aux0 >> (8 * l)) & 0xFFu;
+        const uint32_t s7 = (aux1 >> (7 * l)) & 0x7Fu;
+        const uint32_t sbyte = s7 | ((uint32_t)(__popc(s7) & 1) << 7);
+        const uint64_t g64 = lut[g_idx];
+        const unsigned s0 = __vcmpne4(((sbyte & 0x03u) << 7) | ((sbyte & 0x0Cu) << 21), 0u);
+        const unsigned s1 = __vcmpne4(((sbyte & 0x30u) << 3) | ((sbyte & 0xC0u) << 17), 0u);
+        const int w0 = (int)__vsub4((uint32_t)g64 ^ s0, s0);
+        const int w1 = (int)__vsub4((uint32_t)(g64 >> 32) ^ s1, s1);
+        sumi = dp4a_packed(w0, u[2 * l],     sumi);
+        sumi = dp4a_packed(w1, u[2 * l + 1], sumi);
+    }
+    return dw * d8 * 0.125f * (float)(sumi * (2 * ls + 1));
+}
+
+__device__ __forceinline__ float dot_sub_iq2_xs(
+    const block_iq2_xs* blk,
+    const int (&u)[8],
+    float d8,
+    int sub,
+    const uint64_t* grid_lut = nullptr
+) {
+    const float dw = fp16_bits_to_f32(load_u16_align2(&blk->d));
+    const uint32_t q01 = (uint32_t)load_i32_align2(blk->qs + 8 * sub);
+    const uint32_t q23 = (uint32_t)load_i32_align2(blk->qs + 8 * sub + 4);
+    const uint8_t sc_byte = blk->scales[sub];
+    const int ls0 = (int)(sc_byte & 0x0Fu);
+    const int ls1 = (int)(sc_byte >> 4);
+    const uint64_t* lut = grid_lut ? grid_lut : d_iq2xs_grid;
+    int sumi0 = 0, sumi1 = 0;
+    #pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t qw = (l < 2) ? q01 : q23;
+        const uint32_t q16 = (l & 1) ? (qw >> 16) : (qw & 0xFFFFu);
+        const uint32_t g_idx = q16 & 511u;
+        const uint32_t s7 = q16 >> 9;
+        const uint32_t sbyte = s7 | ((uint32_t)(__popc(s7) & 1) << 7);
+        const uint64_t g64 = lut[g_idx];
+        const unsigned s0 = __vcmpne4(((sbyte & 0x03u) << 7) | ((sbyte & 0x0Cu) << 21), 0u);
+        const unsigned s1 = __vcmpne4(((sbyte & 0x30u) << 3) | ((sbyte & 0xC0u) << 17), 0u);
+        const int w0 = (int)__vsub4((uint32_t)g64 ^ s0, s0);
+        const int w1 = (int)__vsub4((uint32_t)(g64 >> 32) ^ s1, s1);
+        if (l < 2) {
+            sumi0 = dp4a_packed(w0, u[2 * l],     sumi0);
+            sumi0 = dp4a_packed(w1, u[2 * l + 1], sumi0);
+        } else {
+            sumi1 = dp4a_packed(w0, u[2 * l],     sumi1);
+            sumi1 = dp4a_packed(w1, u[2 * l + 1], sumi1);
+        }
+    }
+    return dw * d8 * 0.125f * (float)(sumi0 * (2 * ls0 + 1) + sumi1 * (2 * ls1 + 1));
+}
+
+__device__ __forceinline__ float dot_sub_iq1_s(
+    const block_iq1_s* blk,
+    const int (&u)[8],
+    float2 ds8,
+    int sub,
+    const uint64_t* grid_lut = nullptr
+) {
+    const float dw = fp16_bits_to_f32(load_u16_align2(&blk->d));
+    const uint16_t qh = load_u16_align2(&blk->qh[sub]);
+    const uint32_t qs4 = (uint32_t)load_i32_align2(blk->qs + 4 * sub);
+    const int sc = 2 * (int)((qh >> 12) & 7u) + 1;
+    const float delta = (qh & 0x8000u) ? -0.125f : 0.125f;
+    const uint64_t* lut = grid_lut ? grid_lut : d_iq1s_grid;
+    int sumi = 0;
+    #pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t g_idx = ((qs4 >> (8 * l)) & 0xFFu) | ((((uint32_t)qh >> (3 * l)) & 7u) << 8);
+        const uint64_t g64 = lut[g_idx];
+        sumi = dp4a_packed((int)(uint32_t)g64, u[2 * l], sumi);
+        sumi = dp4a_packed((int)(uint32_t)(g64 >> 32), u[2 * l + 1], sumi);
+    }
+    return dw * (float)sc * (ds8.x * (float)sumi + delta * ds8.y);
+}
+
+__device__ __forceinline__ float dot_iq2_xxs_q8_1(const block_iq2_xxs* w, const block_q8_1* x) {
+    float acc = 0.0f;
+    for (int sub = 0; sub < 8; ++sub) {
+        int u[8]; float2 ds8;
+        load_q8_1_sub_words(x + sub, u, ds8);
+        acc += dot_sub_iq2_xxs(w, u, ds8.x, sub);
+    }
+    return acc;
+}
+__device__ __forceinline__ float dot_iq2_xs_q8_1(const block_iq2_xs* w, const block_q8_1* x) {
+    float acc = 0.0f;
+    for (int sub = 0; sub < 8; ++sub) {
+        int u[8]; float2 ds8;
+        load_q8_1_sub_words(x + sub, u, ds8);
+        acc += dot_sub_iq2_xs(w, u, ds8.x, sub);
+    }
+    return acc;
+}
+__device__ __forceinline__ float dot_iq1_s_q8_1(const block_iq1_s* w, const block_q8_1* x) {
+    float acc = 0.0f;
+    for (int sub = 0; sub < 8; ++sub) {
+        int u[8]; float2 ds8;
+        load_q8_1_sub_words(x + sub, u, ds8);
+        acc += dot_sub_iq1_s(w, u, ds8, sub);
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float dot_row_iq2_xxs_sub(const block_iq2_xxs* w_row, const block_q8_1* x_q8, int K, int lane, const uint64_t* grid_lut = nullptr) {
+    int nb = K >> 8, sub = lane & 7, b0 = lane >> 3;
+    float acc = 0.0f;
+    for (int b = b0; b < nb; b += 4) {
+        int u[8]; float2 ds8;
+        load_q8_1_sub_words(x_q8 + b * 8 + sub, u, ds8);
+        acc += dot_sub_iq2_xxs(w_row + b, u, ds8.x, sub, grid_lut);
+    }
+    return warp_reduce_sum(acc);
+}
+__device__ __forceinline__ float dot_row_iq2_xs_sub(const block_iq2_xs* w_row, const block_q8_1* x_q8, int K, int lane, const uint64_t* grid_lut = nullptr) {
+    int nb = K >> 8, sub = lane & 7, b0 = lane >> 3;
+    float acc = 0.0f;
+    for (int b = b0; b < nb; b += 4) {
+        int u[8]; float2 ds8;
+        load_q8_1_sub_words(x_q8 + b * 8 + sub, u, ds8);
+        acc += dot_sub_iq2_xs(w_row + b, u, ds8.x, sub, grid_lut);
+    }
+    return warp_reduce_sum(acc);
+}
+__device__ __forceinline__ float dot_row_iq1_s_sub(const block_iq1_s* w_row, const block_q8_1* x_q8, int K, int lane, const uint64_t* grid_lut = nullptr) {
+    int nb = K >> 8, sub = lane & 7, b0 = lane >> 3;
+    float acc = 0.0f;
+    for (int b = b0; b < nb; b += 4) {
+        int u[8]; float2 ds8;
+        load_q8_1_sub_words(x_q8 + b * 8 + sub, u, ds8);
+        acc += dot_sub_iq1_s(w_row + b, u, ds8, sub, grid_lut);
+    }
+    return warp_reduce_sum(acc);
+}
+
 __device__ __forceinline__ void dot_quad_iq2_s_sub(
     const block_iq2_s* w0, const block_iq2_s* w1, const block_iq2_s* w2, const block_iq2_s* w3,
     const block_q8_1* x_q8, int K, int lane,
@@ -1239,6 +1713,226 @@ __device__ __forceinline__ void dot_quad_iq3_s_sub(
         a1 += dot_sub_iq3_s(w1 + b, u, ds8.x, sub, grid_lut);
         a2 += dot_sub_iq3_s(w2 + b, u, ds8.x, sub, grid_lut);
         a3 += dot_sub_iq3_s(w3 + b, u, ds8.x, sub, grid_lut);
+    }
+    o0 = warp_reduce_sum(a0);
+    o1 = warp_reduce_sum(a1);
+    o2 = warp_reduce_sum(a2);
+    o3 = warp_reduce_sum(a3);
+}
+
+__device__ __forceinline__ float dot_sub_iq4_xs(
+    const block_iq4_xs* blk,
+    const int (&u)[8],
+    float d8,
+    int sub
+) {
+    float dw = fp16_bits_to_f32(load_u16_align2(&blk->d));
+    uint16_t scales_h = load_u16_align2(&blk->scales_h);
+    int ls = ((blk->scales_l[sub >> 1] >> (4 * (sub & 1))) & 0xF) | (((scales_h >> (2 * sub)) & 3) << 4);
+    float dl = dw * (float)(ls - 32);
+    const uint8_t* qs = blk->qs + sub * 16;
+    int sumi = 0;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        uint32_t q4 = (uint32_t)load_i32_align4(qs + j * 4);
+        int lo = lut_iq4nl_x4(q4 & 0x0F0F0F0Fu);
+        int hi = lut_iq4nl_x4((q4 >> 4) & 0x0F0F0F0Fu);
+        sumi = dp4a_packed(lo, u[j], sumi);
+        sumi = dp4a_packed(hi, u[4 + j], sumi);
+    }
+    return dl * d8 * (float)sumi;
+}
+
+__device__ __forceinline__ float dot_sub_q5_K(
+    const block_q5_K* blk,
+    const int (&u)[8],
+    float2 ds8,
+    int sub
+) {
+    float2 dpair = fp16x2_bits_to_f32(&blk->d);
+    uint8_t sc = 0, mn = 0;
+    get_scale_min_k4_dev(sub, blk->scales, sc, mn);
+    const uint8_t* qs = blk->qs + 32 * (sub >> 1);
+    int q4_shift = 4 * (sub & 1);
+    int sumi = 0;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        uint32_t q4 = ((uint32_t)load_i32_align4(qs + 4 * j) >> q4_shift) & 0x0F0F0F0Fu;
+        uint32_t qh4 = (uint32_t)load_i32_align4(blk->qh + 4 * j);
+        uint32_t qh_hi = ((sub <= 4) ? (qh4 << (4 - sub)) : (qh4 >> (sub - 4))) & 0x10101010u;
+        int w5 = (int)(q4 | qh_hi);
+        sumi = dp4a_packed(w5, u[j], sumi);
+    }
+    return dpair.x * (float)sc * ds8.x * (float)sumi - dpair.y * (float)mn * ds8.y;
+}
+
+__device__ __forceinline__ float dot_row_iq4_xs_sub(
+    const block_iq4_xs* w_row,
+    const block_q8_1* x_q8,
+    int K,
+    int lane
+) {
+    int nb = K >> 8, sub = lane & 7, b0 = lane >> 3;
+    float acc = 0.0f;
+    for (int b = b0; b < nb; b += 4) {
+        int u[8]; float2 ds8;
+        load_q8_1_sub_words(x_q8 + b * 8 + sub, u, ds8);
+        acc += dot_sub_iq4_xs(w_row + b, u, ds8.x, sub);
+    }
+    return warp_reduce_sum(acc);
+}
+
+__device__ __forceinline__ void dot_pair_iq4_xs_sub(
+    const block_iq4_xs* w0,
+    const block_iq4_xs* w1,
+    const block_q8_1* x_q8,
+    int K,
+    int lane,
+    float& out0,
+    float& out1
+) {
+    int nb = K >> 8, sub = lane & 7, b0 = lane >> 3;
+    float a0 = 0.0f, a1 = 0.0f;
+    for (int b = b0; b < nb; b += 4) {
+        int u[8]; float2 ds8;
+        load_q8_1_sub_words(x_q8 + b * 8 + sub, u, ds8);
+        a0 += dot_sub_iq4_xs(w0 + b, u, ds8.x, sub);
+        a1 += dot_sub_iq4_xs(w1 + b, u, ds8.x, sub);
+    }
+    out0 = warp_reduce_sum(a0);
+    out1 = warp_reduce_sum(a1);
+}
+
+__device__ __forceinline__ void dot_quad_iq4_xs_sub(
+    const block_iq4_xs* w0,
+    const block_iq4_xs* w1,
+    const block_iq4_xs* w2,
+    const block_iq4_xs* w3,
+    const block_q8_1* x_q8,
+    int K,
+    int lane,
+    float& o0,
+    float& o1,
+    float& o2,
+    float& o3
+) {
+    int nb = K >> 8, sub = lane & 7, b0 = lane >> 3;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    #pragma unroll 1
+    for (int b = b0; b < nb; b += 4) {
+        int u[8]; float2 ds8;
+        load_q8_1_sub_words(x_q8 + b * 8 + sub, u, ds8);
+        a0 += dot_sub_iq4_xs(w0 + b, u, ds8.x, sub);
+        a1 += dot_sub_iq4_xs(w1 + b, u, ds8.x, sub);
+        a2 += dot_sub_iq4_xs(w2 + b, u, ds8.x, sub);
+        a3 += dot_sub_iq4_xs(w3 + b, u, ds8.x, sub);
+    }
+    o0 = warp_reduce_sum(a0);
+    o1 = warp_reduce_sum(a1);
+    o2 = warp_reduce_sum(a2);
+    o3 = warp_reduce_sum(a3);
+}
+
+__device__ __forceinline__ float dot_row_q5_K_sub(
+    const block_q5_K* w_row,
+    const block_q8_1* x_q8,
+    int K,
+    int lane
+) {
+    int nb = K >> 8, sub = lane & 7, b0 = lane >> 3;
+    float acc = 0.0f;
+    for (int b = b0; b < nb; b += 4) {
+        int u[8]; float2 ds8;
+        load_q8_1_sub_words(x_q8 + b * 8 + sub, u, ds8);
+        acc += dot_sub_q5_K(w_row + b, u, ds8, sub);
+    }
+    return warp_reduce_sum(acc);
+}
+
+__device__ __forceinline__ void dot_pair_q5_K_sub(
+    const block_q5_K* w0,
+    const block_q5_K* w1,
+    const block_q8_1* x_q8,
+    int K,
+    int lane,
+    float& out0,
+    float& out1
+) {
+    int nb = K >> 8, sub = lane & 7, b0 = lane >> 3;
+    float a0 = 0.0f, a1 = 0.0f;
+    for (int b = b0; b < nb; b += 4) {
+        int u[8]; float2 ds8;
+        load_q8_1_sub_words(x_q8 + b * 8 + sub, u, ds8);
+        a0 += dot_sub_q5_K(w0 + b, u, ds8, sub);
+        a1 += dot_sub_q5_K(w1 + b, u, ds8, sub);
+    }
+    out0 = warp_reduce_sum(a0);
+    out1 = warp_reduce_sum(a1);
+}
+
+__device__ __forceinline__ void dot_quad_q5_K_sub(
+    const block_q5_K* w0,
+    const block_q5_K* w1,
+    const block_q5_K* w2,
+    const block_q5_K* w3,
+    const block_q8_1* x_q8,
+    int K,
+    int lane,
+    float& o0,
+    float& o1,
+    float& o2,
+    float& o3
+) {
+    int nb = K >> 8, sub = lane & 7, b0 = lane >> 3;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    #pragma unroll 1
+    for (int b = b0; b < nb; b += 4) {
+        int u[8]; float2 ds8;
+        load_q8_1_sub_words(x_q8 + b * 8 + sub, u, ds8);
+        a0 += dot_sub_q5_K(w0 + b, u, ds8, sub);
+        a1 += dot_sub_q5_K(w1 + b, u, ds8, sub);
+        a2 += dot_sub_q5_K(w2 + b, u, ds8, sub);
+        a3 += dot_sub_q5_K(w3 + b, u, ds8, sub);
+    }
+    o0 = warp_reduce_sum(a0);
+    o1 = warp_reduce_sum(a1);
+    o2 = warp_reduce_sum(a2);
+    o3 = warp_reduce_sum(a3);
+}
+
+__device__ __forceinline__ void dot_quad_q8_0_sub(
+    const block_q8_0* __restrict__ w0,
+    const block_q8_0* __restrict__ w1,
+    const block_q8_0* __restrict__ w2,
+    const block_q8_0* __restrict__ w3,
+    const block_q8_1* __restrict__ x_q8,
+    int K,
+    int lane,
+    float& o0,
+    float& o1,
+    float& o2,
+    float& o3
+) {
+    int nb = K >> 5;
+    int sub = lane & 7;
+    int blk0 = lane >> 3;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int b = blk0; b < nb; b += 4) {
+        const block_q8_1* xb = x_q8 + b;
+        int xa = load_i32_align4(xb->qs + sub * 4);
+        float xd = fp16_bits_to_f32(load_u16_align2(&xb->d));
+
+        const block_q8_0* wb0 = w0 + b;
+        a0 += (fp16_bits_to_f32(load_u16_align2(&wb0->d)) * xd) * (float)dp4a_packed(load_i32_align2(wb0->qs + sub * 4), xa, 0);
+
+        const block_q8_0* wb1 = w1 + b;
+        a1 += (fp16_bits_to_f32(load_u16_align2(&wb1->d)) * xd) * (float)dp4a_packed(load_i32_align2(wb1->qs + sub * 4), xa, 0);
+
+        const block_q8_0* wb2 = w2 + b;
+        a2 += (fp16_bits_to_f32(load_u16_align2(&wb2->d)) * xd) * (float)dp4a_packed(load_i32_align2(wb2->qs + sub * 4), xa, 0);
+
+        const block_q8_0* wb3 = w3 + b;
+        a3 += (fp16_bits_to_f32(load_u16_align2(&wb3->d)) * xd) * (float)dp4a_packed(load_i32_align2(wb3->qs + sub * 4), xa, 0);
     }
     o0 = warp_reduce_sum(a0);
     o1 = warp_reduce_sum(a1);

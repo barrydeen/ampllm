@@ -4,6 +4,9 @@ use crate::kv_cache::KvQuantMode;
 use crate::pipeline::PipelineGpuEngine;
 use crate::sampling::{sample_next_token, SamplingParams};
 use crate::single::SingleGpuEngine;
+use crate::snapshot::{
+    EngineSnapshotData, InklingSnapshot, QuantumGenerateResult, QuantumOptions, SequenceSnapshot,
+};
 use crate::tp2::Tp2GpuEngine;
 use ampllm_cache::{CacheBudget, CacheStats};
 use ampllm_gguf::{GgufFile, Inkling2Config};
@@ -39,6 +42,7 @@ pub struct Inkling2Engine {
     pub cfg: Inkling2Config,
     backend: EngineBackend,
     snapshots: VecDeque<PrefixSnapshot>,
+    pub committed_tokens: Vec<u32>,
     pub prefix_reuse_tokens_total: u64,
 }
 
@@ -73,6 +77,7 @@ impl Inkling2Engine {
             cfg,
             backend,
             snapshots: VecDeque::with_capacity(4),
+            committed_tokens: Vec::new(),
             prefix_reuse_tokens_total: 0,
         })
     }
@@ -169,6 +174,8 @@ impl Inkling2Engine {
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        self.committed_tokens.clear();
+        self.snapshots.clear();
         match &mut self.backend {
             EngineBackend::Single(e) => e.reset(),
             EngineBackend::Helper(e) => e.reset(),
@@ -182,12 +189,76 @@ impl Inkling2Engine {
         tokens: &[u32],
         capture_logits: bool,
     ) -> Result<(u32, Option<Vec<f32>>)> {
-        match &mut self.backend {
+        let res = match &mut self.backend {
             EngineBackend::Single(e) => e.forward_tokens(tokens, capture_logits),
             EngineBackend::Helper(e) => e.forward_tokens(tokens, capture_logits),
             EngineBackend::Pipeline(e) => e.forward_tokens(tokens, capture_logits),
             EngineBackend::Tp2(e) => e.forward_tokens(tokens, capture_logits),
+        }?;
+        self.committed_tokens.extend_from_slice(tokens);
+        Ok(res)
+    }
+
+    pub fn capture_sequence_snapshot(&self, has_images: bool) -> Result<SequenceSnapshot> {
+        let pos = self.cur_pos();
+        let (rank0, rank1) = match &self.backend {
+            EngineBackend::Single(e) => (e.rank.kv_cache.capture_full_snapshot(e.rank.device, pos)?, None),
+            EngineBackend::Helper(e) => (e.rank0.kv_cache.capture_full_snapshot(0, pos)?, None),
+            EngineBackend::Pipeline(e) => (
+                e.rank0.kv_cache.capture_full_snapshot(0, pos)?,
+                Some(e.rank1.kv_cache.capture_full_snapshot(1, pos)?),
+            ),
+            EngineBackend::Tp2(e) => (
+                e.rank0.kv_cache.capture_full_snapshot(0, pos)?,
+                Some(e.rank1.kv_cache.capture_full_snapshot(1, pos)?),
+            ),
+        };
+        let byte_len: usize = rank0.iter().flatten().map(|s| s.byte_len()).sum::<usize>()
+            + rank1
+                .as_ref()
+                .map_or(0, |v| v.iter().flatten().map(|s| s.byte_len()).sum());
+        Ok(SequenceSnapshot {
+            tokens: self.committed_tokens.clone(),
+            has_images,
+            allow_lcp_truncate: false,
+            max_safe_rollback_delta: None,
+            rollback_align: 1,
+            byte_len,
+            inner: EngineSnapshotData::Inkling2(InklingSnapshot { rank0, rank1 }),
+        })
+    }
+
+    pub fn restore_sequence_snapshot(
+        &mut self,
+        snap: &SequenceSnapshot,
+        _truncate_to: Option<usize>,
+    ) -> Result<()> {
+        let EngineSnapshotData::Inkling2(ref is) = snap.inner else {
+            anyhow::bail!("expected Inkling2 snapshot");
+        };
+        match &mut self.backend {
+            EngineBackend::Single(e) => e.rank.kv_cache.restore_full_snapshot(e.rank.device, &is.rank0)?,
+            EngineBackend::Helper(e) => e.rank0.kv_cache.restore_full_snapshot(0, &is.rank0)?,
+            EngineBackend::Pipeline(e) => {
+                e.rank0.kv_cache.restore_full_snapshot(0, &is.rank0)?;
+                if let Some(ref r1) = is.rank1 {
+                    e.rank1.kv_cache.restore_full_snapshot(1, r1)?;
+                }
+            }
+            EngineBackend::Tp2(e) => {
+                e.rank0.kv_cache.restore_full_snapshot(0, &is.rank0)?;
+                if let Some(ref r1) = is.rank1 {
+                    e.rank1.kv_cache.restore_full_snapshot(1, r1)?;
+                }
+            }
         }
+        self.set_cur_pos(snap.tokens.len());
+        self.committed_tokens = snap.tokens.clone();
+        self.snapshots.clear();
+        if let Ok(conv_snap) = self.capture_snapshot(&snap.tokens) {
+            self.snapshots.push_back(conv_snap);
+        }
+        Ok(())
     }
 
     /// Generate tokens with exact prefix KV+conv reuse and streaming callback.
@@ -196,45 +267,79 @@ impl Inkling2Engine {
         &mut self,
         prompt_tokens: &[u32],
         params: &SamplingParams,
-        mut on_token: F,
+        on_token: F,
     ) -> Result<StreamGenerateResult>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        let mut no_yield = |_: usize| false;
+        let qres = self.generate_stream_quantum(
+            prompt_tokens,
+            params,
+            QuantumOptions::no_yield(&mut no_yield),
+            on_token,
+        )?;
+        Ok(qres.result)
+    }
+
+    pub fn generate_stream_quantum<F>(
+        &mut self,
+        prompt_tokens: &[u32],
+        params: &SamplingParams,
+        opts: QuantumOptions<'_>,
+        mut on_token: F,
+    ) -> Result<QuantumGenerateResult>
     where
         F: FnMut(u32) -> bool,
     {
         let swa = self.cfg.sliding_window;
         let cur = self.cur_pos();
 
-        // Find longest snapshotted prefix whose SWA KV slots are still intact.
-        let matched_idx = self
-            .snapshots
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| {
-                let slen = s.tokens.len();
-                slen > 0
-                    && prompt_tokens.len() > slen
-                    && prompt_tokens.starts_with(&s.tokens)
-                    && (cur == slen || (cur <= swa && slen <= cur))
-            })
-            .max_by_key(|(_, s)| s.tokens.len())
-            .map(|(idx, _)| idx);
+        let exact_resident_reuse = !self.committed_tokens.is_empty()
+            && self.committed_tokens.len() == cur
+            && prompt_tokens.len() > cur
+            && prompt_tokens.starts_with(&self.committed_tokens);
 
-        let reused = if let Some(idx) = matched_idx {
-            let snap_tokens = self.snapshots[idx].tokens.clone();
-            let conv0 = self.snapshots[idx].conv_rank0.clone();
-            let conv1 = self.snapshots[idx].conv_rank1.clone();
-            self.restore_snapshot(&PrefixSnapshot {
-                tokens: snap_tokens,
-                conv_rank0: conv0,
-                conv_rank1: conv1,
-            })?;
-            let rlen = self.cur_pos();
-            self.prefix_reuse_tokens_total += rlen as u64;
-            rlen
+        let reused = if exact_resident_reuse {
+            if !opts.resume_active {
+                self.prefix_reuse_tokens_total += cur as u64;
+            }
+            cur
         } else {
-            self.reset()?;
-            self.snapshots.clear();
-            0
+            // Find longest snapshotted prefix whose SWA KV slots are still intact.
+            let matched_idx = self
+                .snapshots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    let slen = s.tokens.len();
+                    slen > 0
+                        && prompt_tokens.len() > slen
+                        && prompt_tokens.starts_with(&s.tokens)
+                        && (cur == slen || (cur <= swa && slen <= cur))
+                })
+                .max_by_key(|(_, s)| s.tokens.len())
+                .map(|(idx, _)| idx);
+
+            if let Some(idx) = matched_idx {
+                let snap_tokens = self.snapshots[idx].tokens.clone();
+                let conv0 = self.snapshots[idx].conv_rank0.clone();
+                let conv1 = self.snapshots[idx].conv_rank1.clone();
+                self.restore_snapshot(&PrefixSnapshot {
+                    tokens: snap_tokens.clone(),
+                    conv_rank0: conv0,
+                    conv_rank1: conv1,
+                })?;
+                self.committed_tokens = snap_tokens;
+                let rlen = self.cur_pos();
+                if !opts.resume_active {
+                    self.prefix_reuse_tokens_total += rlen as u64;
+                }
+                rlen
+            } else {
+                self.reset()?;
+                0
+            }
         };
 
         let suffix = &prompt_tokens[reused..];
@@ -249,6 +354,11 @@ impl Inkling2Engine {
         if let Ok(snap) = self.capture_snapshot(prompt_tokens) {
             self.push_snapshot(snap);
         }
+        let prefill_snapshot = if opts.capture_prefill_snap {
+            Some(self.capture_sequence_snapshot(false)?)
+        } else {
+            None
+        };
 
         let mut next_tok = if let Some(ref logits) = logits_opt {
             sample_next_token(logits, params, &mut rng)
@@ -258,6 +368,7 @@ impl Inkling2Engine {
 
         let mut generated = Vec::new();
         let mut full_seq = prompt_tokens.to_vec();
+        let mut yielded = false;
         let t_dec = Instant::now();
 
         for step in 0..params.max_tokens {
@@ -268,6 +379,10 @@ impl Inkling2Engine {
             full_seq.push(next_tok);
             let keep_going = on_token(next_tok);
             if !keep_going || step + 1 >= params.max_tokens {
+                break;
+            }
+            if (opts.should_yield)(generated.len()) {
+                yielded = true;
                 break;
             }
             let (g_nxt, l_opt) = self.forward_tokens(&[next_tok], need_logits)?;
@@ -283,17 +398,27 @@ impl Inkling2Engine {
             self.push_snapshot(snap);
         }
 
-        let prefill_tps = suffix.len() as f64 / prefill_s.max(1e-6);
-        let decode_tps = (generated.len().saturating_sub(1).max(1)) as f64 / decode_s.max(1e-6);
+        let prompt_tokens_evaluated = if opts.resume_active { 0 } else { suffix.len() };
+        let prefill_tps = if opts.resume_active {
+            0.0
+        } else {
+            suffix.len() as f64 / prefill_s.max(1e-6)
+        };
+        let decode_tps = (generated.len().saturating_sub(if opts.resume_active { 0 } else { 1 }).max(1)) as f64
+            / decode_s.max(1e-6);
 
-        Ok(StreamGenerateResult {
-            prompt_tokens_evaluated: suffix.len(),
-            prefix_reused_tokens: reused,
-            generated_tokens: generated,
-            prefill_tps,
-            decode_tps,
-            draft_n: 0,
-            draft_accepted: 0,
+        Ok(QuantumGenerateResult {
+            result: StreamGenerateResult {
+                prompt_tokens_evaluated,
+                prefix_reused_tokens: reused,
+                generated_tokens: generated,
+                prefill_tps,
+                decode_tps,
+                draft_n: 0,
+                draft_accepted: 0,
+            },
+            yielded,
+            prefill_snapshot,
         })
     }
 

@@ -1,11 +1,16 @@
 use crate::format::GgmlType;
-use crate::iq_tables::{IQ2S_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
+use crate::iq_tables::{
+    IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
+    KSIGNS_IQ2XS,
+};
 use bytemuck::{Pod, Zeroable};
 use half::{bf16, f16};
 
 pub const QK4_0: usize = 32;
+pub const QK5_1: usize = 32;
 pub const QK8_0: usize = 32;
 pub const QK4_NL: usize = 32;
+pub const QK2_0: usize = 64;
 pub const QK_NVFP4: usize = 64;
 pub const QK_K: usize = 256;
 pub const K_SCALE_SIZE: usize = 12;
@@ -25,6 +30,22 @@ pub const KVALUES_NVFP4: [i8; 16] = [
 pub struct BlockQ4_0 {
     pub d: [u8; 2],
     pub qs: [u8; QK4_0 / 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct BlockQ5_1 {
+    pub d: [u8; 2],
+    pub m: [u8; 2],
+    pub qh: [u8; 4],
+    pub qs: [u8; QK5_1 / 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct BlockQ2_0 {
+    pub d: [u8; 2],
+    pub qs: [u8; QK2_0 / 4],
 }
 
 #[repr(C)]
@@ -104,6 +125,29 @@ pub struct BlockQ3K {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+pub struct BlockIq2Xxs {
+    pub d: [u8; 2],
+    pub qs: [u8; QK_K / 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct BlockIq2Xs {
+    pub d: [u8; 2],
+    pub qs: [u8; QK_K / 4],
+    pub scales: [u8; QK_K / 32],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct BlockIq1S {
+    pub d: [u8; 2],
+    pub qs: [u8; QK_K / 8],
+    pub qh: [u8; QK_K / 16],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 pub struct BlockIq2S {
     pub d: [u8; 2],
     pub qs: [u8; QK_K / 4],
@@ -130,12 +174,17 @@ pub struct BlockIq3S {
 
 const _: () = {
     assert!(std::mem::size_of::<BlockQ4_0>() == 18);
+    assert!(std::mem::size_of::<BlockQ5_1>() == 24);
     assert!(std::mem::size_of::<BlockQ8_0>() == 34);
     assert!(std::mem::size_of::<BlockQ8_1>() == 36);
+    assert!(std::mem::size_of::<BlockQ2_0>() == 18);
     assert!(std::mem::size_of::<BlockQ3K>() == 110);
     assert!(std::mem::size_of::<BlockQ4K>() == 144);
     assert!(std::mem::size_of::<BlockQ5K>() == 176);
     assert!(std::mem::size_of::<BlockQ6K>() == 210);
+    assert!(std::mem::size_of::<BlockIq2Xxs>() == 66);
+    assert!(std::mem::size_of::<BlockIq2Xs>() == 74);
+    assert!(std::mem::size_of::<BlockIq1S>() == 50);
     assert!(std::mem::size_of::<BlockIq2S>() == 82);
     assert!(std::mem::size_of::<BlockIq3Xxs>() == 98);
     assert!(std::mem::size_of::<BlockIq3S>() == 110);
@@ -214,6 +263,35 @@ pub fn dequantize_row_to_f32(ggml_type: GgmlType, src: &[u8], dst: &mut [f32]) {
                     let x1 = ((b.qs[j] >> 4) as i32) - 8;
                     out[j] = d * (x0 as f32);
                     out[j + QK4_0 / 2] = d * (x1 as f32);
+                }
+            }
+        }
+        GgmlType::Q5_1 => {
+            assert_eq!(k % QK5_1, 0);
+            let blocks: &[BlockQ5_1] = bytemuck::cast_slice(src);
+            for (b, out) in blocks.iter().zip(dst.chunks_exact_mut(QK5_1)) {
+                let d = f16_bytes_to_f32(b.d);
+                let m = f16_bytes_to_f32(b.m);
+                let qh = u32::from_le_bytes(b.qh);
+                for j in 0..(QK5_1 / 2) {
+                    let x0 = ((b.qs[j] & 0x0F) as u32) | (((qh >> j) & 1) << 4);
+                    let x1 = ((b.qs[j] >> 4) as u32) | (((qh >> (j + 16)) & 1) << 4);
+                    out[j] = d * (x0 as f32) + m;
+                    out[j + QK5_1 / 2] = d * (x1 as f32) + m;
+                }
+            }
+        }
+        GgmlType::Q2_0 => {
+            assert_eq!(k % QK2_0, 0);
+            let blocks: &[BlockQ2_0] = bytemuck::cast_slice(src);
+            for (b, out) in blocks.iter().zip(dst.chunks_exact_mut(QK2_0)) {
+                let d = f16_bytes_to_f32(b.d);
+                for j in 0..(QK2_0 / 4) {
+                    let byte = b.qs[j];
+                    for s in 0..4 {
+                        let q = ((byte >> (2 * s)) & 3) as f32 - 1.0;
+                        out[4 * j + s] = q * d;
+                    }
                 }
             }
         }
@@ -382,6 +460,77 @@ pub fn dequantize_row_to_f32(ggml_type: GgmlType, src: &[u8], dst: &mut [f32]) {
                         m <<= 1;
                     }
                     q_off += 32;
+                }
+            }
+        }
+        GgmlType::Iq2Xxs => {
+            assert_eq!(k % QK_K, 0);
+            let blocks: &[BlockIq2Xxs] = bytemuck::cast_slice(src);
+            for (b, out) in blocks.iter().zip(dst.chunks_exact_mut(QK_K)) {
+                let d = f16_bytes_to_f32(b.d);
+                let mut y_off = 0usize;
+                for ib32 in 0..(QK_K / 32) {
+                    let aux0 = u32::from_le_bytes(b.qs[8 * ib32..8 * ib32 + 4].try_into().unwrap());
+                    let aux1 = u32::from_le_bytes(b.qs[8 * ib32 + 4..8 * ib32 + 8].try_into().unwrap());
+                    let db = d * (0.5 + ((aux1 >> 28) as f32)) * 0.25;
+                    for l in 0..4 {
+                        let grid_idx = ((aux0 >> (8 * l)) & 0xFF) as usize;
+                        let grid = IQ2XXS_GRID[grid_idx].to_le_bytes();
+                        let signs = KSIGNS_IQ2XS[((aux1 >> (7 * l)) & 127) as usize];
+                        for j in 0..8 {
+                            let sign = if signs & KMASK_IQ2XS[j] != 0 { -1.0f32 } else { 1.0f32 };
+                            out[y_off + j] = db * (grid[j] as f32) * sign;
+                        }
+                        y_off += 8;
+                    }
+                }
+            }
+        }
+        GgmlType::Iq2Xs => {
+            assert_eq!(k % QK_K, 0);
+            let blocks: &[BlockIq2Xs] = bytemuck::cast_slice(src);
+            for (b, out) in blocks.iter().zip(dst.chunks_exact_mut(QK_K)) {
+                let d = f16_bytes_to_f32(b.d);
+                let mut y_off = 0usize;
+                for ib32 in 0..(QK_K / 32) {
+                    let db0 = d * (0.5 + ((b.scales[ib32] & 0xF) as f32)) * 0.25;
+                    let db1 = d * (0.5 + ((b.scales[ib32] >> 4) as f32)) * 0.25;
+                    for l in 0..4 {
+                        let q16 = u16::from_le_bytes([
+                            b.qs[8 * ib32 + 2 * l],
+                            b.qs[8 * ib32 + 2 * l + 1],
+                        ]);
+                        let dl = if l < 2 { db0 } else { db1 };
+                        let grid = IQ2XS_GRID[(q16 & 511) as usize].to_le_bytes();
+                        let signs = KSIGNS_IQ2XS[(q16 >> 9) as usize];
+                        for j in 0..8 {
+                            let sign = if signs & KMASK_IQ2XS[j] != 0 { -1.0f32 } else { 1.0f32 };
+                            out[y_off + j] = dl * (grid[j] as f32) * sign;
+                        }
+                        y_off += 8;
+                    }
+                }
+            }
+        }
+        GgmlType::Iq1S => {
+            assert_eq!(k % QK_K, 0);
+            let blocks: &[BlockIq1S] = bytemuck::cast_slice(src);
+            for (b, out) in blocks.iter().zip(dst.chunks_exact_mut(QK_K)) {
+                let d = f16_bytes_to_f32(b.d);
+                let mut y_off = 0usize;
+                for ib in 0..(QK_K / 32) {
+                    let qh = u16::from_le_bytes([b.qh[2 * ib], b.qh[2 * ib + 1]]);
+                    let dl = d * ((2 * ((qh >> 12) & 7) + 1) as f32);
+                    let delta = if (qh & 0x8000) != 0 { -0.125f32 } else { 0.125f32 };
+                    for l in 0..4 {
+                        let idx = (b.qs[4 * ib + l] as usize)
+                            | ((((qh >> (3 * l)) & 7) as usize) << 8);
+                        let grid = IQ1S_GRID[idx].to_le_bytes();
+                        for j in 0..8 {
+                            out[y_off + j] = dl * ((grid[j] as i8 as f32) + delta);
+                        }
+                        y_off += 8;
+                    }
                 }
             }
         }
@@ -574,5 +723,94 @@ mod tests {
         dequantize_row_to_f32(GgmlType::Iq3S, bytemuck::bytes_of(&biq3s), &mut out);
         assert!(out.iter().all(|v| v.is_finite()));
         assert!(out.iter().any(|&v| v != 0.0));
+    }
+
+    #[test]
+    fn test_qwen4_q5_1_and_q2_0_dequant_and_dot() {
+        let mut qh_bits = 0u32;
+        qh_bits |= 1 << 0; // elem 0 gets +16
+        qh_bits |= 1 << 17; // elem 17 gets +16
+        let mut qs5 = [0u8; 16];
+        qs5[0] = 0x23; // elem 0 low=3 -> 19, elem 16 high=2 -> 2
+        qs5[1] = 0x57; // elem 1 low=7 -> 7, elem 17 high=5 -> 21
+        let bq5 = BlockQ5_1 {
+            d: f16::from_f32(0.5).to_le_bytes(),
+            m: f16::from_f32(-4.0).to_le_bytes(),
+            qh: qh_bits.to_le_bytes(),
+            qs: qs5,
+        };
+        let mut out5 = vec![0.0f32; QK5_1];
+        dequantize_row_to_f32(GgmlType::Q5_1, bytemuck::bytes_of(&bq5), &mut out5);
+        assert_eq!(out5[0], 0.5 * 19.0 - 4.0);
+        assert_eq!(out5[1], 0.5 * 7.0 - 4.0);
+        assert_eq!(out5[16], 0.5 * 2.0 - 4.0);
+        assert_eq!(out5[17], 0.5 * 21.0 - 4.0);
+        let ones5 = vec![1.0f32; QK5_1];
+        let expected_dot5: f32 = out5.iter().sum();
+        assert!((vec_dot_q_f32_ref(GgmlType::Q5_1, bytemuck::bytes_of(&bq5), &ones5) - expected_dot5).abs() < 1e-4);
+
+        // Q2_0: codes {0,1,2,3} -> {-1, 0, +1, +2} * d
+        // byte 0xE4 = 0b11_10_01_00 -> codes [0, 1, 2, 3] -> values [-1, 0, +1, +2] * d
+        let mut qs2 = [0x55u8; 16]; // code=1 -> 0
+        qs2[0] = 0xE4;
+        let bq2 = BlockQ2_0 {
+            d: f16::from_f32(0.25).to_le_bytes(),
+            qs: qs2,
+        };
+        let mut out2 = vec![0.0f32; QK2_0];
+        dequantize_row_to_f32(GgmlType::Q2_0, bytemuck::bytes_of(&bq2), &mut out2);
+        assert_eq!(&out2[0..5], &[-0.25, 0.0, 0.25, 0.5, 0.0]);
+        let act2: Vec<f32> = (0..QK2_0).map(|i| (i as f32) * 0.1 + 1.0).collect();
+        let dot2 = vec_dot_q_f32_ref(GgmlType::Q2_0, bytemuck::bytes_of(&bq2), &act2);
+        let exp2 = -0.25 * 1.0 + 0.0 * 1.1 + 0.25 * 1.2 + 0.5 * 1.3;
+        assert!((dot2 - exp2).abs() < 1e-5, "dot2={dot2} exp2={exp2}");
+
+        // IQ2_XXS / IQ2_XS / IQ1_S roundtrip & dot sanity checks
+        let one_f16 = f16::from_f32(1.0).to_le_bytes();
+        let mut biq2xxs = BlockIq2Xxs {
+            d: one_f16,
+            qs: [0u8; QK_K / 4],
+        };
+        biq2xxs.qs[0] = 3;
+        biq2xxs.qs[4] = 1; // sign idx 1 -> KSIGNS_IQ2XS[1] = 129 (bits 0, 7 negative)
+        biq2xxs.qs[7] = 0x20; // nibble 2 -> (0.5 + 2) * 0.25 = 0.625
+        let mut out_xxs = vec![0.0f32; QK_K];
+        dequantize_row_to_f32(GgmlType::Iq2Xxs, bytemuck::bytes_of(&biq2xxs), &mut out_xxs);
+        let g3 = IQ2XXS_GRID[3].to_le_bytes();
+        assert!((out_xxs[0] - (-0.625 * g3[0] as f32)).abs() < 1e-5);
+        assert!((out_xxs[1] - (0.625 * g3[1] as f32)).abs() < 1e-5);
+        assert!((out_xxs[7] - (-0.625 * g3[7] as f32)).abs() < 1e-5);
+
+        let mut biq2xs = BlockIq2Xs {
+            d: one_f16,
+            qs: [0u8; QK_K / 4],
+            scales: [0x31u8; QK_K / 32],
+        };
+        let q0: u16 = 300 | (2u16 << 9);
+        biq2xs.qs[0..2].copy_from_slice(&q0.to_le_bytes());
+        let mut out_xs = vec![0.0f32; QK_K];
+        dequantize_row_to_f32(GgmlType::Iq2Xs, bytemuck::bytes_of(&biq2xs), &mut out_xs);
+        let gx = IQ2XS_GRID[300].to_le_bytes();
+        let s2 = KSIGNS_IQ2XS[2]; // 130 = bit 1 | bit 7
+        for j in 0..8 {
+            let sg = if s2 & KMASK_IQ2XS[j] != 0 { -1.0f32 } else { 1.0f32 };
+            assert!((out_xs[j] - (0.375 * (gx[j] as f32) * sg)).abs() < 1e-5);
+        }
+
+        let mut biq1s = BlockIq1S {
+            d: one_f16,
+            qs: [0u8; QK_K / 8],
+            qh: [0u8; QK_K / 16],
+        };
+        biq1s.qs[0] = 42;
+        let qh0: u16 = 0x8000 | (2u16 << 12) | 3; // delta = -0.125, dl = 5.0, high 3 bits of idx0 = 3
+        biq1s.qh[0..2].copy_from_slice(&qh0.to_le_bytes());
+        let mut out_1s = vec![0.0f32; QK_K];
+        dequantize_row_to_f32(GgmlType::Iq1S, bytemuck::bytes_of(&biq1s), &mut out_1s);
+        let g1 = IQ1S_GRID[(3usize << 8) | 42].to_le_bytes();
+        for j in 0..8 {
+            let exp = 5.0 * ((g1[j] as i8 as f32) - 0.125);
+            assert!((out_1s[j] - exp).abs() < 1e-5);
+        }
     }
 }

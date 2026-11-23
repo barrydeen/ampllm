@@ -1,3 +1,4 @@
+use crate::snapshot::{d2h_full, d2h_prefix, h2d_bytes, InklingKvSnap};
 use ampllm_cuda_kernels::DeviceBuffer;
 use ampllm_gguf::Inkling2Config;
 use anyhow::Result;
@@ -131,5 +132,54 @@ impl KvConvCache {
             .flatten()
             .map(|s| s.k_cache.bytes + s.v_cache.bytes + s.conv_history.bytes)
             .sum()
+    }
+
+    pub(crate) fn capture_full_snapshot(
+        &self,
+        device: i32,
+        cur_pos: usize,
+    ) -> Result<Vec<Option<InklingKvSnap>>> {
+        ampllm_cuda_kernels::set_device(device)?;
+        let mut out = Vec::with_capacity(self.slots.len());
+        for s in &self.slots {
+            match s {
+                Some(slot) => {
+                    let kv_bytes = if slot.ring_cap == 0 {
+                        0
+                    } else {
+                        let row_bytes = slot.k_cache.bytes / slot.ring_cap;
+                        let rows = if slot.swa_window > 0 && cur_pos >= slot.ring_cap {
+                            slot.ring_cap
+                        } else {
+                            cur_pos.min(slot.ring_cap)
+                        };
+                        rows * row_bytes
+                    };
+                    out.push(Some(InklingKvSnap {
+                        k_cache: d2h_prefix(&slot.k_cache, kv_bytes)?,
+                        v_cache: d2h_prefix(&slot.v_cache, kv_bytes)?,
+                        conv_history: d2h_full(&slot.conv_history)?,
+                    }));
+                }
+                None => out.push(None),
+            }
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn restore_full_snapshot(
+        &self,
+        device: i32,
+        snaps: &[Option<InklingKvSnap>],
+    ) -> Result<()> {
+        ampllm_cuda_kernels::set_device(device)?;
+        for (slot_opt, snap_opt) in self.slots.iter().zip(snaps.iter()) {
+            if let (Some(slot), Some(snap)) = (slot_opt, snap_opt) {
+                h2d_bytes(&slot.k_cache, &snap.k_cache)?;
+                h2d_bytes(&slot.v_cache, &snap.v_cache)?;
+                h2d_bytes(&slot.conv_history, &snap.conv_history)?;
+            }
+        }
+        Ok(())
     }
 }

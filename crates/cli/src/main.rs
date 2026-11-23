@@ -1,6 +1,11 @@
 use ampllm_cache::CacheBudget;
-use ampllm_engine::{AnyEngine, EngineConfig, Glm5Engine, Inkling2Engine, KvQuantMode, MultiGpuMode};
-use ampllm_gguf::{GgmlType, GgufFile, Glm5Config, Inkling2Config, ModelArch};
+use ampllm_engine::{
+    AnyEngine, EngineConfig, Glm5Engine, Hy4Engine, Inkling2Engine, KvQuantMode, Mm3Engine,
+    MultiGpuMode, Qwen4Engine, SamplingParams,
+};
+use ampllm_gguf::{
+    GgmlType, GgufFile, Glm5Config, Hy4Config, Inkling2Config, Mm3Config, ModelArch, Qwen4Config,
+};
 use ampllm_tokenizer::BpeTokenizer;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -58,7 +63,7 @@ fn parse_cache_budget(s: &str) -> Result<CacheBudget, String> {
 #[command(
     name = "ampllm",
     version,
-    about = "Pure Rust + CUDA MoE LLM inference engine for Inkling-2-Mini and GLM-5.3-Flash"
+    about = "Pure Rust + CUDA MoE LLM inference engine for Inkling-2-Mini, GLM-5.3-Flash, and Hy4-Flash"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -82,10 +87,10 @@ enum Cmd {
         device: i32,
         #[arg(long, default_value = "auto", value_parser = parse_cache_budget)]
         expert_cache_mb: CacheBudget,
-        #[arg(long, value_enum, default_value_t = CliKvMode::F16)]
-        kv: CliKvMode,
-        #[arg(long, value_enum, default_value_t = CliMultiGpu::Single)]
-        multi_gpu: CliMultiGpu,
+        #[arg(long, value_enum)]
+        kv: Option<CliKvMode>,
+        #[arg(long, value_enum)]
+        multi_gpu: Option<CliMultiGpu>,
         #[arg(long)]
         threads: Option<usize>,
         #[arg(long)]
@@ -99,6 +104,8 @@ enum Cmd {
         model: PathBuf,
         #[arg(short, long)]
         prompt: String,
+        #[arg(long)]
+        image: Vec<PathBuf>,
         #[arg(short = 'n', long, default_value_t = 64)]
         max_tokens: usize,
         #[arg(long, default_value_t = 4096)]
@@ -107,10 +114,10 @@ enum Cmd {
         device: i32,
         #[arg(long, default_value = "auto", value_parser = parse_cache_budget)]
         expert_cache_mb: CacheBudget,
-        #[arg(long, value_enum, default_value_t = CliKvMode::F16)]
-        kv: CliKvMode,
-        #[arg(long, value_enum, default_value_t = CliMultiGpu::Single)]
-        multi_gpu: CliMultiGpu,
+        #[arg(long, value_enum)]
+        kv: Option<CliKvMode>,
+        #[arg(long, value_enum)]
+        multi_gpu: Option<CliMultiGpu>,
         #[arg(long)]
         threads: Option<usize>,
         #[arg(long)]
@@ -134,10 +141,10 @@ enum Cmd {
         device: i32,
         #[arg(long, default_value = "auto", value_parser = parse_cache_budget)]
         expert_cache_mb: CacheBudget,
-        #[arg(long, value_enum, default_value_t = CliKvMode::F16)]
-        kv: CliKvMode,
-        #[arg(long, value_enum, default_value_t = CliMultiGpu::Single)]
-        multi_gpu: CliMultiGpu,
+        #[arg(long, value_enum)]
+        kv: Option<CliKvMode>,
+        #[arg(long, value_enum)]
+        multi_gpu: Option<CliMultiGpu>,
         #[arg(long)]
         threads: Option<usize>,
         #[arg(long)]
@@ -148,6 +155,10 @@ enum Cmd {
         load_profile: Option<PathBuf>,
         #[arg(long)]
         save_profile: Option<PathBuf>,
+        #[arg(long, default_value_t = 4)]
+        parallel: usize,
+        #[arg(long, default_value_t = 32)]
+        slot_quantum: usize,
     },
 }
 
@@ -168,6 +179,48 @@ struct GoldenPrompt {
 struct GoldenTop5 {
     id: u32,
     logit: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_engine_cfg(
+    arch: ModelArch,
+    max_ctx: usize,
+    device: i32,
+    expert_cache: CacheBudget,
+    kv: Option<CliKvMode>,
+    multi_gpu: Option<CliMultiGpu>,
+    cpu_threads: Option<usize>,
+    no_cuda_graph: bool,
+    no_spec: bool,
+    load_profile: Option<PathBuf>,
+    save_profile: Option<PathBuf>,
+) -> EngineConfig {
+    let resolved_multi_gpu = multi_gpu.map(Into::into).unwrap_or(match arch {
+        ModelArch::Inkling2 => MultiGpuMode::Single,
+        ModelArch::Glm5 | ModelArch::Hy4 | ModelArch::Qwen4Exp | ModelArch::MinimaxM3 => {
+            MultiGpuMode::Pipeline
+        }
+    });
+    let resolved_kv = kv.map(Into::into).unwrap_or(match arch {
+        ModelArch::Hy4 if max_ctx > 16384 => KvQuantMode::Q8_0,
+        ModelArch::Qwen4Exp if max_ctx > 16384 => KvQuantMode::Q8_0,
+        ModelArch::MinimaxM3 => KvQuantMode::Q8_0,
+        _ => KvQuantMode::F16,
+    });
+    EngineConfig {
+        device,
+        max_ctx,
+        max_batch: 512,
+        kv_mode: resolved_kv,
+        expert_cache,
+        multi_gpu: resolved_multi_gpu,
+        cpu_threads,
+        use_cuda_graph: !no_cuda_graph,
+        use_spec: !no_spec,
+        load_profile,
+        save_profile,
+        ..Default::default()
+    }
 }
 
 fn main() -> Result<()> {
@@ -251,6 +304,154 @@ fn main() -> Result<()> {
                         cfg.idx_top_k
                     );
                 }
+                ModelArch::Hy4 => {
+                    let cfg = Hy4Config::from_gguf(&gguf)?;
+                    println!(
+                        "GGUF v{} | shards={} | tensors={} | kv={} | arch={}",
+                        gguf.version,
+                        gguf.shard_count(),
+                        gguf.tensors.len(),
+                        gguf.metadata.len(),
+                        cfg.arch
+                    );
+                    let n_swa = (0..cfg.n_layer).filter(|&l| cfg.swa[l]).count();
+                    let n_dsa = (0..cfg.n_layer).filter(|&l| cfg.indexer[l]).count();
+                    println!(
+                        "Config: layers={} (swa={} dsa={} dense_lead={} moe={} mtp={}) embd={} vocab={} hc={} experts={}/{} shared={} latent={} ff_exp={} ff_dense={} ix_topk={}",
+                        cfg.n_layer,
+                        n_swa,
+                        n_dsa,
+                        cfg.n_dense_lead,
+                        cfg.n_layer.saturating_sub(cfg.n_dense_lead),
+                        cfg.n_mtp,
+                        cfg.n_embd,
+                        cfg.n_vocab,
+                        cfg.hc,
+                        cfg.n_expert,
+                        cfg.n_expert_used,
+                        cfg.n_expert_shared,
+                        cfg.n_expert_latent,
+                        cfg.n_ff_exp,
+                        cfg.n_ff,
+                        cfg.ix_top_k
+                    );
+                    if let Some(ref eng) = cfg.engram {
+                        println!(
+                            "Engram: layers={:?} table_rows={} external_scales={}",
+                            eng.layers,
+                            eng.table_rows,
+                            eng.scales_path.is_some()
+                        );
+                    }
+                }
+                ModelArch::Qwen4Exp => {
+                    let cfg = Qwen4Config::from_gguf(&gguf)?;
+                    println!(
+                        "GGUF v{} | shards={} | tensors={} | kv={} | arch={}",
+                        gguf.version,
+                        gguf.shard_count(),
+                        gguf.tensors.len(),
+                        gguf.metadata.len(),
+                        cfg.arch
+                    );
+                    let n_qsa = (0..cfg.n_layer).filter(|&l| cfg.is_qsa(l)).count();
+                    let n_gdn = cfg.n_layer.saturating_sub(n_qsa);
+                    println!(
+                        "Config: layers={} (gdn={} qsa={}) embd={} vocab={} heads={}:{} head_dim={} hc={}/{} experts={}/{} ff_exp={} ff_sh={} idx={}:{}x{} rope={}/{:?}",
+                        cfg.n_layer,
+                        n_gdn,
+                        n_qsa,
+                        cfg.n_embd,
+                        cfg.n_vocab,
+                        cfg.n_head,
+                        cfg.n_head_kv,
+                        cfg.head_dim,
+                        cfg.hc,
+                        cfg.hc_low_rank,
+                        cfg.n_expert,
+                        cfg.n_expert_used,
+                        cfg.n_ff_exp,
+                        cfg.n_ff_shared,
+                        cfg.idx_heads,
+                        cfg.idx_key_dim,
+                        cfg.idx_top_k,
+                        cfg.rope_dim,
+                        cfg.rope_sections,
+                    );
+                    if let Some(ref ple) = cfg.ple {
+                        println!(
+                            "PLE: layers={:?} ngram={} heads={} conv_k={} dim={} table_rows={} type={:?}",
+                            ple.layers,
+                            ple.ngram_size,
+                            ple.n_heads(),
+                            ple.conv_kernel,
+                            ple.head_dim,
+                            ple.table_rows,
+                            ple.table_type
+                        );
+                    }
+                    if let Ok((mtp_opt, mm_opt)) =
+                        ampllm_gguf::discover_qwen4_aux_files(&model, None, None)
+                    {
+                        println!(
+                            "Aux files: mtp={} | mmproj={}",
+                            mtp_opt
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "none".to_owned()),
+                            mm_opt
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "none".to_owned()),
+                        );
+                    }
+                }
+                ModelArch::MinimaxM3 => {
+                    let cfg = Mm3Config::from_gguf(&gguf)?;
+                    println!(
+                        "GGUF v{} | shards={} | tensors={} | kv={} | arch=minimax-m3",
+                        gguf.version,
+                        gguf.shard_count(),
+                        gguf.tensors.len(),
+                        gguf.metadata.len(),
+                    );
+                    println!(
+                        "Config: layers={} (dense={} moe={}) embd={} vocab={} heads={}:{} head_dim={} experts={}/{} ff_exp={} ff_dense={} idx={}:{}x{} topk={}",
+                        cfg.n_layers,
+                        cfg.n_dense_layers,
+                        cfg.n_layers.saturating_sub(cfg.n_dense_layers),
+                        cfg.n_embd,
+                        cfg.vocab_size,
+                        cfg.n_heads,
+                        cfg.n_kv_heads,
+                        cfg.head_dim,
+                        cfg.n_experts,
+                        cfg.n_experts_used,
+                        cfg.expert_ff,
+                        cfg.n_dense_ff,
+                        cfg.ix_heads,
+                        cfg.ix_head_dim,
+                        cfg.ix_block_size,
+                        cfg.ix_top_k
+                    );
+                    if let Ok(aux) = ampllm_gguf::discover_mm3_aux_files(&model, None, None) {
+                        println!(
+                            "Aux files: indexers={} | dspark={} | vision={}",
+                            aux.indexers_bin
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "embedded".to_owned()),
+                            aux.dspark_safetensors
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "none".to_owned()),
+                            aux.vision_safetensors
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "none".to_owned()),
+                        );
+                    }
+                }
             }
             println!(
                 "Expert pool bytes: {:.2} GiB",
@@ -266,15 +467,21 @@ fn main() -> Result<()> {
                     | GgmlType::Bf16
                     | GgmlType::Q8_0
                     | GgmlType::Q4_0
+                    | GgmlType::Q5_1
+                    | GgmlType::Q2_0
                     | GgmlType::Q3K
                     | GgmlType::Q4K
                     | GgmlType::Q5K
                     | GgmlType::Q6K
+                    | GgmlType::Iq1S
+                    | GgmlType::Iq2Xxs
+                    | GgmlType::Iq2Xs
                     | GgmlType::Iq2S
                     | GgmlType::Iq3Xxs
                     | GgmlType::Iq3S
                     | GgmlType::Iq4Nl
                     | GgmlType::Iq4Xs
+                    | GgmlType::F8E4m3
                     | GgmlType::Nvfp4 => {}
                     other => anyhow::bail!("unsupported tensor type {other:?} on {}", t.name),
                 }
@@ -306,25 +513,27 @@ fn main() -> Result<()> {
             let gguf = GgufFile::open(&model)?;
             if gguf.architecture()? != ModelArch::Inkling2 {
                 anyhow::bail!(
-                    "verify currently supports Inkling-2-Mini golden parity files; use `ampllm inspect` or `ampllm run` for GLM-5.3-Flash"
+                    "verify currently supports Inkling-2-Mini golden parity files; use `ampllm inspect` or `ampllm run` for GLM-5.3-Flash and Hy4-Flash"
                 );
             }
             let tok = BpeTokenizer::from_gguf(&gguf)?;
-            let engine_cfg = EngineConfig {
+            let engine_cfg = build_engine_cfg(
+                ModelArch::Inkling2,
+                2048,
                 device,
-                max_ctx: 2048,
-                max_batch: 512,
-                kv_mode: kv.into(),
-                expert_cache: expert_cache_mb,
-                multi_gpu: multi_gpu.into(),
-                cpu_threads: threads,
-                use_cuda_graph: !no_cuda_graph,
+                expert_cache_mb,
+                kv,
+                multi_gpu,
+                threads,
+                no_cuda_graph,
+                false,
                 load_profile,
                 save_profile,
-                ..Default::default()
-            };
+            );
             println!(
-                "Loading Inkling-2-Mini (mode={multi_gpu:?}, cache={expert_cache_mb:?}, kv={kv:?})..."
+                "Loading Inkling-2-Mini (mode={:?}, cache={expert_cache_mb:?}, kv={:?})...",
+                engine_cfg.multi_gpu,
+                engine_cfg.kv_mode
             );
             let mut engine = Inkling2Engine::load(&gguf, engine_cfg)?;
             println!("Engine ready: {}", engine.cache_summary());
@@ -372,6 +581,7 @@ fn main() -> Result<()> {
         Cmd::Run {
             model,
             prompt,
+            image,
             max_tokens,
             max_ctx,
             device,
@@ -387,29 +597,165 @@ fn main() -> Result<()> {
             let gguf = GgufFile::open(&model)?;
             let tok = BpeTokenizer::from_gguf(&gguf)?;
             let arch = gguf.architecture()?;
-            let engine_cfg = EngineConfig {
-                device,
+            let engine_cfg = build_engine_cfg(
+                arch,
                 max_ctx,
-                max_batch: 512,
-                kv_mode: kv.into(),
-                expert_cache: expert_cache_mb,
-                multi_gpu: multi_gpu.into(),
-                cpu_threads: threads,
-                use_cuda_graph: !no_cuda_graph,
-                use_spec: !no_spec,
+                device,
+                expert_cache_mb,
+                kv,
+                multi_gpu,
+                threads,
+                no_cuda_graph,
+                no_spec,
                 load_profile,
                 save_profile,
-                ..Default::default()
-            };
+            );
             let mut engine = match arch {
                 ModelArch::Inkling2 => {
                     AnyEngine::Inkling2(Box::new(Inkling2Engine::load(&gguf, engine_cfg)?))
                 }
                 ModelArch::Glm5 => AnyEngine::Glm5(Box::new(Glm5Engine::load(gguf, &tok, engine_cfg)?)),
+                ModelArch::Hy4 => AnyEngine::Hy4(Box::new(Hy4Engine::load(gguf, engine_cfg)?)),
+                ModelArch::Qwen4Exp => Qwen4Engine::load(gguf, engine_cfg)
+                    .map(|e| AnyEngine::Qwen4(Box::new(e)))?,
+                ModelArch::MinimaxM3 => Mm3Engine::load(gguf, engine_cfg)
+                    .map(|e| AnyEngine::Mm3(Box::new(e)))?,
             };
-            let ids = tok.encode(&prompt, true)?;
-            let (gen, pf_tps, dc_tps, _) = engine.generate_greedy(&ids, max_tokens)?;
-            println!("{}", tok.decode(&gen, false));
+
+            let (gen, pf_tps, dc_tps) = if !image.is_empty() {
+                if !engine.has_vision() {
+                    anyhow::bail!(
+                        "--image requires a multimodal model loaded with mmproj vision weights"
+                    );
+                }
+                let mut parts: Vec<serde_json::Value> = image
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "type": "image_url",
+                            "image_url": { "url": p.to_string_lossy().as_ref() }
+                        })
+                    })
+                    .collect();
+                parts.push(serde_json::json!({ "type": "text", "text": prompt }));
+                let msg = ampllm_server::routes::ChatMessage {
+                    role: "user".to_owned(),
+                    content: Some(serde_json::Value::Array(parts)),
+                    ..Default::default()
+                };
+                if arch == ModelArch::Qwen4Exp {
+                    let (rendered, _, _, img_sources) = ampllm_server::routes::format_qwen4_chat(
+                        &[msg],
+                        None,
+                        None,
+                        true,
+                        "xhigh",
+                        true,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let raw_ids = tok.encode(&rendered, true)?;
+                    let (eval_ids, spans) = ampllm_server::vision::prepare_and_encode_qwen4_images(
+                        &mut engine,
+                        &raw_ids,
+                        &img_sources,
+                    )?;
+                    let params = SamplingParams {
+                        temperature: 0.0,
+                        top_p: 1.0,
+                        seed: 42,
+                        max_tokens,
+                        stop_token_ids: ampllm_server::qwen4_stop_ids(&tok),
+                    };
+                    let res = engine.generate_stream_with_qwen4_images(
+                        &eval_ids,
+                        &spans,
+                        &params,
+                        |_| true,
+                    )?;
+                    (res.generated_tokens, res.prefill_tps, res.decode_tps)
+                } else if arch == ModelArch::MinimaxM3 {
+                    let (rendered, _, _, img_sources) = ampllm_server::routes::format_mm3_chat(
+                        &[msg],
+                        None,
+                        None,
+                        "disabled",
+                        None,
+                        true,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let raw_ids = tok.encode(&rendered, true)?;
+                    let (eval_ids, spans) = ampllm_server::vision::prepare_and_encode_mm3_images(
+                        &mut engine,
+                        &raw_ids,
+                        &img_sources,
+                    )?;
+                    let params = SamplingParams {
+                        temperature: 0.0,
+                        top_p: 1.0,
+                        seed: 42,
+                        max_tokens,
+                        stop_token_ids: ampllm_server::mm3_stop_ids(&tok),
+                    };
+                    let res = engine.generate_stream_with_mm3_images(
+                        &eval_ids,
+                        &spans,
+                        &params,
+                        |_| true,
+                    )?;
+                    (res.generated_tokens, res.prefill_tps, res.decode_tps)
+                } else {
+                    let hytk = tok
+                        .hy4_tag_suffix()
+                        .map(|s| format!(":{s}"))
+                        .unwrap_or_else(|| ":opensource".to_owned());
+                    let (rendered, _, _, img_sources) = ampllm_server::routes::format_hy4_chat(
+                        &[msg],
+                        None,
+                        None,
+                        true,
+                        "high",
+                        &hytk,
+                        true,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let raw_ids = tok.encode(&rendered, true)?;
+                    let (eval_ids, spans) = ampllm_server::vision::prepare_and_encode_hy4_images(
+                        &mut engine,
+                        &raw_ids,
+                        &img_sources,
+                    )?;
+                    let params = SamplingParams {
+                        temperature: 0.0,
+                        top_p: 1.0,
+                        seed: 42,
+                        max_tokens,
+                        stop_token_ids: ampllm_server::hy4_stop_ids(&tok, &hytk),
+                    };
+                    let res =
+                        engine.generate_stream_with_images(&eval_ids, &spans, &params, |_| true)?;
+                    (res.generated_tokens, res.prefill_tps, res.decode_tps)
+                }
+            } else {
+                let mut ids = tok.encode(&prompt, true)?;
+                if arch == ModelArch::Hy4 && !prompt.starts_with("<｜") {
+                    if let Some(bos) = tok.bos_token_id {
+                        if ids.first() != Some(&bos) {
+                            ids.insert(0, bos);
+                        }
+                    }
+                }
+                let (gen, pf_tps, dc_tps, _) = engine.generate_greedy(&ids, max_tokens)?;
+                (gen, pf_tps, dc_tps)
+            };
+
+            let decoded = if arch == ModelArch::Hy4 {
+                tok.decode_hy4_aliased(&gen)
+            } else if arch == ModelArch::Qwen4Exp {
+                tok.decode_skip_control(&gen)
+            } else {
+                tok.decode(&gen, false)
+            };
+            println!("{decoded}");
             let stats = engine.cache_stats();
             eprintln!(
                 "\n[prefill={pf_tps:.1} tok/s, decode={dc_tps:.1} tok/s | hit_rate={:.1}% promotions={} | {}]",
@@ -433,6 +779,8 @@ fn main() -> Result<()> {
             no_spec,
             load_profile,
             save_profile,
+            parallel,
+            slot_quantum,
         } => {
             let gguf = GgufFile::open(&model)?;
             let tok = BpeTokenizer::from_gguf(&gguf)?;
@@ -440,38 +788,53 @@ fn main() -> Result<()> {
             let default_name = match arch {
                 ModelArch::Inkling2 => "inkling2-mini",
                 ModelArch::Glm5 => "glm-5.3-flash",
+                ModelArch::Hy4 => "hy4-flash",
+                ModelArch::Qwen4Exp => "qwen3.8-flash-next",
+                ModelArch::MinimaxM3 => "minimax-m3.1-flash",
             };
             let model_name = model
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or(default_name)
                 .to_owned();
-            let engine_cfg = EngineConfig {
-                device,
+            let engine_cfg = build_engine_cfg(
+                arch,
                 max_ctx,
-                max_batch: 512,
-                kv_mode: kv.into(),
-                expert_cache: expert_cache_mb,
-                multi_gpu: multi_gpu.into(),
-                cpu_threads: threads,
-                use_cuda_graph: !no_cuda_graph,
-                use_spec: !no_spec,
+                device,
+                expert_cache_mb,
+                kv,
+                multi_gpu,
+                threads,
+                no_cuda_graph,
+                no_spec,
                 load_profile,
                 save_profile,
-                ..Default::default()
-            };
+            );
             let engine = match arch {
                 ModelArch::Inkling2 => {
                     AnyEngine::Inkling2(Box::new(Inkling2Engine::load(&gguf, engine_cfg)?))
                 }
                 ModelArch::Glm5 => AnyEngine::Glm5(Box::new(Glm5Engine::load(gguf, &tok, engine_cfg)?)),
+                ModelArch::Hy4 => AnyEngine::Hy4(Box::new(Hy4Engine::load(gguf, engine_cfg)?)),
+                ModelArch::Qwen4Exp => Qwen4Engine::load(gguf, engine_cfg)
+                    .map(|e| AnyEngine::Qwen4(Box::new(e)))?,
+                ModelArch::MinimaxM3 => Mm3Engine::load(gguf, engine_cfg)
+                    .map(|e| AnyEngine::Mm3(Box::new(e)))?,
             };
-            println!("Serving {model_name}: {}", engine.cache_summary());
+            let server_cfg = ampllm_server::ServerConfig::from_cli(parallel, slot_quantum);
+            println!(
+                "Serving {model_name} (parallel={} quantum={}): {}",
+                server_cfg.parallel_slots,
+                server_cfg.slot_quantum,
+                engine.cache_summary()
+            );
             let addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(ampllm_server::run_server(engine, tok, model_name, addr))?;
+            rt.block_on(ampllm_server::run_server_with_config(
+                engine, tok, model_name, addr, server_cfg,
+            ))?;
         }
     }
     Ok(())

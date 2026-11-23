@@ -1357,6 +1357,41 @@ pub unsafe fn moe_prefill_small_down(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub unsafe fn moe_prefill_small_down_det(
+    d_type: i32,
+    exp_ptrs: *const u64,
+    slot_off: *const i32,
+    slot_nt: *const i32,
+    pair_all: *const i32,
+    wts_all: *const f32,
+    d_off: u32,
+    d_row_bytes: usize,
+    inter_q8: *const c_void,
+    pair_out_f32: *mut f32,
+    n_embd: i32,
+    n_ff: i32,
+    n_jobs: i32,
+    stream: &CudaStream,
+) {
+    ffi::launch_glm5_moe_prefill_small_down_det(
+        d_type,
+        exp_ptrs,
+        slot_off,
+        slot_nt,
+        pair_all,
+        wts_all,
+        d_off,
+        d_row_bytes,
+        inter_q8,
+        pair_out_f32,
+        n_embd,
+        n_ff,
+        n_jobs,
+        stream.raw,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn dsa_mla_prefill_mma(
     q_abs: *const f32,
     vram_lat8: *const c_void,

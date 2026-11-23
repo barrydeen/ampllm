@@ -1,23 +1,30 @@
 pub mod metrics;
 pub mod parser;
 pub mod routes;
+pub mod scheduler;
+pub mod vision;
+
+pub use scheduler::{ServerConfig, SlotPublicStatus};
 
 use crate::metrics::ServerMetrics;
-use crate::parser::{ChatOutputMode, OutputParser, ParsedEvent};
+use crate::parser::{ChatOutputMode, ParsedEvent};
 use crate::routes::{
-    chat_completions, completions, health, list_models, metrics, AppState, EngineJob, StreamEvent,
+    chat_completions, completions, health, list_models, list_slots, metrics, AppState, EngineJob,
+    ServerModelKind, StreamEvent,
 };
+use crate::scheduler::{RealBackend, SlotScheduler};
 use ampllm_engine::AnyEngine;
 use ampllm_tokenizer::BpeTokenizer;
 use anyhow::Result;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
-fn collect_stop_ids(tokenizer: &BpeTokenizer, specials: &[&str]) -> Vec<u32> {
+pub(crate) fn collect_stop_ids(tokenizer: &BpeTokenizer, specials: &[&str]) -> Vec<u32> {
     let mut ids = vec![tokenizer.eos_token_id];
     for s in specials {
         if let Some(id) = tokenizer.token_id(s) {
@@ -29,7 +36,7 @@ fn collect_stop_ids(tokenizer: &BpeTokenizer, specials: &[&str]) -> Vec<u32> {
     ids
 }
 
-fn forward_parsed_event(ev: ParsedEvent, tx: &mpsc::UnboundedSender<StreamEvent>) {
+pub(crate) fn forward_parsed_event(ev: ParsedEvent, tx: &mpsc::UnboundedSender<StreamEvent>) {
     match ev {
         ParsedEvent::Token(t) => {
             let _ = tx.send(StreamEvent::Token(t));
@@ -53,201 +60,131 @@ fn forward_parsed_event(ev: ParsedEvent, tx: &mpsc::UnboundedSender<StreamEvent>
     }
 }
 
-fn decode_for_mode(tokenizer: &BpeTokenizer, mode: &ChatOutputMode, ids: &[u32]) -> String {
+/// Collect stop token IDs for Hy4-Flash turn boundaries and end-of-sequence tokens.
+pub fn hy4_stop_ids(tokenizer: &BpeTokenizer, hytk: &str) -> Vec<u32> {
+    let hy_end = format!("<｜hy_end{hytk}｜>");
+    let hy_start = format!("<｜hy_start{hytk}｜>");
+    collect_stop_ids(
+        tokenizer,
+        &[
+            hy_end.as_str(),
+            hy_start.as_str(),
+            "<｜end▁of▁sentence｜>",
+            "<|endoftext|>",
+        ],
+    )
+}
+
+/// Collect stop token IDs for Qwen3.8-Flash-Next turn boundaries and end-of-sequence tokens.
+pub fn qwen4_stop_ids(tokenizer: &BpeTokenizer) -> Vec<u32> {
+    collect_stop_ids(tokenizer, &["<|im_end|>", "<|endoftext|>"])
+}
+
+pub fn mm3_stop_ids(tokenizer: &BpeTokenizer) -> Vec<u32> {
+    collect_stop_ids(tokenizer, &["[e~[", "]~b]", "]~!b["])
+}
+
+pub(crate) fn decode_for_mode(
+    tokenizer: &BpeTokenizer,
+    mode: &ChatOutputMode,
+    ids: &[u32],
+) -> String {
     match mode {
-        ChatOutputMode::Glm5 { .. } => tokenizer.decode_skip_control(ids),
+        ChatOutputMode::Glm5 { .. } | ChatOutputMode::Qwen4 { .. } => {
+            tokenizer.decode_skip_control(ids)
+        }
+        ChatOutputMode::Mm3 { .. } => tokenizer.decode(ids, false),
+        ChatOutputMode::Hy4 { .. } => tokenizer.decode_hy4_aliased(ids),
         ChatOutputMode::Inkling2 { .. } => tokenizer.decode(ids, false),
         ChatOutputMode::Plain => tokenizer.decode(ids, true),
     }
 }
 
 pub async fn run_server(
-    mut engine: AnyEngine,
+    engine: AnyEngine,
     tokenizer: BpeTokenizer,
     model_name: String,
     addr: SocketAddr,
 ) -> Result<()> {
-    let is_glm5 = engine.is_glm5();
+    run_server_with_config(engine, tokenizer, model_name, addr, ServerConfig::default()).await
+}
+
+pub async fn run_server_with_config(
+    engine: AnyEngine,
+    tokenizer: BpeTokenizer,
+    model_name: String,
+    addr: SocketAddr,
+    config: ServerConfig,
+) -> Result<()> {
+    let model_kind = if engine.is_mm3() {
+        ServerModelKind::Mm3
+    } else if engine.is_qwen4() {
+        ServerModelKind::Qwen4
+    } else if engine.is_hy4() {
+        ServerModelKind::Hy4
+    } else if engine.is_glm5() {
+        ServerModelKind::Glm5
+    } else {
+        ServerModelKind::Inkling2
+    };
+    let hy4_tag_suffix = if model_kind == ServerModelKind::Hy4 {
+        tokenizer
+            .hy4_tag_suffix()
+            .map(|s| format!(":{s}"))
+            .unwrap_or_else(|| ":opensource".to_owned())
+    } else {
+        String::new()
+    };
+    let has_vision = engine.has_vision();
     let max_ctx = engine.max_ctx();
     let server_metrics = Arc::new(ServerMetrics::default());
     let metrics_worker = Arc::clone(&server_metrics);
-    let (tx, mut rx) = mpsc::unbounded_channel::<EngineJob>();
+    let pending_jobs = Arc::new(AtomicUsize::new(0));
+    let pending_worker = Arc::clone(&pending_jobs);
+    let slot_statuses = Arc::new(RwLock::new(Vec::<SlotPublicStatus>::new()));
+    let statuses_worker = Arc::clone(&slot_statuses);
+    let (tx, rx) = mpsc::unbounded_channel::<EngineJob>();
+    let hy4_tag_worker = hy4_tag_suffix.clone();
 
-    // Dedicated inference thread owns engine (single-writer CUDA context safety)
+    // Dedicated inference thread owns engine + SlotScheduler (single-writer CUDA context safety)
     std::thread::Builder::new()
         .name("ampllm-infer-worker".to_owned())
         .spawn(move || {
-            let glm5_stops = collect_stop_ids(
-                &tokenizer,
-                &["<|endoftext|>", "<|user|>", "<|observation|>", "<|system|>"],
+            let backend = RealBackend::new(engine, tokenizer, model_kind, &hy4_tag_worker);
+            let scheduler = SlotScheduler::new(
+                backend,
+                config,
+                metrics_worker,
+                pending_worker,
+                statuses_worker,
             );
-            let inkling_text_stops = collect_stop_ids(
-                &tokenizer,
-                &[
-                    "<|endoftext|>",
-                    "<|end_message|>",
-                    "<|content_model_end_sampling|>",
-                    "<|message_user|>",
-                    "<|message_system|>",
-                    "<|message_tool|>",
-                ],
-            );
-            let inkling_structured_stops = collect_stop_ids(
-                &tokenizer,
-                &[
-                    "<|endoftext|>",
-                    "<|content_model_end_sampling|>",
-                    "<|message_user|>",
-                    "<|message_system|>",
-                    "<|message_tool|>",
-                ],
-            );
-            let plain_stops = collect_stop_ids(&tokenizer, &["<|endoftext|>"]);
-
-            while let Some(mut job) = rx.blocking_recv() {
-                let mode_stops: &[u32] = match &job.output_mode {
-                    ChatOutputMode::Glm5 { .. } => &glm5_stops,
-                    ChatOutputMode::Inkling2 {
-                        start_in_text,
-                        parse_tools,
-                    } => {
-                        if *start_in_text && !*parse_tools {
-                            &inkling_text_stops
-                        } else {
-                            &inkling_structured_stops
-                        }
-                    }
-                    ChatOutputMode::Plain => &plain_stops,
-                };
-                for &s in mode_stops {
-                    if !job.params.stop_token_ids.contains(&s) {
-                        job.params.stop_token_ids.push(s);
-                    }
-                }
-
-                let prompt_ids = match tokenizer.encode(&job.prompt, true) {
-                    Ok(ids) => ids,
-                    Err(e) => {
-                        let _ = job.resp_tx.send(StreamEvent::Error(e.to_string()));
-                        continue;
-                    }
-                };
-                let avail_tokens = max_ctx.saturating_sub(prompt_ids.len()).max(1);
-                job.params.max_tokens = job.params.max_tokens.min(avail_tokens);
-
-                let mut gen_ids = Vec::new();
-                let mut emitted_bytes = 0usize;
-                let mut hit_stop_str = false;
-                let mut parser =
-                    OutputParser::new(job.output_mode.clone(), job.call_id_prefix.clone());
-                let max_stop_len = job.stop_strings.iter().map(|s| s.len()).max().unwrap_or(0);
-
-                let resp_tx_cb = &job.resp_tx;
-                let mut emit_piece = |s: &str| {
-                    parser.push(s, &mut |ev| forward_parsed_event(ev, resp_tx_cb));
-                };
-
-                let res = engine.generate_stream(&prompt_ids, &job.params, |tok_id| {
-                    gen_ids.push(tok_id);
-                    let decoded = decode_for_mode(&tokenizer, &job.output_mode, &gen_ids);
-                    if !job.stop_strings.is_empty() {
-                        for stop_s in &job.stop_strings {
-                            if let Some(pos) = decoded.find(stop_s.as_str()) {
-                                if pos > emitted_bytes && decoded.is_char_boundary(pos) {
-                                    emit_piece(&decoded[emitted_bytes..pos]);
-                                }
-                                hit_stop_str = true;
-                                return false;
-                            }
-                        }
-                    }
-                    // Hold back trailing potential partial stop match or replacement char U+FFFD
-                    let mut send_until = decoded.len();
-                    if decoded.ends_with('\u{FFFD}') {
-                        send_until = decoded.len().saturating_sub('\u{FFFD}'.len_utf8());
-                    } else if max_stop_len > 1 {
-                        let keep_tail = max_stop_len - 1;
-                        let target = decoded.len().saturating_sub(keep_tail);
-                        let mut p = target;
-                        while p > emitted_bytes && !decoded.is_char_boundary(p) {
-                            p -= 1;
-                        }
-                        send_until = p;
-                    }
-                    if send_until > emitted_bytes {
-                        let piece = &decoded[emitted_bytes..send_until];
-                        emitted_bytes = send_until;
-                        emit_piece(piece);
-                    }
-                    true
-                });
-
-                match res {
-                    Ok(info) => {
-                        if !hit_stop_str {
-                            let decoded = decode_for_mode(&tokenizer, &job.output_mode, &gen_ids);
-                            if decoded.len() > emitted_bytes {
-                                emit_piece(&decoded[emitted_bytes..]);
-                            }
-                        }
-                        parser.finish(&mut |ev| forward_parsed_event(ev, &job.resp_tx));
-
-                        metrics_worker
-                            .tokens_prefilled_total
-                            .fetch_add(info.prompt_tokens_evaluated as u64, Ordering::Relaxed);
-                        metrics_worker
-                            .tokens_generated_total
-                            .fetch_add(info.generated_tokens.len() as u64, Ordering::Relaxed);
-                        metrics_worker.update_from_engine(
-                            &engine.cache_stats(),
-                            engine.prefix_reuse_tokens_total(),
-                        );
-
-                        let finish_reason = if parser.has_tool_calls() {
-                            "tool_calls".to_owned()
-                        } else if !hit_stop_str
-                            && info.generated_tokens.len() >= job.params.max_tokens
-                        {
-                            "length".to_owned()
-                        } else {
-                            "stop".to_owned()
-                        };
-                        let _ = job.resp_tx.send(StreamEvent::Done {
-                            prompt_tokens: info.prompt_tokens_evaluated,
-                            completion_tokens: info.generated_tokens.len(),
-                            prefix_reused_tokens: info.prefix_reused_tokens,
-                            finish_reason,
-                            prefill_tps: info.prefill_tps,
-                            decode_tps: info.decode_tps,
-                            draft_n: info.draft_n,
-                            draft_accepted: info.draft_accepted,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!("infer worker error: {e:#}");
-                        let _ = job.resp_tx.send(StreamEvent::Error(e.to_string()));
-                    }
-                }
-            }
+            scheduler.run(rx);
         })?;
 
     let state = AppState {
         model_name,
-        is_glm5,
+        model_kind,
+        hy4_tag_suffix,
+        has_vision,
         max_ctx,
         tx,
         metrics: server_metrics,
+        pending_jobs,
+        slot_statuses,
     };
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/slots", get(list_slots))
         .route("/models", get(list_models))
         .route("/chat/completions", post(chat_completions))
         .route("/completions", post(completions))
+        .route("/v1/slots", get(list_slots))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/metrics", get(metrics))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -260,9 +197,17 @@ pub async fn run_server(
 mod tests {
     use crate::parser::{ChatOutputMode, OutputParser, ParsedEvent, ToolParamSchema};
     use crate::routes::{
-        extract_tool_schemas, format_glm5_chat, format_inkling2_chat, resolve_glm5_thinking,
-        ChatMessage,
+        extract_tool_schemas, format_glm5_chat, format_hy4_chat, format_inkling2_chat,
+        format_mm3_chat, format_qwen4_chat, resolve_glm5_thinking, resolve_hy4_thinking,
+        resolve_mm3_thinking, resolve_qwen4_thinking, ChatMessage,
     };
+    use crate::vision::{
+        decode_and_prepare_image, decode_and_prepare_mm3_image, decode_and_prepare_qwen4_image,
+        expand_hy4_image_tokens, expand_mm3_image_tokens, expand_qwen4_image_tokens,
+        load_image_source,
+    };
+    use ampllm_gguf::{Hy4VisionConfig, Mm3VisionConfig, Qwen4VisionConfig};
+    use base64::Engine as _;
     use serde_json::json;
 
     fn user_msg(s: &str) -> ChatMessage {
@@ -553,5 +498,511 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&calls[0].3).unwrap(),
             json!({"a": 7, "b": 6})
         );
+    }
+
+    #[test]
+    fn test_hy4_chat_template_tools_and_streaming_parser() {
+        assert_eq!(resolve_hy4_thinking(None, None), (true, "high"));
+        assert_eq!(
+            resolve_hy4_thinking(Some(&json!({"enable_thinking": false})), None),
+            (false, "no_think")
+        );
+        assert_eq!(
+            resolve_hy4_thinking(None, Some(&json!("no_think"))),
+            (false, "no_think")
+        );
+        assert_eq!(
+            resolve_hy4_thinking(None, Some(&json!("max"))),
+            (true, "max")
+        );
+
+        let msgs = vec![user_msg("Hi")];
+        let (p_off, exp_off, pf_off, imgs_off) =
+            format_hy4_chat(&msgs, None, None, false, "no_think", ":opensource", false).unwrap();
+        assert!(!exp_off);
+        assert!(pf_off.is_empty());
+        assert!(imgs_off.is_empty());
+        assert_eq!(
+            p_off,
+            "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Hi<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>"
+        );
+
+        let (p_hi, exp_hi, pf_hi, _) =
+            format_hy4_chat(&msgs, None, None, true, "high", ":opensource", false).unwrap();
+        assert!(exp_hi);
+        assert!(pf_hi.is_empty());
+        assert!(p_hi.ends_with("<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"));
+
+        let msgs2 = vec![
+            user_msg("Hi"),
+            ChatMessage {
+                role: "assistant".to_owned(),
+                content: Some(json!("Hello!")),
+                ..Default::default()
+            },
+            user_msg("Next?"),
+        ];
+        let (p_t2, _, _, _) =
+            format_hy4_chat(&msgs2, None, None, false, "no_think", ":opensource", false).unwrap();
+        assert!(p_t2.starts_with(&p_off));
+
+        let tools = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "calc",
+                    "description": "Multiply integers",
+                    "strict": true,
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "a": {"type": "integer"}, "b": {"type": "integer"} }
+                    }
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "skip_me",
+                    "defer_loading": true,
+                    "parameters": {}
+                }
+            }),
+        ];
+        let tool_msgs = vec![
+            user_msg("Compute 7*6 and 2*3"),
+            ChatMessage {
+                role: "assistant".to_owned(),
+                reasoning_content: Some("Need calc.".to_owned()),
+                content: None,
+                tool_calls: Some(vec![
+                    json!({"id": "c1", "function": {"name": "calc", "arguments": "{\"a\":7,\"b\":6}"}}),
+                    json!({"id": "c2", "function": {"name": "calc", "arguments": "{\"a\":2,\"b\":3}"}}),
+                ]),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "tool".to_owned(),
+                tool_call_id: Some("c2".to_owned()),
+                content: Some(json!("6")),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "tool".to_owned(),
+                tool_call_id: Some("c1".to_owned()),
+                content: Some(json!("42")),
+                ..Default::default()
+            },
+        ];
+        let (pt, _, _, _) = format_hy4_chat(
+            &tool_msgs,
+            Some(&tools),
+            None,
+            true,
+            "high",
+            ":opensource",
+            false,
+        )
+        .unwrap();
+        assert!(!pt.contains("skip_me"));
+        assert!(!pt.contains("\"strict\""));
+        assert!(pt.contains("<｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>42</tool_response:opensource><tool_response:opensource>6</tool_response:opensource><｜hy_end:opensource｜>"));
+
+        let forced = json!({"type": "function", "function": {"name": "calc"}});
+        let (pf_prompt, pf_think, pf_str, _) = format_hy4_chat(
+            &[user_msg("go")],
+            Some(&tools),
+            Some(&forced),
+            true,
+            "high",
+            ":opensource",
+            false,
+        )
+        .unwrap();
+        assert!(!pf_think);
+        assert_eq!(pf_str, "<tool_call>calc");
+        assert!(pf_prompt.ends_with("<tool_calls:opensource><tool_call:opensource>calc"));
+
+        // Reject image in system message and reject image when vision disabled
+        let img_msg = vec![ChatMessage {
+            role: "user".to_owned(),
+            content: Some(json!([
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                {"type": "text", "text": "describe"}
+            ])),
+            ..Default::default()
+        }];
+        assert!(format_hy4_chat(&img_msg, None, None, true, "high", ":opensource", false).is_err());
+        let (img_prompt, _, _, img_srcs) =
+            format_hy4_chat(&img_msg, None, None, true, "high", ":opensource", true).unwrap();
+        assert_eq!(img_srcs, vec!["data:image/png;base64,AA=="]);
+        assert!(img_prompt.contains(
+            "<｜hy_image▁start:opensource｜><｜hy_image▁pad:opensource｜><｜hy_image▁end:opensource｜>describe"
+        ));
+
+        let schemas = extract_tool_schemas(Some(&tools));
+        let mut parser = OutputParser::new(
+            ChatOutputMode::Hy4 {
+                expect_think_close: true,
+                parse_tools: true,
+                prefill: String::new(),
+                schemas,
+            },
+            "call_7".to_owned(),
+        );
+        let decoded_aliased = "thinking</think><tool_call>calc<arg_key>a</arg_key><arg_value>7</arg_value><arg_key>b</arg_key><arg_value>6</arg_value></tool_call>";
+        let mut r = String::new();
+        let mut calls = Vec::new();
+        for ch in decoded_aliased.as_bytes().chunks(6) {
+            parser.push(std::str::from_utf8(ch).unwrap(), &mut |ev| match ev {
+                ParsedEvent::Reasoning(s) => r.push_str(&s),
+                ParsedEvent::Token(_) => {}
+                ParsedEvent::ToolCall {
+                    index,
+                    id,
+                    name,
+                    arguments,
+                } => calls.push((index, id, name, arguments)),
+            });
+        }
+        parser.finish(&mut |ev| {
+            if let ParsedEvent::ToolCall {
+                index,
+                id,
+                name,
+                arguments,
+            } = ev
+            {
+                calls.push((index, id, name, arguments));
+            }
+        });
+        assert_eq!(r, "thinking");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2, "calc");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].3).unwrap(),
+            json!({"a": 7, "b": 6})
+        );
+    }
+
+    #[test]
+    fn test_hy4_vision_resize_rgba_and_expand() {
+        let cfg = Hy4VisionConfig {
+            dim: 1152,
+            heads: 16,
+            head_dim: 72,
+            ff: 4304,
+            layers: 27,
+            patch_size: 16,
+            spatial_merge: 2,
+            grid: 128,
+            out_dim: 3072,
+            eps: 1e-5,
+            min_pixels: 4096,
+            max_pixels: 4_194_304,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+            image_token_id: 120120,
+            image_start_id: 120118,
+            image_end_id: 120119,
+        };
+        let rgba = image::RgbaImage::from_pixel(300, 200, image::Rgba([255, 0, 0, 0]));
+        let mut png_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut png_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let data_url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png_bytes.get_ref())
+        );
+
+        let raw = load_image_source(&data_url).unwrap();
+        let pic = decode_and_prepare_image(&raw, &cfg).unwrap();
+        assert_eq!((pic.width, pic.height), (288, 192));
+        assert_eq!(pic.n_tokens, (192 / 32) * (288 / 32 + 1));
+        assert_eq!(pic.rgb.len(), 288 * 192 * 3);
+        assert_eq!(&pic.rgb[..3], &[255, 255, 255]);
+
+        let (expanded, starts) = expand_hy4_image_tokens(
+            &[1, cfg.image_start_id, cfg.image_token_id, cfg.image_end_id, 2],
+            std::slice::from_ref(&pic),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(starts, vec![2]);
+        assert_eq!(expanded.len(), 4 + pic.n_tokens);
+        assert_eq!(&expanded[2..2 + pic.n_tokens], vec![cfg.image_token_id; pic.n_tokens].as_slice());
+
+        // Missing image_start/image_end delimiters must fail cleanly
+        assert!(expand_hy4_image_tokens(&[1, cfg.image_token_id, cfg.image_end_id], std::slice::from_ref(&pic), &cfg).is_err());
+        assert!(expand_hy4_image_tokens(&[1, 2], std::slice::from_ref(&pic), &cfg).is_err());
+    }
+
+    #[test]
+    fn test_qwen4_chat_parser_and_vision_expand() {
+        let (th_on, eff_on) = resolve_qwen4_thinking(None, None).unwrap();
+        assert_eq!((th_on, eff_on), (true, "xhigh"));
+        let (th_high, eff_high) = resolve_qwen4_thinking(None, Some(&json!("high"))).unwrap();
+        assert_eq!((th_high, eff_high), (true, "xhigh"));
+        let (th_low, eff_low) = resolve_qwen4_thinking(None, Some(&json!("low"))).unwrap();
+        assert_eq!((th_low, eff_low), (true, "low"));
+        let (th_off, eff_off) =
+            resolve_qwen4_thinking(Some(&json!({"enable_thinking": false})), None).unwrap();
+        assert!(!th_off && eff_off.is_empty());
+
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "calc",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "integer"},
+                        "expr": {"type": "string"}
+                    }
+                }
+            }
+        }]);
+        let msgs = vec![
+            ChatMessage {
+                role: "system".to_owned(),
+                content: Some(json!("Be terse.")),
+                ..Default::default()
+            },
+            user_msg("compute"),
+        ];
+        let (prompt, expect_think, prefill, imgs) = format_qwen4_chat(
+            &msgs,
+            tools.as_array().map(Vec::as_slice),
+            None,
+            true,
+            "low",
+            false,
+        )
+        .unwrap();
+        assert!(expect_think);
+        assert!(prefill.is_empty());
+        assert!(imgs.is_empty());
+        assert!(prompt.starts_with("<|im_start|>system\nReasoning effort is set to low."));
+        assert!(prompt.contains("<function=example_function_name>"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n"));
+
+        let schemas = extract_tool_schemas(tools.as_array().map(Vec::as_slice));
+        let mut parser = OutputParser::new(
+            ChatOutputMode::Qwen4 {
+                expect_think_close: true,
+                parse_tools: true,
+                prefill: String::new(),
+                schemas,
+            },
+            "call_q4".to_owned(),
+        );
+        let stream_txt = "reason</think>\n\n<tool_call>\n<function=calc>\n<parameter=a>\n42\n</parameter>\n<parameter=expr>\nline1\nline2\n</parameter>\n</function>\n</tool_call>";
+        let mut r = String::new();
+        let mut calls = Vec::new();
+        for chunk in stream_txt.as_bytes().chunks(5) {
+            parser.push(std::str::from_utf8(chunk).unwrap(), &mut |ev| match ev {
+                ParsedEvent::Reasoning(s) => r.push_str(&s),
+                ParsedEvent::Token(_) => {}
+                ParsedEvent::ToolCall {
+                    index,
+                    id,
+                    name,
+                    arguments,
+                } => calls.push((index, id, name, arguments)),
+            });
+        }
+        parser.finish(&mut |_| {});
+        assert_eq!(r, "reason");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2, "calc");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].3).unwrap(),
+            json!({"a": 42, "expr": "line1\nline2"})
+        );
+
+        let vcfg = Qwen4VisionConfig {
+            dim: 1152,
+            heads: 16,
+            head_dim: 72,
+            ff: 4304,
+            layers: 27,
+            patch_size: 16,
+            spatial_merge: 2,
+            image_size: 768,
+            grid: 48,
+            out_dim: 2560,
+            eps: 1e-6,
+            min_pixels: 4096,
+            max_pixels: 4_194_304,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+            image_token_id: 248056,
+            vision_start_id: 248053,
+            vision_end_id: 248054,
+        };
+        let rgba = image::RgbaImage::from_pixel(256, 256, image::Rgba([10, 20, 30, 255]));
+        let mut png_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut png_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let pic = decode_and_prepare_qwen4_image(png_bytes.get_ref(), &vcfg).unwrap();
+        assert_eq!((pic.width, pic.height, pic.n_tokens), (256, 256, 64));
+        let (expanded, starts) = expand_qwen4_image_tokens(
+            &[248045, vcfg.vision_start_id, vcfg.image_token_id, vcfg.vision_end_id, 248046],
+            std::slice::from_ref(&pic),
+            &vcfg,
+        )
+        .unwrap();
+        assert_eq!(starts, vec![2]);
+        assert_eq!(expanded.len(), 4 + 64);
+    }
+
+    #[test]
+    fn test_mm3_chat_parser_and_vision_expand() {
+        let kw = json!({"thinking_mode": "disabled", "reasoning_effort": "low"});
+        let (tm, eff) = resolve_mm3_thinking(Some(&kw), None);
+        assert_eq!(tm, "disabled");
+        assert_eq!(eff.as_deref(), Some("low"));
+
+        let tools = json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "calc",
+                    "description": "Evaluate expression",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "a": {"type": "integer"},
+                            "items": {"type": "array"}
+                        }
+                    }
+                }
+            }
+        ]);
+        let msgs = vec![
+            ChatMessage {
+                role: "developer".to_owned(),
+                content: Some(json!("Be concise.")),
+                ..Default::default()
+            },
+            user_msg("compute 6 * 7"),
+        ];
+        let (prompt, expect_think, prefill, imgs) = format_mm3_chat(
+            &msgs,
+            tools.as_array().map(Vec::as_slice),
+            None,
+            "enabled",
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(expect_think);
+        assert!(prefill.is_empty());
+        assert!(imgs.is_empty());
+        assert!(prompt.starts_with("]~!b[]~b]system\n"));
+        assert!(prompt.contains("]<]minimax[>[<invoke name=\"tool-name-1\">"));
+        assert!(prompt.ends_with("]~b]ai\n<mm:think>"));
+
+        let schemas = extract_tool_schemas(tools.as_array().map(Vec::as_slice));
+        let mut parser = OutputParser::new(
+            ChatOutputMode::Mm3 {
+                expect_think_close: true,
+                parse_tools: true,
+                prefill: String::new(),
+                schemas,
+            },
+            "call_m3".to_owned(),
+        );
+        let stream_txt = "thinking...</mm:think>Hello ]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"calc\">]<]minimax[>[<a>42]<]minimax[>[</a>]<]minimax[>[<items>]<]minimax[>[<item>x]<]minimax[>[</item>]<]minimax[>[<item>y]<]minimax[>[</item>]<]minimax[>[</items>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>";
+        let mut r = String::new();
+        let mut txt = String::new();
+        let mut calls = Vec::new();
+        for chunk in stream_txt.as_bytes().chunks(7) {
+            parser.push(std::str::from_utf8(chunk).unwrap(), &mut |ev| match ev {
+                ParsedEvent::Reasoning(s) => r.push_str(&s),
+                ParsedEvent::Token(s) => txt.push_str(&s),
+                ParsedEvent::ToolCall {
+                    index,
+                    id,
+                    name,
+                    arguments,
+                } => calls.push((index, id, name, arguments)),
+            });
+        }
+        parser.finish(&mut |_| {});
+        assert_eq!(r, "thinking...");
+        assert_eq!(txt, "Hello ");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2, "calc");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].3).unwrap(),
+            json!({"a": 42, "items": ["x", "y"]})
+        );
+
+        let mut p_adapt = OutputParser::new(
+            ChatOutputMode::Mm3 {
+                expect_think_close: false,
+                parse_tools: true,
+                prefill: String::new(),
+                schemas: std::collections::HashMap::new(),
+            },
+            "call_m3_adapt".to_owned(),
+        );
+        let mut adapt_txt = String::new();
+        for chunk in "</mm:think>Hello".as_bytes().chunks(4) {
+            p_adapt.push(std::str::from_utf8(chunk).unwrap(), &mut |ev| {
+                if let ParsedEvent::Token(s) = ev {
+                    adapt_txt.push_str(&s);
+                }
+            });
+        }
+        p_adapt.finish(&mut |ev| {
+            if let ParsedEvent::Token(s) = ev {
+                adapt_txt.push_str(&s);
+            }
+        });
+        assert_eq!(adapt_txt, "Hello");
+
+        let vcfg = Mm3VisionConfig {
+            hidden_size: 1280,
+            num_heads: 16,
+            head_dim: 80,
+            num_layers: 32,
+            intermediate_size: 5120,
+            projection_dim: 6144,
+            patch_size: 14,
+            temporal_patch_size: 2,
+            spatial_merge_size: 2,
+            rope_theta: 10000.0,
+            layer_norm_eps: 1e-5,
+            image_size: 672,
+            max_image_resolution: 672,
+            min_pixels: 3136,
+            max_pixels: 451584,
+            image_mean: [0.48145466, 0.4578275, 0.40821073],
+            image_std: [0.26862954, 0.26130258, 0.27577711],
+            image_token_id: 200025,
+            image_start_token_id: 200029,
+            image_end_token_id: 200030,
+            video_token_id: 200026,
+        };
+        let rgba = image::RgbaImage::from_pixel(280, 280, image::Rgba([10, 20, 30, 255]));
+        let mut png_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut png_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let pic = decode_and_prepare_mm3_image(png_bytes.get_ref(), &vcfg).unwrap();
+        assert_eq!((pic.width, pic.height, pic.n_tokens), (280, 280, 100));
+        let (expanded, starts) = expand_mm3_image_tokens(
+            &[10, vcfg.image_token_id, 11],
+            std::slice::from_ref(&pic),
+            &vcfg,
+        )
+        .unwrap();
+        assert_eq!(starts, vec![2]);
+        assert_eq!(expanded.len(), 2 + 1 + 100 + 1);
+        assert_eq!(expanded[1], vcfg.image_start_token_id);
+        assert_eq!(expanded[102], vcfg.image_end_token_id);
     }
 }

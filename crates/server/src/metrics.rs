@@ -13,6 +13,11 @@ pub struct ServerMetrics {
     pub cache_misses: AtomicU64,
     pub cache_helper_hits: AtomicU64,
     pub cache_promotions: AtomicU64,
+    pub slots_total: AtomicU64,
+    pub slots_active: AtomicU64,
+    pub queue_depth: AtomicU64,
+    pub slot_swaps_total: AtomicU64,
+    pub requests_cancelled_total: AtomicU64,
 }
 
 impl ServerMetrics {
@@ -35,6 +40,11 @@ impl ServerMetrics {
         let misses = self.cache_misses.load(Ordering::Relaxed);
         let h_hits = self.cache_helper_hits.load(Ordering::Relaxed);
         let prom = self.cache_promotions.load(Ordering::Relaxed);
+        let slots_total = self.slots_total.load(Ordering::Relaxed);
+        let slots_active = self.slots_active.load(Ordering::Relaxed);
+        let queue_depth = self.queue_depth.load(Ordering::Relaxed);
+        let slot_swaps = self.slot_swaps_total.load(Ordering::Relaxed);
+        let reqs_cancelled = self.requests_cancelled_total.load(Ordering::Relaxed);
         let tot = hits + h_hits + misses;
         let hit_ratio = if tot == 0 {
             1.0
@@ -45,12 +55,22 @@ impl ServerMetrics {
         let mut out = String::with_capacity(1024);
         let _ = writeln!(out, "# TYPE ampllm_requests_total counter");
         let _ = writeln!(out, "ampllm_requests_total {reqs}");
+        let _ = writeln!(out, "# TYPE ampllm_requests_cancelled_total counter");
+        let _ = writeln!(out, "ampllm_requests_cancelled_total {reqs_cancelled}");
         let _ = writeln!(out, "# TYPE ampllm_tokens_prefilled_total counter");
         let _ = writeln!(out, "ampllm_tokens_prefilled_total {prefill}");
         let _ = writeln!(out, "# TYPE ampllm_tokens_generated_total counter");
         let _ = writeln!(out, "ampllm_tokens_generated_total {gen}");
         let _ = writeln!(out, "# TYPE ampllm_prefix_reuse_tokens_total counter");
         let _ = writeln!(out, "ampllm_prefix_reuse_tokens_total {reuse}");
+        let _ = writeln!(out, "# TYPE ampllm_slots_total gauge");
+        let _ = writeln!(out, "ampllm_slots_total {slots_total}");
+        let _ = writeln!(out, "# TYPE ampllm_slots_active gauge");
+        let _ = writeln!(out, "ampllm_slots_active {slots_active}");
+        let _ = writeln!(out, "# TYPE ampllm_queue_depth gauge");
+        let _ = writeln!(out, "ampllm_queue_depth {queue_depth}");
+        let _ = writeln!(out, "# TYPE ampllm_slot_swaps_total counter");
+        let _ = writeln!(out, "ampllm_slot_swaps_total {slot_swaps}");
         let _ = writeln!(out, "# TYPE ampllm_cache_hits_total counter");
         let _ = writeln!(out, "ampllm_cache_hits_total {hits}");
         let _ = writeln!(out, "# TYPE ampllm_cache_helper_hits_total counter");

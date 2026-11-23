@@ -8,3 +8,4 @@ license.workspace = true
 ampllm-gguf = { path = "../gguf" }
 anyhow.workspace = true
 fancy-regex.workspace = true
+unicode-normalization.workspace = true

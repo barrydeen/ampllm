@@ -11,5 +11,6 @@ libc.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+ampllm-cpu-kernels = { path = "../cpu-kernels" }
 bytemuck.workspace = true
 half.workspace = true

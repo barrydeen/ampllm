@@ -93,6 +93,56 @@ extern "C" {
         stream: CudaStreamHandle,
     );
 
+    pub fn launch_mmvq_q8_0_multi2(
+        w0: *const c_void,
+        y0: *mut f32,
+        n0: i32,
+        w1: *const c_void,
+        y1: *mut f32,
+        n1: i32,
+        x_q8: *const c_void,
+        k: i32,
+        m: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mmvq_q8_0_multi3(
+        w0: *const c_void,
+        y0: *mut f32,
+        n0: i32,
+        w1: *const c_void,
+        y1: *mut f32,
+        n1: i32,
+        w2: *const c_void,
+        y2: *mut f32,
+        n2: i32,
+        x_q8: *const c_void,
+        k: i32,
+        m: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_sh_gu_swiglu_q8(
+        w_gate: *const c_void,
+        w_up: *const c_void,
+        x_q8: *const c_void,
+        y_act: *mut f32,
+        n: i32,
+        k: i32,
+        m: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mmvq_q8_0_indexed_m1(
+        w: *const c_void,
+        subset_ids: *const i32,
+        x_q8: *const c_void,
+        y: *mut f32,
+        n_sub: i32,
+        k: i32,
+        stream: CudaStreamHandle,
+    );
+
     pub fn launch_rmsnorm_f32(
         x: *const f32,
         gamma: *const f32,
@@ -1318,6 +1368,23 @@ extern "C" {
         stream: CudaStreamHandle,
     );
 
+    pub fn launch_glm5_moe_prefill_small_down_det(
+        d_type: i32,
+        exp_ptrs: *const u64,
+        slot_off: *const i32,
+        slot_nt: *const i32,
+        pair_all: *const i32,
+        wts_all: *const f32,
+        d_off: u32,
+        d_row_bytes: usize,
+        inter_q8: *const c_void,
+        pair_out_f32: *mut f32,
+        n_embd: i32,
+        n_ff: i32,
+        n_jobs: i32,
+        stream: CudaStreamHandle,
+    );
+
     pub fn launch_glm5_dsa_mla_prefill_mma(
         q_abs: *const f32,
         vram_lat8: *const c_void,
@@ -1334,6 +1401,1450 @@ extern "C" {
         ctx_scratch: *mut f32,
         out: *mut f32,
         t: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_expand_streams(
+        emb: *const f32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        x_out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_hc_pre(
+        x: *const f32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        fn_w: *const f32,
+        fn_by_el: i32,
+        scale: *const f32,
+        base: *const f32,
+        eps: f32,
+        hc_eps: f32,
+        mag: f32,
+        norm_w_opt: *const f32,
+        norm_eps: f32,
+        is_head: i32,
+        part_buf: *mut f32,
+        cur: *mut f32,
+        post_opt: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_hc_post_norm(
+        x: *mut f32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        y: *const f32,
+        post: *const f32,
+        w_opt: *const f32,
+        eps: f32,
+        y_norm_opt: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_rope(
+        x: *mut f32,
+        t: i32,
+        nh: i32,
+        ld_t: usize,
+        ld_h: usize,
+        off: i32,
+        n_rot: i32,
+        pos: *const i32,
+        base: f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_sigmoid_mul(
+        x: *mut f32,
+        g: *const f32,
+        n: usize,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_swiglu_f32(
+        gate: *const f32,
+        up: *const f32,
+        ld_gu: usize,
+        rows: i32,
+        n: i32,
+        clamp_lim: f32,
+        out: *mut f32,
+        ld_out: usize,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_store_rows(
+        src: *const f32,
+        t: i32,
+        dim: i32,
+        ring: *mut c_void,
+        ring_cap: i32,
+        pos: *const i32,
+        is_f16: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_gemv_f32(
+        w: *const f32,
+        n: i32,
+        k: i32,
+        x: *const f32,
+        m: i32,
+        y: *mut f32,
+        alpha: f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_gemv_bf16(
+        w: *const u16,
+        n: i32,
+        k: i32,
+        x: *const f32,
+        m: i32,
+        y: *mut f32,
+        alpha: f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_quantize_heads_q8_1(
+        x: *const f32,
+        x_q8_1: *mut c_void,
+        t: i32,
+        h: i32,
+        k: i32,
+        ld_t: usize,
+        ld_h: usize,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_batched_heads_q8(
+        w_q8_0: *const c_void,
+        x_q8_1: *const c_void,
+        y: *mut f32,
+        t: i32,
+        h: i32,
+        n: i32,
+        k: i32,
+        x_tok_stride_blk: usize,
+        y_tok_stride: usize,
+        y_head_stride: usize,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_batched_heads_q8_mma(
+        w_q8_0: *const c_void,
+        x_f32: *const f32,
+        y: *mut f32,
+        t: i32,
+        h: i32,
+        n: i32,
+        k: i32,
+        x_tok_stride: usize,
+        x_head_stride: usize,
+        y_tok_stride: usize,
+        y_head_stride: usize,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_kv_store(
+        kv: *const f32,
+        t: i32,
+        kv_lora: i32,
+        n_rot: i32,
+        w: *const f32,
+        eps: f32,
+        pos: *const i32,
+        base: f32,
+        cache: *mut c_void,
+        ring_cap: i32,
+        is_q8: i32,
+        rb: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_mla_decode(
+        q: *const f32,
+        t: i32,
+        h: i32,
+        cache: *const c_void,
+        ring_cap: i32,
+        keys_opt: *const i32,
+        ldk: i32,
+        lo_opt: *const i32,
+        nk: *const i32,
+        max_keys: i32,
+        scale: f32,
+        sinks_opt: *const f32,
+        ws: *mut f32,
+        out: *mut f32,
+        is_q8: i32,
+        rb: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_mla_prefill(
+        q: *const f32,
+        t: i32,
+        h: i32,
+        cache: *const c_void,
+        ring_cap: i32,
+        keys_opt: *const i32,
+        ldk: i32,
+        lo_opt: *const i32,
+        nk: *const i32,
+        scale: f32,
+        sinks_opt: *const f32,
+        out: *mut f32,
+        is_q8: i32,
+        rb: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_ix_pool(
+        ivg: *const c_void,
+        ring_cap: i32,
+        g0: i32,
+        n_new: i32,
+        kpool: i32,
+        dim: i32,
+        ape: *const f32,
+        w: *const f32,
+        eps: f32,
+        n_rot: i32,
+        base: f32,
+        pooled: *mut c_void,
+        is_f16: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_ix_score(
+        q: *const f32,
+        wt: *const f32,
+        t: i32,
+        heads: i32,
+        dim: i32,
+        pooled: *const c_void,
+        pos: *const i32,
+        kpool: i32,
+        n_pool: i32,
+        score: *mut f32,
+        ld: usize,
+        is_f16: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_ix_select(
+        score: *const f32,
+        ld: usize,
+        t: i32,
+        pos: *const i32,
+        kpool: i32,
+        top: i32,
+        keys: *mut i32,
+        ldk: i32,
+        nk: *mut i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_router_sigmoid_topk(
+        logits: *const f32,
+        t: i32,
+        n_exp: i32,
+        bias_opt: *const f32,
+        n_used: i32,
+        norm: i32,
+        scale: f32,
+        ids: *mut i32,
+        wout: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_engram_rows(
+        rows: *const u8,
+        valid: *const f32,
+        t: i32,
+        cols: i32,
+        dim: i32,
+        ln: *const f32,
+        eps: f32,
+        scale_opt: *const f32,
+        out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_engram_mix(
+        x: *mut f32,
+        kv: *const f32,
+        kv_b: *const f32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        egate: *const f32,
+        gamma: *const f32,
+        hcs: *const f32,
+        valid: *const f32,
+        eps: f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_vis_layernorm_f16(
+        x: *const f32,
+        w: *const f32,
+        b: *const f32,
+        n: i32,
+        d: i32,
+        eps: f32,
+        y16: *mut u16,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_vis_rmsnorm_inplace(
+        x: *mut f32,
+        w: *const f32,
+        n: i32,
+        d: i32,
+        eps: f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_vis_add_bias(
+        y: *mut f32,
+        bias: *const f32,
+        n: usize,
+        m: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_vis_bias_act_f16(
+        y: *const f32,
+        bias: *const f32,
+        n: usize,
+        m: i32,
+        act: i32,
+        y16: *mut u16,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_vis_residual_bias(
+        h: *mut f32,
+        t: *const f32,
+        bias: *const f32,
+        n: usize,
+        m: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_vis_merge_gather_f16(
+        xn: *const f32,
+        gw: i32,
+        d: i32,
+        ow: i32,
+        oh: i32,
+        m16: *mut u16,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_vis_place_rows(
+        y: *const f32,
+        bias: *const f32,
+        nl: *const f32,
+        ow: i32,
+        oh: i32,
+        o: i32,
+        out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_vis_flash_attn(
+        qkv: *const f32,
+        n: i32,
+        heads: i32,
+        hd: i32,
+        scale: f32,
+        out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_copy_cols(
+        src: *const f32,
+        ld_src: usize,
+        dst: *mut f32,
+        ld_dst: usize,
+        rows: i32,
+        width: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_add_f32(
+        dst: *mut f32,
+        src: *const f32,
+        n: usize,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_rmsnorm_strided(
+        x: *const f32,
+        ld_x: usize,
+        w: *const f32,
+        y: *mut f32,
+        ld_y: usize,
+        dim: i32,
+        rows: i32,
+        eps: f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_top1_prob(
+        logits: *const f32,
+        n_vocab: i32,
+        scratch_and_out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_hy4_build_moe_plan(
+        ids: *const i32,
+        slot_d: *const i32,
+        vram_base: u64,
+        blob_bytes: usize,
+        count: i32,
+        plan_ptrs_out: *mut u64,
+        stream: CudaStreamHandle,
+    );
+
+    // ---- Qwen3.8-Flash-Next (qwen4exp) kernels ----
+
+    pub fn launch_qwen4_hc_expand(
+        emb: *const f32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        r_out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_hc_rmsnorm_q8(
+        r: *const f32,
+        w_norm: *const f32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        eps: f32,
+        xn_out: *mut f32,
+        xn_q8_opt: *mut c_void,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_hc_rmsnorm_inject_q8(
+        r: *const f32,
+        w_norm: *const f32,
+        w_inject: *const c_void,
+        inject_w_type: i32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        eps: f32,
+        xn_out: *mut f32,
+        xn_q8_opt: *mut c_void,
+        inject_partials_out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_hc_down_silu_q8(
+        lo_in: *const f32,
+        t: i32,
+        hc: i32,
+        lr: i32,
+        lo_out_opt: *mut f32,
+        lo_q8_opt: *mut c_void,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_hc_mix_q8(
+        xn: *const f32,
+        up_logits: *const f32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        mixed_out: *mut f32,
+        mixed_q8_opt: *mut c_void,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_hc_inject_dot(
+        xn: *const f32,
+        w_inject: *const c_void,
+        w_type: i32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        inject_out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_hc_write(
+        r: *mut f32,
+        block_out: *const f32,
+        sh_out_opt: *const f32,
+        sh_gate_logit_opt: *const f32,
+        inject: *const f32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_hc_write_strided(
+        r: *mut f32,
+        block_out: *const f32,
+        sh_out_opt: *const f32,
+        sh_gate_logit_opt: *const f32,
+        inject: *const f32,
+        inject_stride: i32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_add_streams_broadcast(
+        h: *const f32,
+        e: *const f32,
+        t: i32,
+        hc: i32,
+        e_dim: i32,
+        r_out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_rmsnorm_f32(
+        x: *const f32,
+        w: *const f32,
+        rows: i32,
+        cols: i32,
+        eps: f32,
+        y_out: *mut f32,
+        y_q8_opt: *mut c_void,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_ple_postops(
+        key: *mut f32,
+        hidden_r: *mut f32,
+        value: *const f32,
+        history: *mut f32,
+        w_norm_key: *const f32,
+        w_norm_query: *const f32,
+        w_norm_conv: *const f32,
+        w_conv1d_f32: *const f32,
+        scratch_qn: *mut f32,
+        scratch_gated: *mut f32,
+        scratch_gate: *mut f32,
+        t: i32,
+        n: i32,
+        h: i32,
+        eps: f32,
+        snap_opt: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_gdn_ab_f32(
+        x: *const f32,
+        w_alpha: *const f32,
+        w_beta: *const f32,
+        dt_bias: *const f32,
+        ssm_a: *const f32,
+        gate_out: *mut f32,
+        beta_out: *mut f32,
+        t: i32,
+        n_embd: i32,
+        h_v: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_gdn_gate_beta_postop(
+        alpha_raw: *const f32,
+        beta_raw: *const f32,
+        dt_bias: *const f32,
+        ssm_a: *const f32,
+        gate_out: *mut f32,
+        beta_out: *mut f32,
+        t: i32,
+        h_v: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_gdn_conv_l2(
+        conv_hist: *mut f32,
+        qkv: *const f32,
+        conv_w: *const f32,
+        h_out: *mut f32,
+        t: i32,
+        channels: i32,
+        qk_heads: i32,
+        eps: f32,
+        hist_snap_opt: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_gdn_decode_step_norm_q8(
+        state: *mut f32,
+        h_qkv: *const f32,
+        gate: *const f32,
+        beta: *const f32,
+        z_gate: *const f32,
+        ssm_norm_w: *const f32,
+        eps: f32,
+        y_f32_opt: *mut f32,
+        y_q8_opt: *mut c_void,
+        h_k: i32,
+        h_v: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_gdn_verify_steps_norm_q8(
+        state: *mut f32,
+        h_qkv: *const f32,
+        gate: *const f32,
+        beta: *const f32,
+        z_gate: *const f32,
+        ssm_norm_w: *const f32,
+        eps: f32,
+        y_f32_opt: *mut f32,
+        y_q8_opt: *mut c_void,
+        state_snap_opt: *mut f32,
+        t: i32,
+        h_k: i32,
+        h_v: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn qwen4_gdn_tc_scratch_bytes(h_k: i32, h_v: i32) -> usize;
+
+    pub fn launch_qwen4_gdn_tc_prefill(
+        state: *mut f32,
+        h_qkv: *const f32,
+        gate: *const f32,
+        beta: *const f32,
+        z_gate: *const f32,
+        ssm_norm_w: *const f32,
+        eps: f32,
+        y_f32_opt: *mut f32,
+        y_f16_opt: *mut c_void,
+        tc_scratch: *mut c_void,
+        t: i32,
+        h_k: i32,
+        h_v: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_qsa_norm_imrope(
+        src: *const f32,
+        in_stride: i32,
+        gamma: *const f32,
+        out: *mut f32,
+        t: i32,
+        n_heads: i32,
+        head_dim: i32,
+        n_rot: i32,
+        eps: f32,
+        freq_base: f32,
+        pos_dev: *const i32,
+        mrope_pos3_opt: *const i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_idx_append_steps(
+        raw_k: *const f32,
+        pos_dev: *const i32,
+        n_steps: i32,
+        gamma: *const f32,
+        eps: f32,
+        freq_base: f32,
+        mrope_pos3_opt: *const i32,
+        tail: *mut f32,
+        dead: *mut f32,
+        pooled: *mut f32,
+        max_cells: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_idx_append_batch(
+        raw_k: *const f32,
+        n_tokens: i32,
+        p0: i32,
+        gamma: *const f32,
+        eps: f32,
+        freq_base: f32,
+        mrope_pos3_opt: *const i32,
+        tail: *mut f32,
+        dead: *mut f32,
+        pooled: *mut f32,
+        max_cells: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_idx_score_select(
+        pooled: *const f32,
+        dead: *const f32,
+        q_idx: *const f32,
+        pos_dev: *const i32,
+        t: i32,
+        max_blocks: i32,
+        top_k_cap: i32,
+        scores_ws: *mut f32,
+        ids_out: *mut i32,
+        width_out: *mut i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_kv_append_q8(
+        k: *const f32,
+        v: *const f32,
+        pos_dev: *const i32,
+        t: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        k_q: *mut i8,
+        v_q: *mut i8,
+        k_sc: *mut u16,
+        v_sc: *mut u16,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn qwen4_qsa_decode_ws_floats(t: i32, n_kv_heads: i32, max_n_ids: i32) -> usize;
+
+    pub fn launch_qwen4_qsa_decode_attn_q8(
+        q: *const f32,
+        q_full_gate_opt: *const f32,
+        k_q: *const i8,
+        v_q: *const i8,
+        k_sc: *const u16,
+        v_sc: *const u16,
+        ids_opt: *const i32,
+        n_ids_dev: *const i32,
+        max_n_ids: i32,
+        id_cap: i32,
+        t: i32,
+        n_kv_heads: i32,
+        scale: f32,
+        ws_buf: *mut f32,
+        out_f32_opt: *mut f32,
+        out_q8_opt: *mut c_void,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_qsa_prefill_attn_q8(
+        q: *const f32,
+        q_full_gate_opt: *const f32,
+        k_q: *const i8,
+        v_q: *const i8,
+        k_sc: *const u16,
+        v_sc: *const u16,
+        ids_opt: *const i32,
+        n_ids_dev: *const i32,
+        id_cap: i32,
+        t: i32,
+        n_kv_heads: i32,
+        scale: f32,
+        out_f32: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_router_top10(
+        logits: *const f32,
+        t: i32,
+        n_exp: i32,
+        topk: i32,
+        ids_out: *mut i32,
+        weights_out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_shared_gate_dot(
+        x: *const f32,
+        w_sh_gate: *const c_void,
+        w_type: i32,
+        t: i32,
+        n_embd: i32,
+        out_logits: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_vis_rope2d(
+        qkv: *mut f32,
+        pos_yx: *const i32,
+        n_patches: i32,
+        heads: i32,
+        hd: i32,
+        base: f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_vis_merge_2x2_f16(
+        x_ln: *const f32,
+        n_merged: i32,
+        d: i32,
+        out_f16: *mut u16,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_fill_dense_widths(
+        pos_dev: *const i32,
+        width_out: *mut i32,
+        t: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_hc_up_mix_q8(
+        w_up_q8_0: *const c_void,
+        lo_q8: *const c_void,
+        xn: *const f32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        lr: i32,
+        mixed_out: *mut f32,
+        mixed_q8_opt: *mut c_void,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_router_doorbell_plan(
+        logits: *const f32,
+        t: i32,
+        n_exp: i32,
+        topk: i32,
+        vram_ptrs: *const u64,
+        ram_ptrs: *const u64,
+        gpu_pcie_div: i32,
+        gpu_pcie_max: i32,
+        mixed_f32: *const f32,
+        n_embd: i32,
+        n_ff: i32,
+        layer_idx: i32,
+        gu_type: i32,
+        d_type: i32,
+        ids_out: *mut i32,
+        weights_out: *mut f32,
+        plan_ptrs_out: *mut u64,
+        doorbell_mapped: *mut c_void,
+        seq_state_dev: *mut u64,
+        expected_seq_out: *mut u64,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_doorbell_wait_hc_write(
+        doorbell_mapped: *const c_void,
+        expected_seq_ptr: *const u64,
+        r: *mut f32,
+        block_out: *const f32,
+        sh_out_opt: *const f32,
+        sh_gate_logit_opt: *const f32,
+        inject: *const f32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_doorbell_wait(
+        doorbell_mapped: *const c_void,
+        expected_seq_ptr: *const u64,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_moe_reduce_hc_write(
+        doorbell_mapped: *const c_void,
+        expected_seq_ptr: *const u64,
+        r: *mut f32,
+        block_out_opt: *const f32,
+        pair_out_opt: *const f32,
+        gpu_pair_mask_opt: *const u16,
+        topk: i32,
+        sh_out_opt: *const f32,
+        sh_gate_logit_opt: *const f32,
+        inject: *const f32,
+        inject_stride: i32,
+        t: i32,
+        hc: i32,
+        e: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_argmax_prob(
+        logits: *const f32,
+        n_vocab: i32,
+        partial_max: *mut f32,
+        partial_idx: *mut i32,
+        partial_sum: *mut f32,
+        out_id: *mut i32,
+        out_prob: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_argmax_prob_indexed(
+        logits: *const f32,
+        n_vocab: i32,
+        sub_to_id_opt: *const i32,
+        partial_max: *mut f32,
+        partial_idx: *mut i32,
+        partial_sum: *mut f32,
+        out_id: *mut i32,
+        out_prob: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_moe_fetch_unique(
+        fetch_src_ptrs: *const u64,
+        fetch_dst_ptrs: *const u64,
+        blob_bytes: usize,
+        fetch_cap: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_router_doorbell_plan_dedup(
+        logits: *const f32,
+        t: i32,
+        n_exp: i32,
+        topk: i32,
+        vram_ptrs: *const u64,
+        ram_ptrs: *const u64,
+        gpu_pcie_div: i32,
+        fetch_cap: i32,
+        dma_stage_base: u64,
+        slot_stride: usize,
+        mixed_f32: *const f32,
+        n_embd: i32,
+        n_ff: i32,
+        layer_idx: i32,
+        gu_type: i32,
+        d_type: i32,
+        ids_out: *mut i32,
+        weights_out: *mut f32,
+        res_ptrs_out: *mut u64,
+        res_off_out: *mut i32,
+        res_nt_out: *mut i32,
+        res_rows_out: *mut i32,
+        res_pair_out: *mut i32,
+        res_wts_out: *mut f32,
+        fetch_src_out: *mut u64,
+        fetch_dst_out: *mut u64,
+        fetch_off_out: *mut i32,
+        fetch_nt_out: *mut i32,
+        fetch_rows_out: *mut i32,
+        fetch_pair_out: *mut i32,
+        fetch_wts_out: *mut f32,
+        gpu_pair_mask_out: *mut u16,
+        doorbell_mapped: *mut c_void,
+        seq_state_dev: *mut u64,
+        expected_seq_out: *mut u64,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_gdn_steps_split_norm_q8(
+        state: *mut f32,
+        h_qkv: *const f32,
+        gate: *const f32,
+        beta: *const f32,
+        z_gate: *const f32,
+        ssm_norm_w: *const f32,
+        eps: f32,
+        y_ws_f32: *mut f32,
+        y_f32_opt: *mut f32,
+        y_q8_opt: *mut c_void,
+        state_before_opt: *mut f32,
+        t: i32,
+        h_k: i32,
+        h_v: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_gdn_replay_steps(
+        state_before: *const f32,
+        state_out: *mut f32,
+        h_qkv: *const f32,
+        gate: *const f32,
+        beta: *const f32,
+        n_steps: i32,
+        h_k: i32,
+        h_v: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_reduce_pairs_f32(
+        pair_out: *const f32,
+        block_out: *mut f32,
+        t: i32,
+        topk: i32,
+        n_embd: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_qwen4_patch_u64(mapped_pairs: *const u64, n: i32, stream: CudaStreamHandle);
+
+    pub fn launch_qwen4_copy_u32_sm(
+        dst: *mut c_void,
+        src: *const c_void,
+        n_u32: i32,
+        system_fence: i32,
+        stream: CudaStreamHandle,
+    );
+
+    // -----------------------------------------------------------------------
+    // MiniMax M3.1 Flash (mm3) kernels
+    // -----------------------------------------------------------------------
+
+    pub fn launch_mm3_rms_norm_f32(
+        x: *const f32,
+        w: *const f32,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        add_one: i32,
+        y_f32_opt: *mut f32,
+        y_q8_1_opt: *mut c_void,
+        y_q8_k_opt: *mut c_void,
+        y_bf16_opt: *mut u16,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_quantize_q8_k(
+        x: *const f32,
+        out_q8k: *mut c_void,
+        m: i32,
+        k: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_swigluoai(
+        gate: *const f32,
+        up: *const f32,
+        rows: i32,
+        ff: i32,
+        alpha: f32,
+        limit: f32,
+        y_f32_opt: *mut f32,
+        y_q8_1_opt: *mut c_void,
+        y_q8_k_opt: *mut c_void,
+        y_bf16_opt: *mut u16,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_qk_norm_rope_kv_store(
+        q: *mut f32,
+        k: *const f32,
+        v: *const f32,
+        q_norm_w: *const f32,
+        k_norm_w: *const f32,
+        pos: *const i32,
+        inv_freq: *const f32,
+        t: i32,
+        hq: i32,
+        hkv: i32,
+        hd: i32,
+        rot_dim: i32,
+        eps: f32,
+        kv_fmt: i32,
+        rot_mask: i32,
+        ring: i32,
+        k_bf16_opt: *mut u16,
+        v_bf16_opt: *mut u16,
+        k_i8_opt: *mut i8,
+        k_scale_opt: *mut f32,
+        v_i8_opt: *mut i8,
+        v_scale_opt: *mut f32,
+        host_k_opt: *mut c_void,
+        host_k_scale_opt: *mut f32,
+        host_v_opt: *mut c_void,
+        host_v_scale_opt: *mut f32,
+        host_tag_opt: *mut i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_index_norm_rope_store(
+        iq: *mut f32,
+        ik: *const f32,
+        iq_norm_w: *const f32,
+        ik_norm_w: *const f32,
+        pos: *const i32,
+        inv_freq: *const f32,
+        t: i32,
+        hi: i32,
+        hd: i32,
+        rot_dim: i32,
+        eps: f32,
+        ic_bf16: *mut u16,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_msa_block_scores(
+        iq: *const f32,
+        ic_bf16: *const u16,
+        pos: *const i32,
+        t: i32,
+        hi: i32,
+        nblk: i32,
+        blk: i32,
+        bs: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_msa_select_topk(
+        bs: *const f32,
+        pos: *const i32,
+        t: i32,
+        hi: i32,
+        nblk: i32,
+        blk: i32,
+        topk: i32,
+        local_blocks: i32,
+        kept: *mut i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_msa_sparse_attn(
+        q: *const f32,
+        kc_bf16_opt: *const u16,
+        vc_bf16_opt: *const u16,
+        kc_i8_opt: *const i8,
+        k_scale_opt: *const f32,
+        vc_i8_opt: *const i8,
+        v_scale_opt: *const f32,
+        kept: *const i32,
+        pos: *const i32,
+        t: i32,
+        hq: i32,
+        hkv: i32,
+        topk: i32,
+        blk: i32,
+        kv_fmt: i32,
+        rot_mask: i32,
+        ring: i32,
+        scale: f32,
+        part_opt: *mut f32,
+        splits: i32,
+        out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_router_f32(
+        x_f32_opt: *const f32,
+        gate_w_opt: *const f32,
+        logits_buf: *mut f32,
+        bias_opt: *const f32,
+        t: i32,
+        d: i32,
+        e: i32,
+        topk: i32,
+        routed_scaling_factor: f32,
+        ids_out: *mut i32,
+        weights_out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_moe_gate_up_q8k(
+        gate_type: i32,
+        up_type: i32,
+        gate_ptrs: *const u64,
+        up_ptrs: *const u64,
+        gate_row_bytes: usize,
+        up_row_bytes: usize,
+        x_q8k: *const c_void,
+        expert_ids: *const i32,
+        inter_q8k: *mut c_void,
+        inter_f32_opt: *mut f32,
+        m: i32,
+        n_embd: i32,
+        n_ff: i32,
+        topk: i32,
+        swiglu_alpha: f32,
+        swiglu_limit: f32,
+        skip_dev: *const i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_moe_down_q8k(
+        down_type: i32,
+        down_ptrs: *const u64,
+        down_row_bytes: usize,
+        inter_q8k: *const c_void,
+        expert_ids: *const i32,
+        expert_out: *mut f32,
+        m: i32,
+        n_ff: i32,
+        n_embd: i32,
+        topk: i32,
+        skip_dev: *const i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_moe_combine(
+        res_opt: *const f32,
+        expert_out: *const f32,
+        weights: *const f32,
+        expert_ids: *const i32,
+        vram_ptrs_opt: *const u64,
+        shared_opt: *const f32,
+        m: i32,
+        topk: i32,
+        n_embd: i32,
+        out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_moe_grp_gate_up_f32(
+        gate_type: i32,
+        up_type: i32,
+        plan_dev: *const c_void,
+        u_off: usize,
+        gate_row_bytes: usize,
+        up_row_bytes: usize,
+        x_q8k: *const c_void,
+        inter_f32: *mut f32,
+        n_embd: i32,
+        n_ff: i32,
+        n_grp: i32,
+        max_nt: i32,
+        swiglu_alpha: f32,
+        swiglu_limit: f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_moe_grp_down_q8k(
+        down_type: i32,
+        plan_dev: *const c_void,
+        d_off: usize,
+        down_row_bytes: usize,
+        inter_q8k: *const c_void,
+        expert_out: *mut f32,
+        n_ff: i32,
+        n_embd: i32,
+        n_grp: i32,
+        max_nt: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_moe_grp_combine(
+        res_opt: *const f32,
+        shared_opt: *const f32,
+        expert_out: *const f32,
+        plan0_dev_opt: *const c_void,
+        n_entries0: i32,
+        plan1_dev_opt: *const c_void,
+        n_entries1: i32,
+        cpu_out_opt: *const f32,
+        m: i32,
+        n_embd: i32,
+        out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_bf16_gemm_mma(
+        a: *const u16,
+        ld_a: i32,
+        b: *const u16,
+        ld_b: i32,
+        c: *mut f32,
+        ld_c: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        beta: f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_mxfp8_to_bf16(
+        w: *const u8,
+        scale: *const u8,
+        n: i32,
+        k: i32,
+        out_bf16: *mut u16,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_mxfp8_linear(
+        w: *const u8,
+        scale: *const u8,
+        n: i32,
+        k: i32,
+        x: *const f32,
+        ld_x: i32,
+        rows: i32,
+        y: *mut f32,
+        ld_y: i32,
+        beta: f32,
+        part_opt: *mut f32,
+        w_bf16_scratch_opt: *mut u16,
+        x_bf16_scratch_opt: *mut u16,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_dspark_window_attn(
+        q: *const f32,
+        kc_bf16: *const u16,
+        vc_bf16: *const u16,
+        ring: i32,
+        lo: *const i32,
+        hi: i32,
+        t: i32,
+        hq: i32,
+        hkv: i32,
+        scale: f32,
+        part_opt: *mut f32,
+        splits: i32,
+        out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_dspark_markov_greedy(
+        logits: *const f32,
+        w2_bf16: *const u16,
+        w1_bf16: *const u16,
+        v: i32,
+        r: i32,
+        prev: *mut i32,
+        out: *mut i32,
+        cw_opt: *const f32,
+        cb_opt: *const f32,
+        hidden_opt: *const f32,
+        d: i32,
+        conf_opt: *mut f32,
+        part: *mut f32,
+        bias_opt: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_vision_patch_embed_f32(
+        px: *const f32,
+        w_patch: *const f32,
+        n: i32,
+        d: i32,
+        p: i32,
+        out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_vision_layernorm(
+        x: *const f32,
+        w: *const f32,
+        b: *const f32,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        y_f32_opt: *mut f32,
+        y_bf16_opt: *mut u16,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_vision_qkv_rope_3d(
+        qkv: *mut f32,
+        bias_opt: *const f32,
+        pos3d: *const i32,
+        inv_freq: *const f32,
+        n: i32,
+        dim: i32,
+        heads: i32,
+        hd: i32,
+        nf: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_vision_full_attn(
+        qkv: *const f32,
+        n: i32,
+        dim: i32,
+        heads: i32,
+        hd: i32,
+        scale: f32,
+        out: *mut f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_vision_bias_gelu(
+        y: *const f32,
+        bias_opt: *const f32,
+        n: usize,
+        m: i32,
+        apply_gelu: i32,
+        y_f32_opt: *mut f32,
+        y_bf16_opt: *mut u16,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_vision_residual_bias(
+        h: *mut f32,
+        t: *const f32,
+        bias_opt: *const f32,
+        n: usize,
+        m: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_gv_q6k_multi(
+        n_jobs: i32,
+        w0: *const c_void,
+        y0: *mut f32,
+        n0: i32,
+        w1: *const c_void,
+        y1: *mut f32,
+        n1: i32,
+        w2: *const c_void,
+        y2: *mut f32,
+        n2: i32,
+        x_q8_1: *const c_void,
+        k: i32,
+        m: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_gv_q8_0_multi(
+        n_jobs: i32,
+        w0: *const c_void,
+        y0: *mut f32,
+        n0: i32,
+        w1: *const c_void,
+        y1: *mut f32,
+        n1: i32,
+        w2: *const c_void,
+        y2: *mut f32,
+        n2: i32,
+        x_q8_1: *const c_void,
+        k: i32,
+        m: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_iota(
+        out: *mut i32,
+        n: i32,
+        pos0: i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_dspark_draft_block(
+        anc_mapped_f32: *const f32,
+        mask_f32: *const f32,
+        d: i32,
+        b: i32,
+        pos0: i32,
+        window: i32,
+        anchor_id: i32,
+        h_out: *mut f32,
+        pos_out: *mut i32,
+        lo_out: *mut i32,
+        prev_out: *mut i32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_mm3_wait_u32(
+        wait_dev_ptr: *const u32,
+        target_val: u32,
         stream: CudaStreamHandle,
     );
 }

@@ -55,6 +55,19 @@ fn fill_random_quant_rows(ty: GgmlType, n: usize, k: usize, seed: u64) -> Vec<u8
                     }
                 }
             }
+            GgmlType::Q5_1 => {
+                let nb = k / 32;
+                for b in 0..nb {
+                    let off = b * 24;
+                    let d = f16::from_f32(0.02 + rng.next_f32().abs() * 0.06).to_le_bytes();
+                    let m = f16::from_f32(-0.35 + rng.next_f32().abs() * 0.5).to_le_bytes();
+                    dst[off..off + 2].copy_from_slice(&d);
+                    dst[off + 2..off + 4].copy_from_slice(&m);
+                    for j in 4..24 {
+                        dst[off + j] = (rng.next_u32() & 0xFF) as u8;
+                    }
+                }
+            }
             GgmlType::Nvfp4 => {
                 let nb = k / 64;
                 for b in 0..nb {
@@ -558,4 +571,843 @@ fn test_glm5_wide_gu_and_prequant_parity() {
         println!("GLM5 wide_gu + prequant ({gu_ty:?}/{dn_ty:?}) rel_err = {rel:.8}");
         assert!(rel < 1e-4, "wide_gu+prequant {gu_ty:?}/{dn_ty:?} rel_err={rel} >= 1e-4");
     }
+}
+
+#[test]
+fn test_hy4_avx512_iq4xs_q5k_q6k_q80_parity() {
+    if !ampllm_cpu_kernels::glm5_cpu::has_glm5_avx512() {
+        eprintln!("skipping test_hy4_avx512_iq4xs_q5k_q6k_q80_parity: CPU lacks AVX-512 VNNI");
+        return;
+    }
+    let n_embd = 1536usize;
+    let n_ff = 1536usize;
+    let clamp = 7.0f32;
+    let pool = CpuThreadPool::new_all_physical(None);
+    let mut rng = Rng(20261123);
+
+    let fp32_moe = |ty: GgmlType, gate_w: &[u8], up_w: &[u8], dn_w: &[u8], x: &[f32], w: f32| -> Vec<f32> {
+        let gu_rb = ty.row_bytes(n_embd);
+        let dn_rb = ty.row_bytes(n_ff);
+        let mut ff = vec![0.0f32; n_ff];
+        let mut row_f = vec![0.0f32; n_embd];
+        for r in 0..n_ff {
+            dequantize_row_to_f32(ty, &gate_w[r * gu_rb..(r + 1) * gu_rb], &mut row_f);
+            let mut g: f32 = row_f.iter().zip(x.iter()).map(|(&a, &b)| a * b).sum();
+            dequantize_row_to_f32(ty, &up_w[r * gu_rb..(r + 1) * gu_rb], &mut row_f);
+            let mut u: f32 = row_f.iter().zip(x.iter()).map(|(&a, &b)| a * b).sum();
+            g = g.min(clamp);
+            u = u.clamp(-clamp, clamp);
+            ff[r] = (g / (1.0 + (-g).exp())) * u;
+        }
+        let mut out = vec![0.0f32; n_embd];
+        let mut d_row = vec![0.0f32; n_ff];
+        for r in 0..n_embd {
+            dequantize_row_to_f32(ty, &dn_w[r * dn_rb..(r + 1) * dn_rb], &mut d_row);
+            let s: f32 = d_row.iter().zip(ff.iter()).map(|(&a, &b)| a * b).sum();
+            out[r] = w * s;
+        }
+        out
+    };
+
+    for (ty, seed) in [
+        (GgmlType::Iq4Xs, 4100u64),
+        (GgmlType::Q5K, 4200u64),
+        (GgmlType::Q6K, 4300u64),
+        (GgmlType::Q8_0, 4400u64),
+    ] {
+        let gate_w = fill_random_quant_rows(ty, n_ff, n_embd, seed);
+        let up_w = fill_random_quant_rows(ty, n_ff, n_embd, seed + 1);
+        let dn_w = fill_random_quant_rows(ty, n_embd, n_ff, seed + 2);
+        let m_toks = 8usize;
+        let x: Vec<f32> = (0..m_toks * n_embd).map(|_| rng.next_f32() * 0.3).collect();
+        let w = 0.72f32;
+
+        let mut scratch = Glm5CpuScratch::new(n_embd, n_ff, 16);
+        let mut got_m1 = vec![0.0f32; n_embd];
+        let job_m1 = [Glm5CpuExpertJob {
+            gate_ptr: gate_w.as_ptr(),
+            up_ptr: up_w.as_ptr(),
+            down_ptr: dn_w.as_ptr(),
+            weight: w,
+        }];
+        run_glm5_cpu_moe_m1(
+            &pool,
+            &mut scratch,
+            ty,
+            ty,
+            n_embd,
+            n_ff,
+            clamp,
+            &x[..n_embd],
+            None,
+            &job_m1,
+            &mut got_m1,
+        );
+
+        let ref_m1 = fp32_moe(ty, &gate_w, &up_w, &dn_w, &x[..n_embd], w);
+        let ref_norm: f64 = ref_m1.iter().map(|&v| (v as f64).powi(2)).sum();
+        let diff_norm: f64 = ref_m1
+            .iter()
+            .zip(got_m1.iter())
+            .map(|(&a, &b)| ((a - b) as f64).powi(2))
+            .sum();
+        let rel = (diff_norm / ref_norm.max(1e-12)).sqrt();
+
+        // Exact check vs scalar dequantized weights using the exact same Q8_1 / Q8_K activations
+        let q8k_moe = |ty: GgmlType, gate_w: &[u8], up_w: &[u8], dn_w: &[u8], x: &[f32], w: f32| -> Vec<f32> {
+            use ampllm_cpu_kernels::glm5_cpu::{ampllm_cpu_quantize_q8_1_g8, CpuBlockQ8_1G8};
+            let quant_dequant = |src: &[f32], n: usize, use_q8_1: bool| -> Vec<f32> {
+                if use_q8_1 {
+                    let nb = n.div_ceil(256);
+                    let mut blks = vec![CpuBlockQ8_1G8::default(); nb];
+                    for bi in 0..nb {
+                        let b0 = bi * 256;
+                        let blk_n = (n - b0).min(256) as i32;
+                        unsafe {
+                            ampllm_cpu_quantize_q8_1_g8(
+                                src[b0..].as_ptr(),
+                                blks.as_mut_ptr().add(bi) as *mut std::ffi::c_void,
+                                blk_n,
+                            );
+                        }
+                    }
+                    let mut dq = vec![0.0f32; n];
+                    for (bi, ch) in dq.chunks_mut(256).enumerate() {
+                        for (j, o) in ch.iter_mut().enumerate() {
+                            *o = blks[bi].d[j / 32] * (blks[bi].qs[j] as f32);
+                        }
+                    }
+                    dq
+                } else {
+                    let mut xq = vec![CpuBlockQ8K::default(); n.div_ceil(256)];
+                    quantize_f32_to_q8_k_cpu(src, &mut xq);
+                    let xq_bytes = unsafe {
+                        std::slice::from_raw_parts(xq.as_ptr() as *const u8, (n / 256) * 292)
+                    };
+                    let mut dq = vec![0.0f32; n];
+                    for bi in 0..(n / 256) {
+                        let blk = &xq_bytes[bi * 292..(bi + 1) * 292];
+                        let d = f32::from_le_bytes(blk[0..4].try_into().unwrap());
+                        for j in 0..256 {
+                            dq[bi * 256 + j] = d * (blk[4 + j] as i8 as f32);
+                        }
+                    }
+                    dq
+                }
+            };
+            let x_dq = quant_dequant(x, n_embd, matches!(ty, GgmlType::Q4K | GgmlType::Q5K));
+            let gu_rb = ty.row_bytes(n_embd);
+            let dn_rb = ty.row_bytes(n_ff);
+            let mut ff = vec![0.0f32; n_ff];
+            let mut row_f = vec![0.0f32; n_embd];
+            for r in 0..n_ff {
+                dequantize_row_to_f32(ty, &gate_w[r * gu_rb..(r + 1) * gu_rb], &mut row_f);
+                let mut g: f32 = row_f.iter().zip(x_dq.iter()).map(|(&a, &b)| a * b).sum();
+                dequantize_row_to_f32(ty, &up_w[r * gu_rb..(r + 1) * gu_rb], &mut row_f);
+                let mut u: f32 = row_f.iter().zip(x_dq.iter()).map(|(&a, &b)| a * b).sum();
+                g = g.min(clamp);
+                u = u.clamp(-clamp, clamp);
+                ff[r] = (g / (1.0 + (-g).exp())) * u;
+            }
+            let ff_dq = quant_dequant(&ff, n_ff, matches!(ty, GgmlType::Q5_1 | GgmlType::Q8_0));
+            let mut out = vec![0.0f32; n_embd];
+            let mut d_row = vec![0.0f32; n_ff];
+            for r in 0..n_embd {
+                dequantize_row_to_f32(ty, &dn_w[r * dn_rb..(r + 1) * dn_rb], &mut d_row);
+                let s: f32 = d_row.iter().zip(ff_dq.iter()).map(|(&a, &b)| a * b).sum();
+                out[r] = w * s;
+            }
+            out
+        };
+        let q8k_m1 = q8k_moe(ty, &gate_w, &up_w, &dn_w, &x[..n_embd], w);
+        let qn: f64 = q8k_m1.iter().map(|&v| (v as f64).powi(2)).sum();
+        let qd: f64 = q8k_m1.iter().zip(got_m1.iter()).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum();
+        let rel_q8k = (qd / qn.max(1e-12)).sqrt();
+        println!("HY4 CPU M=1 MoE ({ty:?}) rel_vs_fp32 = {rel:.6} | rel_vs_q8k = {rel_q8k:.8}");
+        assert!(rel_q8k < 1e-4, "HY4 M=1 {ty:?} kernel mismatch vs exact Q8K ref: {rel_q8k}");
+        assert!(rel < 2.5e-2, "HY4 M=1 {ty:?} rel_vs_fp32={rel} >= 2.5e-2");
+
+        // Grouped NT=8 parity against M=1 and Q8K ref
+        let toks: Vec<usize> = (0..m_toks).collect();
+        let wts = vec![w; m_toks];
+        let grp = [Glm5CpuGroupedExpert {
+            gate_ptr: gate_w.as_ptr(),
+            up_ptr: up_w.as_ptr(),
+            down_ptr: dn_w.as_ptr(),
+            token_indices: &toks,
+            token_weights: &wts,
+        }];
+        let mut got_grp = vec![0.0f32; m_toks * n_embd];
+        run_glm5_cpu_moe_grouped(
+            &pool,
+            &mut scratch,
+            ty,
+            ty,
+            n_embd,
+            n_ff,
+            clamp,
+            m_toks,
+            &x,
+            &grp,
+            &mut got_grp,
+            true,
+        );
+        for t in 0..m_toks {
+            let ref_t = q8k_moe(ty, &gate_w, &up_w, &dn_w, &x[t * n_embd..(t + 1) * n_embd], w);
+            let rn: f64 = ref_t.iter().map(|&v| (v as f64).powi(2)).sum();
+            let dn: f64 = ref_t
+                .iter()
+                .zip(got_grp[t * n_embd..(t + 1) * n_embd].iter())
+                .map(|(&a, &b)| ((a - b) as f64).powi(2))
+                .sum();
+            let rel_t = (dn / rn.max(1e-12)).sqrt();
+            assert!(rel_t < 1e-4, "HY4 grouped {ty:?} tok {t} rel_vs_q8k={rel_t}");
+        }
+        let d0: f64 = got_m1
+            .iter()
+            .zip(got_grp[..n_embd].iter())
+            .map(|(&a, &b)| ((a - b) as f64).powi(2))
+            .sum();
+        let n0: f64 = got_m1.iter().map(|&v| (v as f64).powi(2)).sum();
+        let g_rel = (d0 / n0.max(1e-12)).sqrt();
+        println!("HY4 CPU grouped NT=8 vs M=1 ({ty:?}) tok0 rel_err = {g_rel:.8}");
+        assert!(g_rel < 5e-4, "HY4 grouped {ty:?} tok0 diverged: {g_rel}");
+
+        // Fast CPU tok_row_to_f32 parity vs dequantize_row_to_f32
+        let rb = ty.row_bytes(n_embd);
+        let mut fast_deq = vec![0.0f32; n_embd];
+        let mut ref_deq = vec![0.0f32; n_embd];
+        ampllm_cpu_kernels::tok_row_to_f32_cpu(ty, &gate_w[..rb], &mut fast_deq);
+        dequantize_row_to_f32(ty, &gate_w[..rb], &mut ref_deq);
+        let max_deq_diff = fast_deq
+            .iter()
+            .zip(ref_deq.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_deq_diff < 1e-5, "tok_row_to_f32 {ty:?} max_diff={max_deq_diff}");
+    }
+
+    // BF16 -> Q8_0 and F32 -> Q8_0 parity
+    let rows = 4usize;
+    let k = 512usize;
+    let src_f32: Vec<f32> = (0..rows * k).map(|_| rng.next_f32() * 2.5).collect();
+    let src_bf16: Vec<u16> = src_f32.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect();
+    let mut q_from_f32 = vec![0u8; rows * (k / 32) * 34];
+    let mut q_from_bf16 = vec![0u8; rows * (k / 32) * 34];
+    ampllm_cpu_kernels::f32_to_q8_0_cpu(&src_f32, rows, k, &mut q_from_f32);
+    ampllm_cpu_kernels::bf16_to_q8_0_cpu(&src_bf16, rows, k, &mut q_from_bf16);
+    let mut deq_f32 = vec![0.0f32; k];
+    let mut deq_bf16 = vec![0.0f32; k];
+    for r in 0..rows {
+        let rb = (k / 32) * 34;
+        dequantize_row_to_f32(GgmlType::Q8_0, &q_from_f32[r * rb..(r + 1) * rb], &mut deq_f32);
+        dequantize_row_to_f32(GgmlType::Q8_0, &q_from_bf16[r * rb..(r + 1) * rb], &mut deq_bf16);
+        let s_row = &src_f32[r * k..(r + 1) * k];
+        let sn: f64 = s_row.iter().map(|&v| (v as f64).powi(2)).sum();
+        let df: f64 = s_row.iter().zip(deq_f32.iter()).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum();
+        let db: f64 = s_row.iter().zip(deq_bf16.iter()).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum();
+        assert!((df / sn).sqrt() < 1.5e-2, "f32_to_q8_0 row {r} rel too high");
+        assert!((db / sn).sqrt() < 2e-2, "bf16_to_q8_0 row {r} rel too high");
+    }
+}
+
+#[test]
+fn test_qwen4_avx512_q4k_q51_q80_640_and_iq4nl_parity() {
+    use ampllm_cpu_kernels::glm5_cpu::{
+        ampllm_cpu_quantize_q8_1_g8, run_glm5_cpu_moe_grouped_small, CpuBlockQ8_1G8,
+    };
+    let pool = CpuThreadPool::new(None);
+    let mut rng = Rng(20261122);
+
+    let dequant_q8k_prefix = |blocks: &[CpuBlockQ8K], n: usize| -> Vec<f32> {
+        let nb = n.div_ceil(256);
+        let bytes = unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u8, nb * 292) };
+        let mut out = vec![0.0f32; n];
+        for (idx, chunk) in out.chunks_mut(256).enumerate() {
+            let raw = &bytes[idx * 292..(idx + 1) * 292];
+            let d = f32::from_le_bytes(raw[0..4].try_into().unwrap());
+            for (j, o) in chunk.iter_mut().enumerate() {
+                *o = d * (raw[4 + j] as i8 as f32);
+            }
+        }
+        out
+    };
+
+    let dequant_q8_1_g8_prefix = |blocks: &[CpuBlockQ8_1G8], n: usize| -> Vec<f32> {
+        let mut out = vec![0.0f32; n];
+        for (idx, chunk) in out.chunks_mut(256).enumerate() {
+            let b = &blocks[idx];
+            for (j, o) in chunk.iter_mut().enumerate() {
+                *o = b.d[j / 32] * (b.qs[j] as f32);
+            }
+        }
+        out
+    };
+
+    let ref_moe = |gu_ty: GgmlType,
+                   dn_ty: GgmlType,
+                   n_embd: usize,
+                   n_ff: usize,
+                   gate_w: &[u8],
+                   up_w: &[u8],
+                   dn_w: &[u8],
+                   x_f32: &[f32],
+                   w: f32,
+                   quant_act: bool|
+     -> Vec<f32> {
+        let x_vec = if quant_act {
+            if matches!(gu_ty, GgmlType::Q4K | GgmlType::Q5K) {
+                let mut x_q81 = vec![CpuBlockQ8_1G8::default(); n_embd.div_ceil(256)];
+                for b in 0..x_q81.len() {
+                    let b0 = b * 256;
+                    let blk_n = (n_embd - b0).min(256) as i32;
+                    unsafe {
+                        ampllm_cpu_quantize_q8_1_g8(
+                            x_f32[b0..].as_ptr(),
+                            x_q81.as_mut_ptr().add(b) as *mut std::ffi::c_void,
+                            blk_n,
+                        );
+                    }
+                }
+                dequant_q8_1_g8_prefix(&x_q81, n_embd)
+            } else {
+                let mut x_q8k = vec![CpuBlockQ8K::default(); n_embd.div_ceil(256)];
+                quantize_f32_to_q8_k_cpu(x_f32, &mut x_q8k);
+                dequant_q8k_prefix(&x_q8k, n_embd)
+            }
+        } else {
+            x_f32.to_vec()
+        };
+        let gu_rb = gu_ty.row_bytes(n_embd);
+        let dn_rb = dn_ty.row_bytes(n_ff);
+        let mut w_row = vec![0.0f32; n_embd.max(n_ff)];
+        let mut ff = vec![0.0f32; n_ff];
+        for r in 0..n_ff {
+            dequantize_row_to_f32(gu_ty, &gate_w[r * gu_rb..(r + 1) * gu_rb], &mut w_row[..n_embd]);
+            let g: f32 = w_row[..n_embd].iter().zip(x_vec.iter()).map(|(&a, &b)| a * b).sum();
+            dequantize_row_to_f32(gu_ty, &up_w[r * gu_rb..(r + 1) * gu_rb], &mut w_row[..n_embd]);
+            let u: f32 = w_row[..n_embd].iter().zip(x_vec.iter()).map(|(&a, &b)| a * b).sum();
+            ff[r] = (g / (1.0 + (-g).exp())) * u;
+        }
+        let ff_vec = if quant_act {
+            if matches!(dn_ty, GgmlType::Q5_1 | GgmlType::Q8_0) {
+                let mut ff_q81 = vec![CpuBlockQ8_1G8::default(); n_ff.div_ceil(256)];
+                for b in 0..ff_q81.len() {
+                    let b0 = b * 256;
+                    let blk_n = (n_ff - b0).min(256) as i32;
+                    unsafe {
+                        ampllm_cpu_quantize_q8_1_g8(
+                            ff[b0..].as_ptr(),
+                            ff_q81.as_mut_ptr().add(b) as *mut std::ffi::c_void,
+                            blk_n,
+                        );
+                    }
+                }
+                dequant_q8_1_g8_prefix(&ff_q81, n_ff)
+            } else {
+                let mut ff_q8k = vec![CpuBlockQ8K::default(); n_ff.div_ceil(256)];
+                quantize_f32_to_q8_k_cpu(&ff, &mut ff_q8k);
+                dequant_q8k_prefix(&ff_q8k, n_ff)
+            }
+        } else {
+            ff
+        };
+        let mut out = vec![0.0f32; n_embd];
+        for r in 0..n_embd {
+            dequantize_row_to_f32(dn_ty, &dn_w[r * dn_rb..(r + 1) * dn_rb], &mut w_row[..n_ff]);
+            let d: f32 = w_row[..n_ff].iter().zip(ff_vec.iter()).map(|(&a, &b)| a * b).sum();
+            out[r] = w * d;
+        }
+        out
+    };
+
+    let configs = [
+        (GgmlType::Q4K, GgmlType::Q5_1, 2560usize, 640usize, 13usize, 1u64),
+        (GgmlType::Q5K, GgmlType::Q8_0, 2560usize, 640usize, 7usize, 2u64),
+        (GgmlType::Q4K, GgmlType::Q5_1, 512usize, 288usize, 4usize, 3u64),
+        (GgmlType::Q4K, GgmlType::Q8_0, 512usize, 352usize, 2usize, 4u64),
+    ];
+
+    for (gu_ty, dn_ty, n_embd, n_ff, m_toks, seed) in configs {
+        let gate_w = fill_random_quant_rows(gu_ty, n_ff, n_embd, seed * 10 + 1);
+        let up_w = fill_random_quant_rows(gu_ty, n_ff, n_embd, seed * 10 + 2);
+        let dn_w = fill_random_quant_rows(dn_ty, n_embd, n_ff, seed * 10 + 3);
+        let x: Vec<f32> = (0..m_toks * n_embd).map(|_| rng.next_f32() * 0.6).collect();
+        let w = 0.72f32;
+
+        // M=1 parity (single job + multi-job)
+        let mut scratch = Glm5CpuScratch::new(n_embd, n_ff, 4);
+        let mut got_m1 = vec![0.0f32; n_embd];
+        let job1 = [Glm5CpuExpertJob {
+            gate_ptr: gate_w.as_ptr(),
+            up_ptr: up_w.as_ptr(),
+            down_ptr: dn_w.as_ptr(),
+            weight: w,
+        }];
+        run_glm5_cpu_moe_m1(
+            &pool,
+            &mut scratch,
+            gu_ty,
+            dn_ty,
+            n_embd,
+            n_ff,
+            0.0,
+            &x[..n_embd],
+            None,
+            &job1,
+            &mut got_m1,
+        );
+        let r_q = ref_moe(gu_ty, dn_ty, n_embd, n_ff, &gate_w, &up_w, &dn_w, &x[..n_embd], w, true);
+        let r_f32 = ref_moe(gu_ty, dn_ty, n_embd, n_ff, &gate_w, &up_w, &dn_w, &x[..n_embd], w, false);
+        let qn: f64 = r_q.iter().map(|&v| (v as f64).powi(2)).sum();
+        let qd: f64 = r_q.iter().zip(got_m1.iter()).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum();
+        let fn_: f64 = r_f32.iter().map(|&v| (v as f64).powi(2)).sum();
+        let fd: f64 = r_f32.iter().zip(got_m1.iter()).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum();
+        let rel_q = (qd / qn.max(1e-12)).sqrt();
+        let rel_f32 = (fd / fn_.max(1e-12)).sqrt();
+        println!(
+            "Qwen4 CPU M=1 ({gu_ty:?}/{dn_ty:?}, {n_embd}->{n_ff}) rel_vs_q={rel_q:.8} rel_vs_fp32={rel_f32:.6}"
+        );
+        assert!(rel_q < 1e-4, "Qwen4 M=1 ({gu_ty:?}/{dn_ty:?}, {n_ff}) rel_vs_q={rel_q}");
+        if n_embd == 2560 && n_ff == 640 {
+            assert!(rel_f32 < 1.5e-2, "Qwen4 M=1 ({gu_ty:?}/{dn_ty:?}, {n_ff}) rel_vs_fp32={rel_f32}");
+        } else {
+            assert!(rel_f32 < 6e-2, "Qwen4 M=1 ({gu_ty:?}/{dn_ty:?}, {n_ff}) rel_vs_fp32={rel_f32}");
+        }
+
+        // Multi-job (n_jobs = 3 -> exercises `if n_jobs >= 2` path in M=1)
+        let mut got_m1_3 = vec![0.0f32; n_embd];
+        let job3 = [
+            Glm5CpuExpertJob {
+                gate_ptr: gate_w.as_ptr(),
+                up_ptr: up_w.as_ptr(),
+                down_ptr: dn_w.as_ptr(),
+                weight: 0.3 * w,
+            },
+            Glm5CpuExpertJob {
+                gate_ptr: gate_w.as_ptr(),
+                up_ptr: up_w.as_ptr(),
+                down_ptr: dn_w.as_ptr(),
+                weight: 0.5 * w,
+            },
+            Glm5CpuExpertJob {
+                gate_ptr: gate_w.as_ptr(),
+                up_ptr: up_w.as_ptr(),
+                down_ptr: dn_w.as_ptr(),
+                weight: 0.2 * w,
+            },
+        ];
+        run_glm5_cpu_moe_m1(
+            &pool,
+            &mut scratch,
+            gu_ty,
+            dn_ty,
+            n_embd,
+            n_ff,
+            0.0,
+            &x[..n_embd],
+            None,
+            &job3,
+            &mut got_m1_3,
+        );
+        let d3: f64 = got_m1.iter().zip(got_m1_3.iter()).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum();
+        assert!((d3 / qn.max(1e-12)).sqrt() < 1e-4, "Qwen4 M=1 multi-job sum diverged");
+
+        // Grouped prefill parity (`NT = m_toks`)
+        let toks: Vec<usize> = (0..m_toks).collect();
+        let wts = vec![w; m_toks];
+        let grp = [Glm5CpuGroupedExpert {
+            gate_ptr: gate_w.as_ptr(),
+            up_ptr: up_w.as_ptr(),
+            down_ptr: dn_w.as_ptr(),
+            token_indices: &toks,
+            token_weights: &wts,
+        }];
+        let mut got_grp = vec![0.0f32; m_toks * n_embd];
+        run_glm5_cpu_moe_grouped(
+            &pool,
+            &mut scratch,
+            gu_ty,
+            dn_ty,
+            n_embd,
+            n_ff,
+            0.0,
+            m_toks,
+            &x,
+            &grp,
+            &mut got_grp,
+            true,
+        );
+        for t in 0..m_toks {
+            let rt = ref_moe(
+                gu_ty,
+                dn_ty,
+                n_embd,
+                n_ff,
+                &gate_w,
+                &up_w,
+                &dn_w,
+                &x[t * n_embd..(t + 1) * n_embd],
+                w,
+                true,
+            );
+            let rn: f64 = rt.iter().map(|&v| (v as f64).powi(2)).sum();
+            let rd: f64 = rt
+                .iter()
+                .zip(got_grp[t * n_embd..(t + 1) * n_embd].iter())
+                .map(|(&a, &b)| ((a - b) as f64).powi(2))
+                .sum();
+            let rel_t = (rd / rn.max(1e-12)).sqrt();
+            assert!(
+                rel_t < 1e-4,
+                "Qwen4 grouped ({gu_ty:?}/{dn_ty:?}, {n_ff}, m={m_toks}) tok {t} rel_vs_q={rel_t}"
+            );
+        }
+
+        // Grouped small batch parity (`run_glm5_cpu_moe_grouped_small`, `m_small <= 8`)
+        let m_small = m_toks.min(8);
+        let small_toks: Vec<usize> = (0..m_small).collect();
+        let small_wts = vec![w; m_small];
+        let small_grp = [Glm5CpuGroupedExpert {
+            gate_ptr: gate_w.as_ptr(),
+            up_ptr: up_w.as_ptr(),
+            down_ptr: dn_w.as_ptr(),
+            token_indices: &small_toks,
+            token_weights: &small_wts,
+        }];
+        let mut got_small = vec![0.0f32; m_small * n_embd];
+        run_glm5_cpu_moe_grouped_small(
+            &pool,
+            &mut scratch,
+            gu_ty,
+            dn_ty,
+            n_embd,
+            n_ff,
+            0.0,
+            m_small,
+            &x[..m_small * n_embd],
+            &small_grp,
+            &mut got_small,
+            true,
+        );
+        for t in 0..m_small {
+            let rt = ref_moe(
+                gu_ty,
+                dn_ty,
+                n_embd,
+                n_ff,
+                &gate_w,
+                &up_w,
+                &dn_w,
+                &x[t * n_embd..(t + 1) * n_embd],
+                w,
+                true,
+            );
+            let rn: f64 = rt.iter().map(|&v| (v as f64).powi(2)).sum();
+            let rd: f64 = rt
+                .iter()
+                .zip(got_small[t * n_embd..(t + 1) * n_embd].iter())
+                .map(|(&a, &b)| ((a - b) as f64).powi(2))
+                .sum();
+            let rel_t = (rd / rn.max(1e-12)).sqrt();
+            assert!(
+                rel_t < 1e-4,
+                "Qwen4 grouped_small ({gu_ty:?}/{dn_ty:?}, {n_ff}, m={m_small}) tok {t} rel_vs_q={rel_t}"
+            );
+        }
+    }
+
+    // `tok_row_to_f32_cpu` parity for Qwen3.8 PLE `IQ4_NL` (`k=160`) and `Q5_1` (`k=640`)
+    for (ty, k) in [(GgmlType::Iq4Nl, 160usize), (GgmlType::Iq4Nl, 2560usize), (GgmlType::Q5_1, 640usize)] {
+        let w = fill_random_quant_rows(ty, 1, k, 991 + k as u64);
+        let mut fast = vec![0.0f32; k];
+        let mut ref_deq = vec![0.0f32; k];
+        ampllm_cpu_kernels::tok_row_to_f32_cpu(ty, &w, &mut fast);
+        dequantize_row_to_f32(ty, &w, &mut ref_deq);
+        let max_diff = fast
+            .iter()
+            .zip(ref_deq.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("tok_row_to_f32_cpu ({ty:?}, k={k}) max_diff = {max_diff:.8}");
+        assert!(max_diff < 1e-5, "tok_row_to_f32_cpu ({ty:?}, k={k}) max_diff={max_diff}");
+    }
+}
+
+#[test]
+fn test_mm3_avx512_iq2xxs_iq2xs_iq1s_and_mixed_swigluoai_parity() {
+    if !ampllm_cpu_kernels::glm5_cpu::has_glm5_avx512() {
+        eprintln!("skipping MM3 AVX-512 parity test: host lacks required AVX-512 ISA");
+        return;
+    }
+
+    let fill_mm3_rows = |ty: GgmlType, n: usize, k: usize, seed: u64| -> Vec<u8> {
+        let mut rng = Rng(seed);
+        let rb = ty.row_bytes(k);
+        let blk_sz = ty.type_size();
+        let nb = k / 256;
+        let mut out = vec![0u8; n * rb];
+        for r in 0..n {
+            let row = &mut out[r * rb..(r + 1) * rb];
+            for b in 0..nb {
+                let blk = &mut row[b * blk_sz..(b + 1) * blk_sz];
+                for byte in blk.iter_mut() {
+                    *byte = (rng.next_u32() & 0xFF) as u8;
+                }
+                let d_bytes = f16::from_f32(0.02 + rng.next_f32().abs() * 0.05).to_le_bytes();
+                if ty == GgmlType::Q6K {
+                    blk[208..210].copy_from_slice(&d_bytes);
+                } else {
+                    blk[0..2].copy_from_slice(&d_bytes);
+                }
+            }
+        }
+        out
+    };
+
+    let quant_q8k_ref = |x: &[f32]| -> (Vec<u8>, Vec<f32>) {
+        let nb = x.len() / 256;
+        let q8k_bytes = ampllm_cpu_kernels::glm5_cpu::Q8K_BLOCK_BYTES;
+        let mut raw = vec![0u8; nb * q8k_bytes];
+        unsafe {
+            ampllm_cpu_kernels::mm3_cpu::ampllm_cpu_mm3_quantize_q8_k(
+                x.as_ptr(),
+                raw.as_mut_ptr() as *mut std::ffi::c_void,
+                x.len() as i32,
+            );
+        }
+        let mut deq = Vec::with_capacity(x.len());
+        for b in raw.chunks_exact(q8k_bytes) {
+            let d = f32::from_le_bytes(b[0..4].try_into().unwrap());
+            for j in 0..256 {
+                deq.push(d * ((b[4 + j] as i8) as f32));
+            }
+        }
+        (raw, deq)
+    };
+
+    let ref_mm3_moe = |g_ty: GgmlType,
+                       u_ty: GgmlType,
+                       d_ty: GgmlType,
+                       n_embd: usize,
+                       n_ff: usize,
+                       gate_w: &[u8],
+                       up_w: &[u8],
+                       dn_w: &[u8],
+                       x: &[f32],
+                       weight: f32,
+                       quantize_act: bool| -> Vec<f32> {
+        let g_rb = g_ty.row_bytes(n_embd);
+        let u_rb = u_ty.row_bytes(n_embd);
+        let d_rb = d_ty.row_bytes(n_ff);
+        let alpha = 1.702f32;
+        let limit = 7.0f32;
+        let x_use: Vec<f32> = if quantize_act {
+            quant_q8k_ref(x).1
+        } else {
+            x.to_vec()
+        };
+        let mut hidden = vec![0.0f32; n_ff];
+        let mut dg_row = vec![0.0f32; n_embd];
+        let mut du_row = vec![0.0f32; n_embd];
+        for r in 0..n_ff {
+            dequantize_row_to_f32(g_ty, &gate_w[r * g_rb..(r + 1) * g_rb], &mut dg_row);
+            dequantize_row_to_f32(u_ty, &up_w[r * u_rb..(r + 1) * u_rb], &mut du_row);
+            let g_sum: f64 = dg_row
+                .iter()
+                .zip(x_use.iter())
+                .map(|(&w, &v)| (w as f64) * (v as f64))
+                .sum();
+            let u_sum: f64 = du_row
+                .iter()
+                .zip(x_use.iter())
+                .map(|(&w, &v)| (w as f64) * (v as f64))
+                .sum();
+            let g_c = (g_sum as f32).min(limit);
+            let u_c = (u_sum as f32).clamp(-limit, limit);
+            hidden[r] = (g_c / (1.0f32 + (-alpha * g_c).exp())) * (u_c + 1.0f32);
+        }
+        let h_use: Vec<f32> = if quantize_act {
+            quant_q8k_ref(&hidden).1
+        } else {
+            hidden
+        };
+        let mut out = vec![0.0f32; n_embd];
+        let mut dd_row = vec![0.0f32; n_ff];
+        for r in 0..n_embd {
+            dequantize_row_to_f32(d_ty, &dn_w[r * d_rb..(r + 1) * d_rb], &mut dd_row);
+            let d_sum: f64 = dd_row
+                .iter()
+                .zip(h_use.iter())
+                .map(|(&w, &v)| (w as f64) * (v as f64))
+                .sum();
+            out[r] = weight * (d_sum as f32);
+        }
+        out
+    };
+
+    let pool = CpuThreadPool::new(Some(8));
+    let mut scratch = ampllm_cpu_kernels::Mm3CpuScratch::new(1024, 512, 16);
+
+    let combos = [
+        (GgmlType::Iq2Xxs, GgmlType::Iq2Xxs, GgmlType::Iq2Xxs),
+        (GgmlType::Iq2Xs, GgmlType::Iq2Xxs, GgmlType::Iq3Xxs),
+        (GgmlType::Iq2Xs, GgmlType::Iq2Xxs, GgmlType::Iq2Xs),
+        (GgmlType::Iq2S, GgmlType::Iq2S, GgmlType::Iq3Xxs),
+        (GgmlType::Iq1S, GgmlType::Iq1S, GgmlType::Iq1S),
+    ];
+
+    let n_embd = 1024usize;
+    let n_ff = 512usize;
+    let max_m = 12usize;
+    let mut rng = Rng(20260301);
+    let x: Vec<f32> = (0..max_m * n_embd).map(|_| rng.next_f32() * 0.6).collect();
+    let alpha = 1.702f32;
+    let limit = 7.0f32;
+
+    for (idx, (g_ty, u_ty, d_ty)) in combos.into_iter().enumerate() {
+        let gate_w = fill_mm3_rows(g_ty, n_ff, n_embd, 100 + idx as u64);
+        let up_w = fill_mm3_rows(u_ty, n_ff, n_embd, 200 + idx as u64);
+        let dn_w = fill_mm3_rows(d_ty, n_embd, n_ff, 300 + idx as u64);
+        let w = 0.85f32;
+
+        // 1. M=1 single-job & 3-job parity
+        let mut got_m1 = vec![0.0f32; n_embd];
+        let job1 = [ampllm_cpu_kernels::Mm3CpuExpertJob {
+            gate_ptr: gate_w.as_ptr(),
+            up_ptr: up_w.as_ptr(),
+            down_ptr: dn_w.as_ptr(),
+            weight: w,
+        }];
+        ampllm_cpu_kernels::run_mm3_cpu_moe_m1(
+            &pool,
+            &mut scratch,
+            g_ty,
+            u_ty,
+            d_ty,
+            n_embd,
+            n_ff,
+            alpha,
+            limit,
+            &x[..n_embd],
+            None,
+            &job1,
+            &mut got_m1,
+        );
+        let r_q = ref_mm3_moe(g_ty, u_ty, d_ty, n_embd, n_ff, &gate_w, &up_w, &dn_w, &x[..n_embd], w, true);
+        let r_f = ref_mm3_moe(g_ty, u_ty, d_ty, n_embd, n_ff, &gate_w, &up_w, &dn_w, &x[..n_embd], w, false);
+        let rel_err = |a: &[f32], b: &[f32]| -> f64 {
+            let n2: f64 = a.iter().map(|&v| (v as f64).powi(2)).sum();
+            let d2: f64 = a.iter().zip(b.iter()).map(|(&x, &y)| ((x - y) as f64).powi(2)).sum();
+            (d2 / n2.max(1e-12)).sqrt()
+        };
+        let rel_q = rel_err(&r_q, &got_m1);
+        let rel_f = rel_err(&r_f, &got_m1);
+        println!("MM3 CPU M=1 ({g_ty:?}/{u_ty:?}/{d_ty:?}) rel_vs_q={rel_q:.8} rel_vs_fp32={rel_f:.6}");
+        assert!(rel_q < 1e-4, "MM3 M=1 rel_vs_q={rel_q}");
+        assert!(rel_f < 3e-2, "MM3 M=1 rel_vs_fp32={rel_f}");
+
+        let mut got_m1_3 = vec![0.0f32; n_embd];
+        let job3 = [
+            ampllm_cpu_kernels::Mm3CpuExpertJob {
+                gate_ptr: gate_w.as_ptr(),
+                up_ptr: up_w.as_ptr(),
+                down_ptr: dn_w.as_ptr(),
+                weight: 0.25 * w,
+            },
+            ampllm_cpu_kernels::Mm3CpuExpertJob {
+                gate_ptr: gate_w.as_ptr(),
+                up_ptr: up_w.as_ptr(),
+                down_ptr: dn_w.as_ptr(),
+                weight: 0.45 * w,
+            },
+            ampllm_cpu_kernels::Mm3CpuExpertJob {
+                gate_ptr: gate_w.as_ptr(),
+                up_ptr: up_w.as_ptr(),
+                down_ptr: dn_w.as_ptr(),
+                weight: 0.30 * w,
+            },
+        ];
+        ampllm_cpu_kernels::run_mm3_cpu_moe_m1(
+            &pool,
+            &mut scratch,
+            g_ty,
+            u_ty,
+            d_ty,
+            n_embd,
+            n_ff,
+            alpha,
+            limit,
+            &x[..n_embd],
+            None,
+            &job3,
+            &mut got_m1_3,
+        );
+        let rel_3 = rel_err(&got_m1, &got_m1_3);
+        assert!(rel_3 < 1e-4, "MM3 M=1 3-job sum diverged: {rel_3}");
+
+        // 2. Grouped M=7 (NT<=6 + mixed) and M=12 (wide-tiled NT>=7) parity
+        for &m_toks in &[7usize, 12usize] {
+            let toks: Vec<usize> = (0..m_toks).collect();
+            let wts: Vec<f32> = (0..m_toks).map(|t| 0.4 + 0.1 * ((t % 5) as f32)).collect();
+            let grp = [ampllm_cpu_kernels::Mm3CpuGroupedExpert {
+                gate_ptr: gate_w.as_ptr(),
+                up_ptr: up_w.as_ptr(),
+                down_ptr: dn_w.as_ptr(),
+                token_indices: &toks,
+                token_weights: &wts,
+            }];
+            let mut got_grp = vec![0.0f32; m_toks * n_embd];
+            ampllm_cpu_kernels::run_mm3_cpu_moe_grouped(
+                &pool,
+                &mut scratch,
+                g_ty,
+                u_ty,
+                d_ty,
+                n_embd,
+                n_ff,
+                alpha,
+                limit,
+                m_toks,
+                &x[..m_toks * n_embd],
+                &grp,
+                &mut got_grp,
+                true,
+            );
+            for t in 0..m_toks {
+                let rt = ref_mm3_moe(
+                    g_ty,
+                    u_ty,
+                    d_ty,
+                    n_embd,
+                    n_ff,
+                    &gate_w,
+                    &up_w,
+                    &dn_w,
+                    &x[t * n_embd..(t + 1) * n_embd],
+                    wts[t],
+                    true,
+                );
+                let rel_t = rel_err(&rt, &got_grp[t * n_embd..(t + 1) * n_embd]);
+                assert!(
+                    rel_t < 1e-4,
+                    "MM3 grouped ({g_ty:?}/{u_ty:?}/{d_ty:?}, m={m_toks}) tok {t} rel_vs_q={rel_t}"
+                );
+            }
+        }
+    }
+
+    // 3. q6_k_row_to_f32_cpu parity
+    let q6k_w = fill_mm3_rows(GgmlType::Q6K, 1, 6144, 777);
+    let mut fast_q6 = vec![0.0f32; 6144];
+    let mut ref_q6 = vec![0.0f32; 6144];
+    ampllm_cpu_kernels::q6_k_row_to_f32_cpu(&q6k_w, &mut fast_q6);
+    dequantize_row_to_f32(GgmlType::Q6K, &q6k_w, &mut ref_q6);
+    let max_diff = fast_q6
+        .iter()
+        .zip(ref_q6.iter())
+        .map(|(&a, &b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!("q6_k_row_to_f32_cpu max_diff = {max_diff:.8}");
+    assert!(max_diff < 1e-5, "q6_k_row_to_f32_cpu max_diff={max_diff}");
 }

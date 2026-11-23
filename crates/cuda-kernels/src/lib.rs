@@ -1,6 +1,9 @@
 pub mod cuda_rt;
 pub mod ffi;
 pub mod glm5;
+pub mod hy4;
+pub mod mm3;
+pub mod qwen4;
 
 pub use cuda_rt::{
     can_access_peer, copy_d2d_raw_async, copy_d2h_raw_async, copy_h2d_raw_async,

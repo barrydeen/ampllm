@@ -26,6 +26,8 @@ __device__ __forceinline__ float dispatch_dot_row(
 ) {
     switch (w_type) {
         case GGML_TYPE_Q8_0:    return dot_row_q8_0_sub(reinterpret_cast<const block_q8_0*>(w_row), x_q8, K, lane);
+        case GGML_TYPE_Q5_1:    return dot_row_q5_1_sub(reinterpret_cast<const block_q5_1*>(w_row), x_q8, K, lane);
+        case GGML_TYPE_Q2_0:    return dot_row_q2_0_sub(reinterpret_cast<const block_q2_0*>(w_row), x_q8, K, lane);
         case GGML_TYPE_Q4_0:    return dot_row_blocks<block_q4_0,   32,  dot_q4_0_q8_1>(w_row, x_q8, K, lane);
         case GGML_TYPE_IQ4_NL:  return dot_row_iq4_nl_sub(reinterpret_cast<const block_iq4_nl*>(w_row), x_q8, K, lane);
         case GGML_TYPE_IQ4_XS:  return dot_row_blocks<block_iq4_xs, 256, dot_iq4_xs_q8_1>(w_row, x_q8, K, lane);
@@ -66,6 +68,20 @@ __device__ __forceinline__ void dispatch_dot_pair(
                 x_q8, K, lane, out0, out1
             );
             break;
+        case GGML_TYPE_Q5_1:
+            dot_pair_q5_1_sub(
+                reinterpret_cast<const block_q5_1*>(w_row0),
+                reinterpret_cast<const block_q5_1*>(w_row1),
+                x_q8, K, lane, out0, out1
+            );
+            break;
+        case GGML_TYPE_Q2_0:
+            dot_pair_q2_0_sub(
+                reinterpret_cast<const block_q2_0*>(w_row0),
+                reinterpret_cast<const block_q2_0*>(w_row1),
+                x_q8, K, lane, out0, out1
+            );
+            break;
         case GGML_TYPE_IQ4_NL:
             dot_pair_iq4_nl_sub(
                 reinterpret_cast<const block_iq4_nl*>(w_row0),
@@ -84,6 +100,20 @@ __device__ __forceinline__ void dispatch_dot_pair(
             dot_pair_iq2_s_sub(
                 reinterpret_cast<const block_iq2_s*>(w_row0),
                 reinterpret_cast<const block_iq2_s*>(w_row1),
+                x_q8, K, lane, out0, out1
+            );
+            break;
+        case GGML_TYPE_IQ4_XS:
+            dot_pair_iq4_xs_sub(
+                reinterpret_cast<const block_iq4_xs*>(w_row0),
+                reinterpret_cast<const block_iq4_xs*>(w_row1),
+                x_q8, K, lane, out0, out1
+            );
+            break;
+        case GGML_TYPE_Q5_K:
+            dot_pair_q5_K_sub(
+                reinterpret_cast<const block_q5_K*>(w_row0),
+                reinterpret_cast<const block_q5_K*>(w_row1),
                 x_q8, K, lane, out0, out1
             );
             break;
@@ -219,10 +249,9 @@ __global__ void __launch_bounds__(128) glm5_moe_down_reduce_kernel(
     const int lane = threadIdx.x;
 
     const int nb_ff = n_ff >> 5;
-    constexpr int MAX_STAGED_TOPK = 8;
-    constexpr int MAX_INTER_NB = 64; // n_ff=2048 -> 64 blocks -> 18 KB SMEM
-    // Stage up to 8 x 2048 inter_q8 vectors + IQ3 codebook into SMEM
-    __shared__ __align__(16) uint32_t s_inter_words[MAX_STAGED_TOPK * MAX_INTER_NB * 9];
+    constexpr int MAX_STAGED_TOTAL_BLKS = 512;
+    // Stage up to 512 inter_q8 blocks (e.g. 8x2048 or 10x640 = 200 blks -> 7.2 KB) + IQ3 codebook into SMEM
+    __shared__ __align__(16) uint32_t s_inter_words[MAX_STAGED_TOTAL_BLKS * 9];
     __shared__ __align__(16) uint32_t s_grid[(W_TYPE == GGML_TYPE_IQ3_S) ? 512 : 256];
 
     if constexpr (W_TYPE == GGML_TYPE_IQ3_XXS) {
@@ -230,7 +259,7 @@ __global__ void __launch_bounds__(128) glm5_moe_down_reduce_kernel(
     } else if constexpr (W_TYPE == GGML_TYPE_IQ3_S) {
         for (int i = tid; i < 512; i += 128) s_grid[i] = d_iq3s_grid[i];
     }
-    const bool staged_inter = (nb_ff <= MAX_INTER_NB && topk <= MAX_STAGED_TOPK);
+    const bool staged_inter = (topk * nb_ff <= MAX_STAGED_TOTAL_BLKS);
     if (staged_inter) {
         const uint32_t* src_words = reinterpret_cast<const uint32_t*>(inter_q8 + (size_t)m * topk * nb_ff);
         const int total_words = topk * nb_ff * 9;
@@ -261,6 +290,14 @@ __global__ void __launch_bounds__(128) glm5_moe_down_reduce_kernel(
             dot = dot_row_iq3_s_sub(reinterpret_cast<const block_iq3_s*>(wr), x_use, n_ff, lane, s_grid);
         } else if constexpr (W_TYPE == GGML_TYPE_Q4_K) {
             dot = dot_row_q4_K_sub(reinterpret_cast<const block_q4_K*>(wr), x_use, n_ff, lane);
+        } else if constexpr (W_TYPE == GGML_TYPE_Q5_K) {
+            dot = dot_row_q5_K_sub(reinterpret_cast<const block_q5_K*>(wr), x_use, n_ff, lane);
+        } else if constexpr (W_TYPE == GGML_TYPE_Q8_0) {
+            dot = dot_row_q8_0_sub(reinterpret_cast<const block_q8_0*>(wr), x_use, n_ff, lane);
+        } else if constexpr (W_TYPE == GGML_TYPE_Q5_1) {
+            dot = dot_row_q5_1_sub(reinterpret_cast<const block_q5_1*>(wr), x_use, n_ff, lane);
+        } else if constexpr (W_TYPE == GGML_TYPE_Q2_0) {
+            dot = dot_row_q2_0_sub(reinterpret_cast<const block_q2_0*>(wr), x_use, n_ff, lane);
         } else if constexpr (W_TYPE == GGML_TYPE_IQ2_S) {
             dot = dot_row_iq2_s_sub(reinterpret_cast<const block_iq2_s*>(wr), x_use, n_ff, lane);
         } else {
@@ -336,6 +373,34 @@ __global__ void __launch_bounds__(256, 3) glm5_moe_gate_up_plan_kernel(
             for (int r = tail0 + warp; r < r1; r += 8) {
                 float v = dot_row_q6_K_sub(
                     reinterpret_cast<const block_q6_K*>(sw + (size_t)r * sh_down_row_bytes),
+                    x_sh, n_ff_sh, lane
+                );
+                if (lane == 0) y_sh[r] = v;
+            }
+        } else if (sh_down_type == GGML_TYPE_Q8_0) {
+            const int n_sh = r1 - r0;
+            const int n_quad = n_sh >> 2;
+            for (int q = warp; q < n_quad; q += 8) {
+                const int r = r0 + (q << 2);
+                float o0, o1, o2, o3;
+                dot_quad_q8_0_sub(
+                    reinterpret_cast<const block_q8_0*>(sw + (size_t)(r + 0) * sh_down_row_bytes),
+                    reinterpret_cast<const block_q8_0*>(sw + (size_t)(r + 1) * sh_down_row_bytes),
+                    reinterpret_cast<const block_q8_0*>(sw + (size_t)(r + 2) * sh_down_row_bytes),
+                    reinterpret_cast<const block_q8_0*>(sw + (size_t)(r + 3) * sh_down_row_bytes),
+                    x_sh, n_ff_sh, lane, o0, o1, o2, o3
+                );
+                if (lane == 0) {
+                    y_sh[r + 0] = o0;
+                    y_sh[r + 1] = o1;
+                    y_sh[r + 2] = o2;
+                    y_sh[r + 3] = o3;
+                }
+            }
+            const int tail0 = r0 + (n_quad << 2);
+            for (int r = tail0 + warp; r < r1; r += 8) {
+                float v = dot_row_q8_0_sub(
+                    reinterpret_cast<const block_q8_0*>(sw + (size_t)r * sh_down_row_bytes),
                     x_sh, n_ff_sh, lane
                 );
                 if (lane == 0) y_sh[r] = v;
@@ -431,6 +496,46 @@ __global__ void __launch_bounds__(256, 3) glm5_moe_gate_up_plan_kernel(
                     reinterpret_cast<const block_q6_K*>(u1),
                     x_use, n_embd, lane, vg0, vg1, vu0, vu1
                 );
+            } else if constexpr (W_TYPE == GGML_TYPE_Q5_K) {
+                dot_quad_q5_K_sub(
+                    reinterpret_cast<const block_q5_K*>(g0),
+                    reinterpret_cast<const block_q5_K*>(g1),
+                    reinterpret_cast<const block_q5_K*>(u0),
+                    reinterpret_cast<const block_q5_K*>(u1),
+                    x_use, n_embd, lane, vg0, vg1, vu0, vu1
+                );
+            } else if constexpr (W_TYPE == GGML_TYPE_IQ4_XS) {
+                dot_quad_iq4_xs_sub(
+                    reinterpret_cast<const block_iq4_xs*>(g0),
+                    reinterpret_cast<const block_iq4_xs*>(g1),
+                    reinterpret_cast<const block_iq4_xs*>(u0),
+                    reinterpret_cast<const block_iq4_xs*>(u1),
+                    x_use, n_embd, lane, vg0, vg1, vu0, vu1
+                );
+            } else if constexpr (W_TYPE == GGML_TYPE_Q8_0) {
+                dot_quad_q8_0_sub(
+                    reinterpret_cast<const block_q8_0*>(g0),
+                    reinterpret_cast<const block_q8_0*>(g1),
+                    reinterpret_cast<const block_q8_0*>(u0),
+                    reinterpret_cast<const block_q8_0*>(u1),
+                    x_use, n_embd, lane, vg0, vg1, vu0, vu1
+                );
+            } else if constexpr (W_TYPE == GGML_TYPE_Q5_1) {
+                dot_quad_q5_1_sub(
+                    reinterpret_cast<const block_q5_1*>(g0),
+                    reinterpret_cast<const block_q5_1*>(g1),
+                    reinterpret_cast<const block_q5_1*>(u0),
+                    reinterpret_cast<const block_q5_1*>(u1),
+                    x_use, n_embd, lane, vg0, vg1, vu0, vu1
+                );
+            } else if constexpr (W_TYPE == GGML_TYPE_Q2_0) {
+                dot_quad_q2_0_sub(
+                    reinterpret_cast<const block_q2_0*>(g0),
+                    reinterpret_cast<const block_q2_0*>(g1),
+                    reinterpret_cast<const block_q2_0*>(u0),
+                    reinterpret_cast<const block_q2_0*>(u1),
+                    x_use, n_embd, lane, vg0, vg1, vu0, vu1
+                );
             } else {
                 vg0 = dispatch_dot_row(W_TYPE, g0, x_use, n_embd, lane);
                 vg1 = dispatch_dot_row(W_TYPE, g1, x_use, n_embd, lane);
@@ -477,16 +582,16 @@ __global__ void __launch_bounds__(256) glm5_moe_down_plan_kernel(
     const int nb_ff   = n_ff >> 5;
     const int n_quads = (n_embd + NR - 1) / NR;
 
-    __shared__ uint64_t s_act_base[8];
-    __shared__ float s_act_rw[8];
-    __shared__ int s_act_slot[8];
+    __shared__ uint64_t s_act_base[16];
+    __shared__ float s_act_rw[16];
+    __shared__ int s_act_slot[16];
     __shared__ int s_n_act;
     __shared__ float s_part[8][NR];
     __shared__ __align__(16) uint32_t s_grid[(W_TYPE == GGML_TYPE_IQ3_S) ? 512 : 256];
 
     if (tid == 0) {
         int na = 0;
-        for (int k = 0; k < topk && k < 8; ++k) {
+        for (int k = 0; k < topk && k < 16; ++k) {
             uint64_t bp = plan_ptrs[(size_t)m * topk + k];
             if (fetch_src_filter != nullptr && filter_mode != 0) {
                 const uint64_t fs = fetch_src_filter[(size_t)m * topk + k];
@@ -573,6 +678,46 @@ __global__ void __launch_bounds__(256) glm5_moe_down_plan_kernel(
                 reinterpret_cast<const block_q6_K*>(w3),
                 x_use, n_ff, lane, o0, o1, o2, o3
             );
+        } else if constexpr (W_TYPE == GGML_TYPE_Q5_K) {
+            dot_quad_q5_K_sub(
+                reinterpret_cast<const block_q5_K*>(w0),
+                reinterpret_cast<const block_q5_K*>(w1),
+                reinterpret_cast<const block_q5_K*>(w2),
+                reinterpret_cast<const block_q5_K*>(w3),
+                x_use, n_ff, lane, o0, o1, o2, o3
+            );
+        } else if constexpr (W_TYPE == GGML_TYPE_IQ4_XS) {
+            dot_quad_iq4_xs_sub(
+                reinterpret_cast<const block_iq4_xs*>(w0),
+                reinterpret_cast<const block_iq4_xs*>(w1),
+                reinterpret_cast<const block_iq4_xs*>(w2),
+                reinterpret_cast<const block_iq4_xs*>(w3),
+                x_use, n_ff, lane, o0, o1, o2, o3
+            );
+        } else if constexpr (W_TYPE == GGML_TYPE_Q8_0) {
+            dot_quad_q8_0_sub(
+                reinterpret_cast<const block_q8_0*>(w0),
+                reinterpret_cast<const block_q8_0*>(w1),
+                reinterpret_cast<const block_q8_0*>(w2),
+                reinterpret_cast<const block_q8_0*>(w3),
+                x_use, n_ff, lane, o0, o1, o2, o3
+            );
+        } else if constexpr (W_TYPE == GGML_TYPE_Q5_1) {
+            dot_quad_q5_1_sub(
+                reinterpret_cast<const block_q5_1*>(w0),
+                reinterpret_cast<const block_q5_1*>(w1),
+                reinterpret_cast<const block_q5_1*>(w2),
+                reinterpret_cast<const block_q5_1*>(w3),
+                x_use, n_ff, lane, o0, o1, o2, o3
+            );
+        } else if constexpr (W_TYPE == GGML_TYPE_Q2_0) {
+            dot_quad_q2_0_sub(
+                reinterpret_cast<const block_q2_0*>(w0),
+                reinterpret_cast<const block_q2_0*>(w1),
+                reinterpret_cast<const block_q2_0*>(w2),
+                reinterpret_cast<const block_q2_0*>(w3),
+                x_use, n_ff, lane, o0, o1, o2, o3
+            );
         } else {
             o0 = dispatch_dot_row(W_TYPE, w0, x_use, n_ff, lane);
             o1 = dispatch_dot_row(W_TYPE, w1, x_use, n_ff, lane);
@@ -585,25 +730,49 @@ __global__ void __launch_bounds__(256) glm5_moe_down_plan_kernel(
     const int rq_base = two_quad ? ((int)blockIdx.x * 2) : (int)blockIdx.x;
     if (rq_base >= n_quads) return;
 
-    const int grp = two_quad ? (warp >> 2) : 0;
-    const int w_idx = two_quad ? (warp & 3) : warp;
-    const uint64_t base = (w_idx < n_act) ? s_act_base[w_idx] : 0ULL;
-    const int slot_id = (w_idx < n_act) ? s_act_slot[w_idx] : 0;
-    const block_q8_1* x_use = inter_q8 + ((size_t)m * topk + slot_id) * nb_ff;
     const int red_threads = two_quad ? 8 : NR;
-
-    const int rq = rq_base + grp;
-    const int r0 = rq * NR;
-    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
-    if (rq < n_quads && base != 0ULL && r0 < n_embd) {
-        eval_quad(base, x_use, r0, o0, o1, o2, o3);
-    }
-    if (w_idx < n_act && lane == 0) {
-        const int ps = grp * 4 + w_idx;
-        s_part[ps][0] = o0;
-        s_part[ps][1] = o1;
-        s_part[ps][2] = o2;
-        s_part[ps][3] = o3;
+    if (two_quad) {
+        const int grp = warp >> 2;
+        const int w_idx = warp & 3;
+        const uint64_t base = (w_idx < n_act) ? s_act_base[w_idx] : 0ULL;
+        const int slot_id = (w_idx < n_act) ? s_act_slot[w_idx] : 0;
+        const block_q8_1* x_use = inter_q8 + ((size_t)m * topk + slot_id) * nb_ff;
+        const int rq = rq_base + grp;
+        const int r0 = rq * NR;
+        float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+        if (rq < n_quads && base != 0ULL && r0 < n_embd) {
+            eval_quad(base, x_use, r0, o0, o1, o2, o3);
+        }
+        if (w_idx < n_act && lane == 0) {
+            const int ps = grp * 4 + w_idx;
+            s_part[ps][0] = o0;
+            s_part[ps][1] = o1;
+            s_part[ps][2] = o2;
+            s_part[ps][3] = o3;
+        }
+    } else {
+        const int r0 = rq_base * NR;
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        for (int idx = warp; idx < n_act; idx += 8) {
+            const uint64_t base = s_act_base[idx];
+            if (base != 0ULL && r0 < n_embd) {
+                const int slot_id = s_act_slot[idx];
+                const block_q8_1* x_use = inter_q8 + ((size_t)m * topk + slot_id) * nb_ff;
+                float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+                eval_quad(base, x_use, r0, o0, o1, o2, o3);
+                const float rw = s_act_rw[idx];
+                a0 += rw * o0;
+                a1 += rw * o1;
+                a2 += rw * o2;
+                a3 += rw * o3;
+            }
+        }
+        if (lane == 0) {
+            s_part[warp][0] = a0;
+            s_part[warp][1] = a1;
+            s_part[warp][2] = a2;
+            s_part[warp][3] = a3;
+        }
     }
     __syncthreads();
 
@@ -613,8 +782,15 @@ __global__ void __launch_bounds__(256) glm5_moe_down_plan_kernel(
         const int r = (rq_base + g) * NR + c;
         if (r < n_embd) {
             float sum = 0.0f;
-            for (int i = 0; i < n_act; ++i) {
-                sum += s_act_rw[i] * s_part[g * 4 + i][c];
+            if (two_quad) {
+                for (int i = 0; i < n_act; ++i) {
+                    sum += s_act_rw[i] * s_part[g * 4 + i][c];
+                }
+            } else {
+                const int nw = (n_act < 8) ? n_act : 8;
+                for (int i = 0; i < nw; ++i) {
+                    sum += s_part[i][c];
+                }
             }
             if (filter_mode == 2) {
                 out[(size_t)m * n_embd + r] += sum;
@@ -692,6 +868,36 @@ extern "C" void launch_glm5_moe_plan_filtered(
                 sh_down_w, sh_down_type, sh_down_row_bytes, sh_q8, n_ff_sh, sh_out_opt,
                 n_embd, n_ff, topk, clamp_lim, skip_dev, fetch_src_filter, filter_mode);
             break;
+        case GGML_TYPE_Q5_K:
+            glm5_moe_gate_up_plan_kernel<GGML_TYPE_Q5_K><<<grid_gu, block_gu, 0, stream>>>(
+                plan_ptrs, u_off, gu_row_bytes, xq, iq8,
+                sh_down_w, sh_down_type, sh_down_row_bytes, sh_q8, n_ff_sh, sh_out_opt,
+                n_embd, n_ff, topk, clamp_lim, skip_dev, fetch_src_filter, filter_mode);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            glm5_moe_gate_up_plan_kernel<GGML_TYPE_IQ4_XS><<<grid_gu, block_gu, 0, stream>>>(
+                plan_ptrs, u_off, gu_row_bytes, xq, iq8,
+                sh_down_w, sh_down_type, sh_down_row_bytes, sh_q8, n_ff_sh, sh_out_opt,
+                n_embd, n_ff, topk, clamp_lim, skip_dev, fetch_src_filter, filter_mode);
+            break;
+        case GGML_TYPE_Q8_0:
+            glm5_moe_gate_up_plan_kernel<GGML_TYPE_Q8_0><<<grid_gu, block_gu, 0, stream>>>(
+                plan_ptrs, u_off, gu_row_bytes, xq, iq8,
+                sh_down_w, sh_down_type, sh_down_row_bytes, sh_q8, n_ff_sh, sh_out_opt,
+                n_embd, n_ff, topk, clamp_lim, skip_dev, fetch_src_filter, filter_mode);
+            break;
+        case GGML_TYPE_Q5_1:
+            glm5_moe_gate_up_plan_kernel<GGML_TYPE_Q5_1><<<grid_gu, block_gu, 0, stream>>>(
+                plan_ptrs, u_off, gu_row_bytes, xq, iq8,
+                sh_down_w, sh_down_type, sh_down_row_bytes, sh_q8, n_ff_sh, sh_out_opt,
+                n_embd, n_ff, topk, clamp_lim, skip_dev, fetch_src_filter, filter_mode);
+            break;
+        case GGML_TYPE_Q2_0:
+            glm5_moe_gate_up_plan_kernel<GGML_TYPE_Q2_0><<<grid_gu, block_gu, 0, stream>>>(
+                plan_ptrs, u_off, gu_row_bytes, xq, iq8,
+                sh_down_w, sh_down_type, sh_down_row_bytes, sh_q8, n_ff_sh, sh_out_opt,
+                n_embd, n_ff, topk, clamp_lim, skip_dev, fetch_src_filter, filter_mode);
+            break;
         default:
             break;
     }
@@ -712,6 +918,31 @@ extern "C" void launch_glm5_moe_plan_filtered(
             break;
         case GGML_TYPE_Q4_K:
             glm5_moe_down_plan_kernel<GGML_TYPE_Q4_K><<<grid_d, block_d, 0, stream>>>(
+                plan_ptrs, d_off, d_row_bytes, iq8, router_w, sh_out_opt, out_f32, n_embd, n_ff, topk,
+                skip_dev, fetch_src_filter, filter_mode);
+            break;
+        case GGML_TYPE_Q5_K:
+            glm5_moe_down_plan_kernel<GGML_TYPE_Q5_K><<<grid_d, block_d, 0, stream>>>(
+                plan_ptrs, d_off, d_row_bytes, iq8, router_w, sh_out_opt, out_f32, n_embd, n_ff, topk,
+                skip_dev, fetch_src_filter, filter_mode);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            glm5_moe_down_plan_kernel<GGML_TYPE_IQ4_XS><<<grid_d, block_d, 0, stream>>>(
+                plan_ptrs, d_off, d_row_bytes, iq8, router_w, sh_out_opt, out_f32, n_embd, n_ff, topk,
+                skip_dev, fetch_src_filter, filter_mode);
+            break;
+        case GGML_TYPE_Q8_0:
+            glm5_moe_down_plan_kernel<GGML_TYPE_Q8_0><<<grid_d, block_d, 0, stream>>>(
+                plan_ptrs, d_off, d_row_bytes, iq8, router_w, sh_out_opt, out_f32, n_embd, n_ff, topk,
+                skip_dev, fetch_src_filter, filter_mode);
+            break;
+        case GGML_TYPE_Q5_1:
+            glm5_moe_down_plan_kernel<GGML_TYPE_Q5_1><<<grid_d, block_d, 0, stream>>>(
+                plan_ptrs, d_off, d_row_bytes, iq8, router_w, sh_out_opt, out_f32, n_embd, n_ff, topk,
+                skip_dev, fetch_src_filter, filter_mode);
+            break;
+        case GGML_TYPE_Q2_0:
+            glm5_moe_down_plan_kernel<GGML_TYPE_Q2_0><<<grid_d, block_d, 0, stream>>>(
                 plan_ptrs, d_off, d_row_bytes, iq8, router_w, sh_out_opt, out_f32, n_embd, n_ff, topk,
                 skip_dev, fetch_src_filter, filter_mode);
             break;
@@ -806,6 +1037,22 @@ extern "C" void launch_glm5_moe_resident(
             glm5_moe_gate_up_swiglu_kernel<GGML_TYPE_Q4_K><<<grid_gu, block_gu, 0, stream>>>(
                 gate_ptrs, up_ptrs, gu_row_bytes, xq, expert_ids, iq8, inter_f32_opt, n_embd, n_ff, topk, clamp_lim, skip_dev);
             break;
+        case GGML_TYPE_Q5_K:
+            glm5_moe_gate_up_swiglu_kernel<GGML_TYPE_Q5_K><<<grid_gu, block_gu, 0, stream>>>(
+                gate_ptrs, up_ptrs, gu_row_bytes, xq, expert_ids, iq8, inter_f32_opt, n_embd, n_ff, topk, clamp_lim, skip_dev);
+            break;
+        case GGML_TYPE_Q8_0:
+            glm5_moe_gate_up_swiglu_kernel<GGML_TYPE_Q8_0><<<grid_gu, block_gu, 0, stream>>>(
+                gate_ptrs, up_ptrs, gu_row_bytes, xq, expert_ids, iq8, inter_f32_opt, n_embd, n_ff, topk, clamp_lim, skip_dev);
+            break;
+        case GGML_TYPE_Q5_1:
+            glm5_moe_gate_up_swiglu_kernel<GGML_TYPE_Q5_1><<<grid_gu, block_gu, 0, stream>>>(
+                gate_ptrs, up_ptrs, gu_row_bytes, xq, expert_ids, iq8, inter_f32_opt, n_embd, n_ff, topk, clamp_lim, skip_dev);
+            break;
+        case GGML_TYPE_Q2_0:
+            glm5_moe_gate_up_swiglu_kernel<GGML_TYPE_Q2_0><<<grid_gu, block_gu, 0, stream>>>(
+                gate_ptrs, up_ptrs, gu_row_bytes, xq, expert_ids, iq8, inter_f32_opt, n_embd, n_ff, topk, clamp_lim, skip_dev);
+            break;
         default:
             break;
     }
@@ -823,6 +1070,22 @@ extern "C" void launch_glm5_moe_resident(
             break;
         case GGML_TYPE_Q4_K:
             glm5_moe_down_reduce_kernel<GGML_TYPE_Q4_K><<<grid_d, block_d, 0, stream>>>(
+                down_ptrs, d_row_bytes, iq8, expert_ids, router_w, out_f32, n_embd, n_ff, topk, skip_dev);
+            break;
+        case GGML_TYPE_Q5_K:
+            glm5_moe_down_reduce_kernel<GGML_TYPE_Q5_K><<<grid_d, block_d, 0, stream>>>(
+                down_ptrs, d_row_bytes, iq8, expert_ids, router_w, out_f32, n_embd, n_ff, topk, skip_dev);
+            break;
+        case GGML_TYPE_Q8_0:
+            glm5_moe_down_reduce_kernel<GGML_TYPE_Q8_0><<<grid_d, block_d, 0, stream>>>(
+                down_ptrs, d_row_bytes, iq8, expert_ids, router_w, out_f32, n_embd, n_ff, topk, skip_dev);
+            break;
+        case GGML_TYPE_Q5_1:
+            glm5_moe_down_reduce_kernel<GGML_TYPE_Q5_1><<<grid_d, block_d, 0, stream>>>(
+                down_ptrs, d_row_bytes, iq8, expert_ids, router_w, out_f32, n_embd, n_ff, topk, skip_dev);
+            break;
+        case GGML_TYPE_Q2_0:
+            glm5_moe_down_reduce_kernel<GGML_TYPE_Q2_0><<<grid_d, block_d, 0, stream>>>(
                 down_ptrs, d_row_bytes, iq8, expert_ids, router_w, out_f32, n_embd, n_ff, topk, skip_dev);
             break;
         case GGML_TYPE_IQ2_S:

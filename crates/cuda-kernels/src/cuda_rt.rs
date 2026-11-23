@@ -660,6 +660,11 @@ impl PinnedHostBuffer {
     }
 
     #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
+    #[inline]
     pub fn as_mut_ptr(&self) -> *mut u8 {
         self.ptr.as_ptr()
     }
@@ -667,6 +672,16 @@ impl PinnedHostBuffer {
     #[inline]
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.bytes) }
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.bytes) }
     }
 }
 

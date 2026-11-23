@@ -34,6 +34,67 @@ extern "C" void launch_f32_to_f16(const float* src, void* dst_f16, int n, cudaSt
     f32_to_f16_kernel<<<(n + 255) / 256, 256, 0, stream>>>(src, reinterpret_cast<uint16_t*>(dst_f16), n);
 }
 
+__global__ void __launch_bounds__(256) dequant_bf16_to_f16_kernel(
+    const uint16_t* __restrict__ src,
+    uint16_t* __restrict__ dst,
+    int64_t n
+) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = f32_to_fp16_bits(bf16_bits_to_f32(src[idx]));
+    }
+}
+
+__global__ void __launch_bounds__(256) dequant_q5_K_to_f16_kernel(
+    const block_q5_K* __restrict__ src,
+    uint16_t* __restrict__ dst,
+    int n_blocks
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int blk_idx = tid >> 7;
+    int t128 = tid & 127;
+    if (blk_idx >= n_blocks) return;
+    const block_q5_K* b = src + blk_idx;
+    float2 dm = fp16x2_bits_to_f32(&b->d);
+    int j = t128 >> 5;
+    int l = t128 & 31;
+    uint8_t sc1, m1, sc2, m2;
+    get_scale_min_k4_dev(j * 2 + 0, b->scales, sc1, m1);
+    get_scale_min_k4_dev(j * 2 + 1, b->scales, sc2, m2);
+    uint8_t qb = b->qs[j * 32 + l];
+    uint8_t qh = b->qh[l];
+    uint8_t u1 = (uint8_t)(1u << (j * 2));
+    uint8_t u2 = (uint8_t)(2u << (j * 2));
+    int v0 = (int)(qb & 0xF) + ((qh & u1) ? 16 : 0);
+    int v1 = (int)(qb >> 4)  + ((qh & u2) ? 16 : 0);
+    size_t base = (size_t)blk_idx * 256 + j * 64 + l;
+    dst[base + 0]  = f32_to_fp16_bits(dm.x * (float)sc1 * (float)v0 - dm.y * (float)m1);
+    dst[base + 32] = f32_to_fp16_bits(dm.x * (float)sc2 * (float)v1 - dm.y * (float)m2);
+}
+
+__global__ void __launch_bounds__(256) dequant_iq4_xs_to_f16_kernel(
+    const block_iq4_xs* __restrict__ src,
+    uint16_t* __restrict__ dst,
+    int n_blocks
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int blk_idx = tid >> 3;
+    int sub = tid & 7;
+    if (blk_idx >= n_blocks) return;
+    const block_iq4_xs* b = src + blk_idx;
+    float d = fp16_bits_to_f32(load_u16_align2(&b->d));
+    uint16_t sh = load_u16_align2(&b->scales_h);
+    int ls = ((b->scales_l[sub >> 1] >> (4 * (sub & 1))) & 0xF) | (((sh >> (2 * sub)) & 3) << 4);
+    float dl = d * (float)(ls - 32);
+    const uint8_t* qs = b->qs + sub * 16;
+    size_t base = (size_t)blk_idx * 256 + sub * 32;
+    for (int l = 0; l < 16; ++l) {
+        uint8_t q = qs[l];
+        dst[base + l + 0]  = f32_to_fp16_bits(dl * (float)KVALUES_IQ4NL_DEV[q & 0xF]);
+        dst[base + l + 16] = f32_to_fp16_bits(dl * (float)KVALUES_IQ4NL_DEV[q >> 4]);
+    }
+}
+
 // Parallel dequantizer: 16 threads per Q8_0 block (packed uint32_t writes)
 __global__ void __launch_bounds__(256) dequant_q8_0_to_f16_kernel(
     const block_q8_0* __restrict__ src,
@@ -54,6 +115,47 @@ __global__ void __launch_bounds__(256) dequant_q8_0_to_f16_kernel(
         size_t o = (size_t)blk_idx * 32 + 2 * p;
         dst[o] = (uint16_t)h0;
         dst[o + 1] = (uint16_t)h1;
+    }
+}
+
+__global__ void __launch_bounds__(256) dequant_q5_1_to_f16_kernel(
+    const block_q5_1* __restrict__ src,
+    uint16_t* __restrict__ dst,
+    int n_blocks
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int blk_idx = tid >> 4;
+    int p = tid & 15;
+    if (blk_idx >= n_blocks) return;
+    const block_q5_1* b = src + blk_idx;
+    float d = fp16_bits_to_f32(load_u16_align2(&b->d));
+    float m = fp16_bits_to_f32(load_u16_align2(&b->m));
+    uint32_t qh = (uint32_t)load_i32_align2(b->qh);
+    uint8_t q = b->qs[p];
+    int x0 = (int)(q & 0x0Fu) | (int)(((qh >> p) & 1u) << 4);
+    int x1 = (int)(q >> 4)    | (int)(((qh >> (p + 16)) & 1u) << 4);
+    size_t base = (size_t)blk_idx * 32;
+    dst[base + p]      = f32_to_fp16_bits(d * (float)x0 + m);
+    dst[base + p + 16] = f32_to_fp16_bits(d * (float)x1 + m);
+}
+
+__global__ void __launch_bounds__(256) dequant_q2_0_to_f16_kernel(
+    const block_q2_0* __restrict__ src,
+    uint16_t* __restrict__ dst,
+    int n_blocks
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int blk_idx = tid >> 4;
+    int p = tid & 15;
+    if (blk_idx >= n_blocks) return;
+    const block_q2_0* b = src + blk_idx;
+    float d = fp16_bits_to_f32(load_u16_align2(&b->d));
+    uint8_t q = b->qs[p];
+    size_t base = (size_t)blk_idx * 64 + 4 * p;
+    #pragma unroll
+    for (int s = 0; s < 4; ++s) {
+        int v = (int)((q >> (2 * s)) & 3u) - 1;
+        dst[base + s] = f32_to_fp16_bits(d * (float)v);
     }
 }
 
@@ -288,10 +390,30 @@ extern "C" void launch_dequant_to_f16(
         cudaMemcpyAsync(dst_f16, src, (size_t)n_elems * 2, cudaMemcpyDeviceToDevice, stream);
         return;
     }
+    if (w_type == GGML_TYPE_BF16) {
+        dequant_bf16_to_f16_kernel<<<(int)((n_elems + 255) / 256), 256, 0, stream>>>(
+            reinterpret_cast<const uint16_t*>(src), d16, n_elems
+        );
+        return;
+    }
     if (w_type == GGML_TYPE_Q8_0) {
         int nb = (int)(n_elems / 32);
         dequant_q8_0_to_f16_kernel<<<(nb * 16 + 255) / 256, 256, 0, stream>>>(
             reinterpret_cast<const block_q8_0*>(src), d16, nb
+        );
+        return;
+    }
+    if (w_type == GGML_TYPE_Q5_1) {
+        int nb = (int)(n_elems / 32);
+        dequant_q5_1_to_f16_kernel<<<(nb * 16 + 255) / 256, 256, 0, stream>>>(
+            reinterpret_cast<const block_q5_1*>(src), d16, nb
+        );
+        return;
+    }
+    if (w_type == GGML_TYPE_Q2_0) {
+        int nb = (int)(n_elems / 64);
+        dequant_q2_0_to_f16_kernel<<<(nb * 16 + 255) / 256, 256, 0, stream>>>(
+            reinterpret_cast<const block_q2_0*>(src), d16, nb
         );
         return;
     }
@@ -303,9 +425,19 @@ extern "C" void launch_dequant_to_f16(
                 reinterpret_cast<const block_q6_K*>(src), d16, nb
             );
             break;
+        case GGML_TYPE_Q5_K:
+            dequant_q5_K_to_f16_kernel<<<(nb * 128 + 255) / 256, 256, 0, stream>>>(
+                reinterpret_cast<const block_q5_K*>(src), d16, nb
+            );
+            break;
         case GGML_TYPE_Q4_K:
             dequant_q4_K_to_f16_kernel<<<(nb * 128 + 255) / 256, 256, 0, stream>>>(
                 reinterpret_cast<const block_q4_K*>(src), d16, nb
+            );
+            break;
+        case GGML_TYPE_IQ4_XS:
+            dequant_iq4_xs_to_f16_kernel<<<(nb * 8 + 255) / 256, 256, 0, stream>>>(
+                reinterpret_cast<const block_iq4_xs*>(src), d16, nb
             );
             break;
         case GGML_TYPE_Q3_K:

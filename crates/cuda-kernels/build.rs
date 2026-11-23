@@ -49,6 +49,9 @@ fn main() {
         "glm5_ops.cu",
         "glm5_gemm_mma.cu",
         "glm5_mmq_mma.cu",
+        "hy4_ops.cu",
+        "qwen4_ops.cu",
+        "mm3_ops.cu",
     ];
 
     println!("cargo:rerun-if-changed=build.rs");

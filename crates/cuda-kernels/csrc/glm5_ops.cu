@@ -36,6 +36,12 @@ __device__ __forceinline__ float dot_row_q3_K_def(const block_q3_K* w, const blo
 __device__ __forceinline__ float dot_row_q4_K_def(const block_q4_K* w, const block_q8_1* x, int K, int lane) {
     return dot_row_q4_K_sub(w, x, K, lane);
 }
+__device__ __forceinline__ float dot_row_q5_K_def(const block_q5_K* w, const block_q8_1* x, int K, int lane) {
+    return dot_row_q5_K_sub(w, x, K, lane);
+}
+__device__ __forceinline__ float dot_row_iq4_xs_def(const block_iq4_xs* w, const block_q8_1* x, int K, int lane) {
+    return dot_row_iq4_xs_sub(w, x, K, lane);
+}
 __device__ __forceinline__ float dot_row_q6_K_def(const block_q6_K* w, const block_q8_1* x, int K, int lane) {
     return dot_row_q6_K_sub(w, x, K, lane);
 }
@@ -53,6 +59,12 @@ __device__ __forceinline__ void dot_pair_q3_K_def(const block_q3_K* w0, const bl
 }
 __device__ __forceinline__ void dot_pair_q4_K_def(const block_q4_K* w0, const block_q4_K* w1, const block_q8_1* x, int K, int lane, float& o0, float& o1) {
     dot_pair_q4_K_sub(w0, w1, x, K, lane, o0, o1);
+}
+__device__ __forceinline__ void dot_pair_q5_K_def(const block_q5_K* w0, const block_q5_K* w1, const block_q8_1* x, int K, int lane, float& o0, float& o1) {
+    dot_pair_q5_K_sub(w0, w1, x, K, lane, o0, o1);
+}
+__device__ __forceinline__ void dot_pair_iq4_xs_def(const block_iq4_xs* w0, const block_iq4_xs* w1, const block_q8_1* x, int K, int lane, float& o0, float& o1) {
+    dot_pair_iq4_xs_sub(w0, w1, x, K, lane, o0, o1);
 }
 __device__ __forceinline__ void dot_pair_q6_K_def(const block_q6_K* w0, const block_q6_K* w1, const block_q8_1* x, int K, int lane, float& o0, float& o1) {
     dot_pair_q6_K_sub(w0, w1, x, K, lane, o0, o1);
@@ -103,7 +115,9 @@ extern "C" void launch_glm5_mmvq_sub256_skip(
     switch (w_type) {
         case GGML_TYPE_Q3_K:    glm5_mmvq_sub256_pair_kernel<block_q3_K, dot_pair_q3_K_def><<<grid2, block, 0, stream>>>(w8, xq, Y, N, K, skip_dev); break;
         case GGML_TYPE_Q4_K:    glm5_mmvq_sub256_pair_kernel<block_q4_K, dot_pair_q4_K_def><<<grid2, block, 0, stream>>>(w8, xq, Y, N, K, skip_dev); break;
+        case GGML_TYPE_Q5_K:    glm5_mmvq_sub256_pair_kernel<block_q5_K, dot_pair_q5_K_def><<<grid2, block, 0, stream>>>(w8, xq, Y, N, K, skip_dev); break;
         case GGML_TYPE_Q6_K:    glm5_mmvq_sub256_pair_kernel<block_q6_K, dot_pair_q6_K_def><<<grid2, block, 0, stream>>>(w8, xq, Y, N, K, skip_dev); break;
+        case GGML_TYPE_IQ4_XS:  glm5_mmvq_sub256_pair_kernel<block_iq4_xs, dot_pair_iq4_xs_def><<<grid2, block, 0, stream>>>(w8, xq, Y, N, K, skip_dev); break;
         case GGML_TYPE_IQ2_S:   glm5_mmvq_sub256_kernel<block_iq2_s, dot_row_iq2_s_def><<<grid1, block, 0, stream>>>(w8, xq, Y, N, K, skip_dev); break;
         case GGML_TYPE_IQ3_XXS: glm5_mmvq_sub256_kernel<block_iq3_xxs, dot_row_iq3_xxs_def><<<grid1, block, 0, stream>>>(w8, xq, Y, N, K, skip_dev); break;
         case GGML_TYPE_IQ3_S:   glm5_mmvq_sub256_kernel<block_iq3_s, dot_row_iq3_s_def><<<grid1, block, 0, stream>>>(w8, xq, Y, N, K, skip_dev); break;
@@ -6311,6 +6325,43 @@ struct Glm5SubPackedW {
 };
 
 template <int W_TYPE>
+__device__ __forceinline__ void unpack_sub_w_blk32(
+    const uint8_t* w_row,
+    int blk32,
+    Glm5SubPackedW& p
+) {
+    if constexpr (W_TYPE == GGML_TYPE_Q8_0) {
+        const block_q8_0* blk = reinterpret_cast<const block_q8_0*>(w_row) + blk32;
+        p.s0 = fp16_bits_to_f32(load_u16_align2(&blk->d));
+        p.s1 = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            p.w[j] = load_i32_align2(blk->qs + 4 * j);
+        }
+    } else if constexpr (W_TYPE == GGML_TYPE_Q5_1) {
+        const block_q5_1* blk = reinterpret_cast<const block_q5_1*>(w_row) + blk32;
+        p.s0 = fp16_bits_to_f32(load_u16_align2(&blk->d));
+        p.s1 = -fp16_bits_to_f32(load_u16_align2(&blk->m));
+        const uint32_t qh = (uint32_t)load_i32_align2(blk->qh);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t q4 = (uint32_t)load_i32_align2(blk->qs + 4 * j);
+            p.w[j + 0] = (int)((q4 & 0x0F0F0F0Fu) | expand_q5_1_hi4(qh >> (4 * j)));
+            p.w[j + 4] = (int)(((q4 >> 4) & 0x0F0F0F0Fu) | expand_q5_1_hi4(qh >> (16 + 4 * j)));
+        }
+    } else if constexpr (W_TYPE == GGML_TYPE_Q2_0) {
+        const block_q2_0* blk = reinterpret_cast<const block_q2_0*>(w_row) + (blk32 >> 1);
+        p.s0 = fp16_bits_to_f32(load_u16_align2(&blk->d));
+        p.s1 = 0.0f;
+        const int half = blk32 & 1;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            p.w[j] = unpack_q2_0_x4(blk->qs[half * 8 + j]);
+        }
+    }
+}
+
+template <int W_TYPE>
 __device__ __forceinline__ void unpack_sub_w_row(
     const uint8_t* w_row,
     int b,
@@ -6348,6 +6399,37 @@ __device__ __forceinline__ void unpack_sub_w_row(
         for (int j = 0; j < 8; ++j) {
             p.w[j] = (int)(((uint32_t)load_i32_align4(qs + 4 * j) >> shift) & 0x0F0F0F0Fu);
         }
+    } else if constexpr (W_TYPE == GGML_TYPE_Q5_K) {
+        const block_q5_K* blk = reinterpret_cast<const block_q5_K*>(w_row) + b;
+        float2 dpair = fp16x2_bits_to_f32(&blk->d);
+        uint8_t sc = 0, mn = 0;
+        get_scale_min_k4_dev(sub, blk->scales, sc, mn);
+        p.s0 = dpair.x * (float)sc;
+        p.s1 = dpair.y * (float)mn;
+        const uint8_t* qs = blk->qs + 32 * (sub >> 1);
+        int shift = 4 * (sub & 1);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            uint32_t q4 = ((uint32_t)load_i32_align4(qs + 4 * j) >> shift) & 0x0F0F0F0Fu;
+            uint32_t raw_qh = (uint32_t)load_i32_align4(blk->qh + 4 * j);
+            p.w[j] = (int)(q4 | (((raw_qh >> sub) & 0x01010101u) << 4));
+        }
+    } else if constexpr (W_TYPE == GGML_TYPE_IQ4_XS) {
+        const block_iq4_xs* blk = reinterpret_cast<const block_iq4_xs*>(w_row) + b;
+        float dw = fp16_bits_to_f32(load_u16_align2(&blk->d));
+        uint16_t sh = load_u16_align2(&blk->scales_h);
+        int ls = ((blk->scales_l[sub >> 1] >> (4 * (sub & 1))) & 0xF) | (((sh >> (2 * sub)) & 3) << 4);
+        p.s0 = dw * (float)(ls - 32);
+        p.s1 = 0.0f;
+        const uint8_t* qs = blk->qs + sub * 16;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint32_t q4 = (uint32_t)load_i32_align2(qs + 4 * j);
+            p.w[j + 0] = lut_iq4nl_x4(q4 & 0x0F0F0F0Fu);
+            p.w[j + 4] = lut_iq4nl_x4((q4 >> 4) & 0x0F0F0F0Fu);
+        }
+    } else if constexpr (W_TYPE == GGML_TYPE_Q8_0 || W_TYPE == GGML_TYPE_Q5_1 || W_TYPE == GGML_TYPE_Q2_0) {
+        unpack_sub_w_blk32<W_TYPE>(w_row, b * 8 + sub, p);
     } else if constexpr (W_TYPE == GGML_TYPE_Q3_K) {
         const block_q3_K* blk = reinterpret_cast<const block_q3_K*>(w_row) + b;
         float dw = fp16_bits_to_f32(load_u16_align2(&blk->d));
@@ -6448,12 +6530,12 @@ __device__ __forceinline__ float dot_unpacked_w_q8(
     const int (&u)[8],
     float2 ds8
 ) {
-    if constexpr (W_TYPE == GGML_TYPE_Q4_K) {
+    if constexpr (W_TYPE == GGML_TYPE_Q4_K || W_TYPE == GGML_TYPE_Q5_K || W_TYPE == GGML_TYPE_Q5_1) {
         int sumi = 0;
         #pragma unroll
         for (int j = 0; j < 8; ++j) sumi = dp4a_packed(p.w[j], u[j], sumi);
         return p.s0 * ds8.x * (float)sumi - p.s1 * ds8.y;
-    } else if constexpr (W_TYPE == GGML_TYPE_IQ3_XXS || W_TYPE == GGML_TYPE_IQ3_S) {
+    } else if constexpr (W_TYPE == GGML_TYPE_IQ3_XXS || W_TYPE == GGML_TYPE_IQ3_S || W_TYPE == GGML_TYPE_IQ4_XS || W_TYPE == GGML_TYPE_Q8_0 || W_TYPE == GGML_TYPE_Q2_0) {
         int sumi = 0;
         #pragma unroll
         for (int j = 0; j < 8; ++j) sumi = dp4a_packed(p.w[j], u[j], sumi);
@@ -6509,8 +6591,11 @@ __global__ void __launch_bounds__(256, 2) glm5_moe_prefill_small_gu_kernel(
     if (base == 0ULL || nt <= 0 || r_base >= n_ff) return;
 
     constexpr int LUT_WORDS = (W_TYPE == GGML_TYPE_IQ2_S) ? 2048 : ((W_TYPE == GGML_TYPE_IQ3_S) ? 512 : ((W_TYPE == GGML_TYPE_IQ3_XXS) ? 256 : 4));
+    constexpr bool STAGE_X_OK = (W_TYPE != GGML_TYPE_IQ2_S && W_TYPE != GGML_TYPE_IQ3_S && W_TYPE != GGML_TYPE_IQ3_XXS);
+    constexpr int MAX_X_BLKS = STAGE_X_OK ? 80 : 1;
     __shared__ __align__(16) uint32_t s_lut[LUT_WORDS];
     __shared__ float s_h[8][32];
+    __shared__ __align__(16) uint32_t s_x[STAGE_X_OK ? 8 : 1][MAX_X_BLKS * 9];
     stage_small_moe_lut<W_TYPE>(s_lut, tid);
 
     const uint8_t* g_base = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(base));
@@ -6520,11 +6605,24 @@ __global__ void __launch_bounds__(256, 2) glm5_moe_prefill_small_gu_kernel(
     const int nb = n_embd >> 8;
     const int sub = lane & 7;
     const int b0 = lane >> 3;
+    const bool use_sx = STAGE_X_OK && (nb_x <= MAX_X_BLKS);
 
     for (int t_base = 0; t_base < nt; t_base += 8) {
         const int t_cnt = min(8, nt - t_base);
         int t_rows[8];
         for (int i = 0; i < t_cnt; ++i) t_rows[i] = rows_all[off + t_base + i];
+        if (use_sx) {
+            const int wpt = nb_x * 9;
+            const int tot_w = t_cnt * wpt;
+            uint32_t* dst_sx = &s_x[0][0];
+            for (int i = tid; i < tot_w; i += 256) {
+                const int ti = i / wpt;
+                const int wi = i - ti * wpt;
+                dst_sx[ti * (MAX_X_BLKS * 9) + wi] =
+                    reinterpret_cast<const uint32_t*>(x_q8 + (size_t)t_rows[ti] * nb_x)[wi];
+            }
+            __syncthreads();
+        }
 
         #pragma unroll
         for (int step = 0; step < 4; ++step) {
@@ -6533,17 +6631,39 @@ __global__ void __launch_bounds__(256, 2) glm5_moe_prefill_small_gu_kernel(
                 float ag[8] = {0}, au[8] = {0};
                 const uint8_t* gr = g_base + (size_t)r * row_bytes;
                 const uint8_t* ur = u_base + (size_t)r * row_bytes;
-                #pragma unroll 1
-                for (int b = b0; b < nb; b += 4) {
-                    Glm5SubPackedW wg, wu;
-                    unpack_sub_w_row<W_TYPE>(gr, b, sub, s_lut, wg);
-                    unpack_sub_w_row<W_TYPE>(ur, b, sub, s_lut, wu);
-                    for (int ti = 0; ti < t_cnt; ++ti) {
-                        int u[8];
-                        float2 ds8;
-                        load_q8_1_sub_words(x_q8 + (size_t)t_rows[ti] * nb_x + b * 8 + sub, u, ds8);
-                        ag[ti] += dot_unpacked_w_q8<W_TYPE>(wg, u, ds8);
-                        au[ti] += dot_unpacked_w_q8<W_TYPE>(wu, u, ds8);
+                if constexpr (W_TYPE == GGML_TYPE_Q8_0 || W_TYPE == GGML_TYPE_Q5_1 || W_TYPE == GGML_TYPE_Q2_0) {
+                    #pragma unroll 1
+                    for (int blk32 = lane; blk32 < nb_x; blk32 += 32) {
+                        Glm5SubPackedW wg, wu;
+                        unpack_sub_w_blk32<W_TYPE>(gr, blk32, wg);
+                        unpack_sub_w_blk32<W_TYPE>(ur, blk32, wu);
+                        for (int ti = 0; ti < t_cnt; ++ti) {
+                            int u[8];
+                            float2 ds8;
+                            const block_q8_1* x_ptr = use_sx
+                                ? (reinterpret_cast<const block_q8_1*>(s_x[ti]) + blk32)
+                                : (x_q8 + (size_t)t_rows[ti] * nb_x + blk32);
+                            load_q8_1_sub_words(x_ptr, u, ds8);
+                            ag[ti] += dot_unpacked_w_q8<W_TYPE>(wg, u, ds8);
+                            au[ti] += dot_unpacked_w_q8<W_TYPE>(wu, u, ds8);
+                        }
+                    }
+                } else {
+                    #pragma unroll 1
+                    for (int b = b0; b < nb; b += 4) {
+                        Glm5SubPackedW wg, wu;
+                        unpack_sub_w_row<W_TYPE>(gr, b, sub, s_lut, wg);
+                        unpack_sub_w_row<W_TYPE>(ur, b, sub, s_lut, wu);
+                        for (int ti = 0; ti < t_cnt; ++ti) {
+                            int u[8];
+                            float2 ds8;
+                            const block_q8_1* x_ptr = use_sx
+                                ? (reinterpret_cast<const block_q8_1*>(s_x[ti]) + b * 8 + sub)
+                                : (x_q8 + (size_t)t_rows[ti] * nb_x + b * 8 + sub);
+                            load_q8_1_sub_words(x_ptr, u, ds8);
+                            ag[ti] += dot_unpacked_w_q8<W_TYPE>(wg, u, ds8);
+                            au[ti] += dot_unpacked_w_q8<W_TYPE>(wu, u, ds8);
+                        }
                     }
                 }
                 for (int ti = 0; ti < t_cnt; ++ti) {
@@ -6567,7 +6687,7 @@ __global__ void __launch_bounds__(256, 2) glm5_moe_prefill_small_gu_kernel(
     }
 }
 
-template <int W_TYPE>
+template <int W_TYPE, bool DET_PAIR = false>
 __global__ void __launch_bounds__(256, 2) glm5_moe_prefill_small_down_kernel(
     const uint64_t* __restrict__ exp_ptrs,
     const int32_t* __restrict__ slot_off,
@@ -6581,7 +6701,7 @@ __global__ void __launch_bounds__(256, 2) glm5_moe_prefill_small_down_kernel(
     int n_embd,
     int n_ff
 ) {
-    const int r_base = (int)blockIdx.x * 16;
+    const int r_base = (int)blockIdx.x * 32;
     const int job = (int)blockIdx.y;
     const int warp = threadIdx.y;
     const int lane = threadIdx.x;
@@ -6593,7 +6713,10 @@ __global__ void __launch_bounds__(256, 2) glm5_moe_prefill_small_down_kernel(
     if (base == 0ULL || nt <= 0 || r_base >= n_embd) return;
 
     constexpr int LUT_WORDS = (W_TYPE == GGML_TYPE_IQ2_S) ? 2048 : ((W_TYPE == GGML_TYPE_IQ3_S) ? 512 : ((W_TYPE == GGML_TYPE_IQ3_XXS) ? 256 : 4));
+    constexpr bool STAGE_I_OK = (W_TYPE != GGML_TYPE_IQ2_S && W_TYPE != GGML_TYPE_IQ3_S && W_TYPE != GGML_TYPE_IQ3_XXS);
+    constexpr int MAX_I_BLKS = STAGE_I_OK ? 32 : 1;
     __shared__ __align__(16) uint32_t s_lut[LUT_WORDS];
+    __shared__ __align__(16) uint32_t s_inter[STAGE_I_OK ? 8 : 1][MAX_I_BLKS * 9];
     stage_small_moe_lut<W_TYPE>(s_lut, tid);
 
     const uint8_t* d_base = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(base + d_off));
@@ -6601,6 +6724,7 @@ __global__ void __launch_bounds__(256, 2) glm5_moe_prefill_small_down_kernel(
     const int nb = n_ff >> 8;
     const int sub = lane & 7;
     const int b0 = lane >> 3;
+    const bool use_si = STAGE_I_OK && (nb_ff <= MAX_I_BLKS);
 
     for (int t_base = 0; t_base < nt; t_base += 8) {
         const int t_cnt = min(8, nt - t_base);
@@ -6610,31 +6734,68 @@ __global__ void __launch_bounds__(256, 2) glm5_moe_prefill_small_down_kernel(
             t_rows[i] = rows_all[off + t_base + i];
             t_rw[i] = wts_all[off + t_base + i];
         }
+        if (use_si) {
+            const int wpt = nb_ff * 9;
+            const int tot_w = t_cnt * wpt;
+            const uint32_t* gi = reinterpret_cast<const uint32_t*>(inter_q8 + (size_t)(off + t_base) * nb_ff);
+            uint32_t* dst_si = &s_inter[0][0];
+            for (int i = tid; i < tot_w; i += 256) {
+                const int ti = i / wpt;
+                const int wi = i - ti * wpt;
+                dst_si[ti * (MAX_I_BLKS * 9) + wi] = gi[i];
+            }
+            __syncthreads();
+        }
 
         #pragma unroll
-        for (int step = 0; step < 2; ++step) {
-            const int r = r_base + warp * 2 + step;
+        for (int step = 0; step < 4; ++step) {
+            const int r = r_base + warp * 4 + step;
             if (r >= n_embd) break;
             const uint8_t* dr = d_base + (size_t)r * row_bytes;
             float ad[8] = {0};
-            #pragma unroll 1
-            for (int b = b0; b < nb; b += 4) {
-                Glm5SubPackedW wd;
-                unpack_sub_w_row<W_TYPE>(dr, b, sub, s_lut, wd);
-                for (int ti = 0; ti < t_cnt; ++ti) {
-                    int u[8];
-                    float2 ds8;
-                    load_q8_1_sub_words(inter_q8 + (size_t)(off + t_base + ti) * nb_ff + b * 8 + sub, u, ds8);
-                    ad[ti] += dot_unpacked_w_q8<W_TYPE>(wd, u, ds8);
+            if constexpr (W_TYPE == GGML_TYPE_Q8_0 || W_TYPE == GGML_TYPE_Q5_1 || W_TYPE == GGML_TYPE_Q2_0) {
+                #pragma unroll 1
+                for (int blk32 = lane; blk32 < nb_ff; blk32 += 32) {
+                    Glm5SubPackedW wd;
+                    unpack_sub_w_blk32<W_TYPE>(dr, blk32, wd);
+                    for (int ti = 0; ti < t_cnt; ++ti) {
+                        int u[8];
+                        float2 ds8;
+                        const block_q8_1* i_ptr = use_si
+                            ? (reinterpret_cast<const block_q8_1*>(s_inter[ti]) + blk32)
+                            : (inter_q8 + (size_t)(off + t_base + ti) * nb_ff + blk32);
+                        load_q8_1_sub_words(i_ptr, u, ds8);
+                        ad[ti] += dot_unpacked_w_q8<W_TYPE>(wd, u, ds8);
+                    }
+                }
+            } else {
+                #pragma unroll 1
+                for (int b = b0; b < nb; b += 4) {
+                    Glm5SubPackedW wd;
+                    unpack_sub_w_row<W_TYPE>(dr, b, sub, s_lut, wd);
+                    for (int ti = 0; ti < t_cnt; ++ti) {
+                        int u[8];
+                        float2 ds8;
+                        const block_q8_1* i_ptr = use_si
+                            ? (reinterpret_cast<const block_q8_1*>(s_inter[ti]) + b * 8 + sub)
+                            : (inter_q8 + (size_t)(off + t_base + ti) * nb_ff + b * 8 + sub);
+                        load_q8_1_sub_words(i_ptr, u, ds8);
+                        ad[ti] += dot_unpacked_w_q8<W_TYPE>(wd, u, ds8);
+                    }
                 }
             }
             for (int ti = 0; ti < t_cnt; ++ti) {
                 float v = warp_reduce_sum(ad[ti]);
                 if (lane == 0) {
-                    atomicAdd(&out_f32[(size_t)t_rows[ti] * n_embd + r], t_rw[ti] * v);
+                    if constexpr (DET_PAIR) {
+                        out_f32[(size_t)t_rows[ti] * n_embd + r] = t_rw[ti] * v;
+                    } else {
+                        atomicAdd(&out_f32[(size_t)t_rows[ti] * n_embd + r], t_rw[ti] * v);
+                    }
                 }
             }
         }
+        if (use_si && (t_base + 8 < nt)) __syncthreads();
     }
 }
 
@@ -6680,9 +6841,98 @@ extern "C" void launch_glm5_moe_prefill_small_gu(
             glm5_moe_prefill_small_gu_kernel<GGML_TYPE_Q4_K><<<grid, block, 0, stream>>>(
                 exp_ptrs, slot_off, slot_nt, rows_all, u_off, gu_row_bytes, xq, iq, n_embd, n_ff, clamp_lim);
             break;
+        case GGML_TYPE_Q5_K:
+            glm5_moe_prefill_small_gu_kernel<GGML_TYPE_Q5_K><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, u_off, gu_row_bytes, xq, iq, n_embd, n_ff, clamp_lim);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            glm5_moe_prefill_small_gu_kernel<GGML_TYPE_IQ4_XS><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, u_off, gu_row_bytes, xq, iq, n_embd, n_ff, clamp_lim);
+            break;
+        case GGML_TYPE_Q8_0:
+            glm5_moe_prefill_small_gu_kernel<GGML_TYPE_Q8_0><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, u_off, gu_row_bytes, xq, iq, n_embd, n_ff, clamp_lim);
+            break;
+        case GGML_TYPE_Q5_1:
+            glm5_moe_prefill_small_gu_kernel<GGML_TYPE_Q5_1><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, u_off, gu_row_bytes, xq, iq, n_embd, n_ff, clamp_lim);
+            break;
+        case GGML_TYPE_Q2_0:
+            glm5_moe_prefill_small_gu_kernel<GGML_TYPE_Q2_0><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, u_off, gu_row_bytes, xq, iq, n_embd, n_ff, clamp_lim);
+            break;
         default:
             glm5_moe_prefill_small_gu_kernel<GGML_TYPE_Q6_K><<<grid, block, 0, stream>>>(
                 exp_ptrs, slot_off, slot_nt, rows_all, u_off, gu_row_bytes, xq, iq, n_embd, n_ff, clamp_lim);
+            break;
+    }
+}
+
+template <bool DET_PAIR>
+static void launch_glm5_moe_prefill_small_down_impl(
+    int32_t d_type,
+    const uint64_t* exp_ptrs,
+    const int32_t* slot_off,
+    const int32_t* slot_nt,
+    const int32_t* rows_all,
+    const float* wts_all,
+    uint32_t d_off,
+    size_t d_row_bytes,
+    const void* inter_q8,
+    float* out_f32,
+    int n_embd,
+    int n_ff,
+    int n_jobs,
+    cudaStream_t stream
+) {
+    if (n_jobs <= 0 || n_embd <= 0 || n_ff <= 0) return;
+    dim3 grid((n_embd + 31) / 32, n_jobs);
+    dim3 block(32, 8);
+    const auto* iq = reinterpret_cast<const block_q8_1*>(inter_q8);
+    switch (d_type) {
+        case GGML_TYPE_IQ2_S:
+            glm5_moe_prefill_small_down_kernel<GGML_TYPE_IQ2_S, DET_PAIR><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            glm5_moe_prefill_small_down_kernel<GGML_TYPE_IQ3_XXS, DET_PAIR><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
+            break;
+        case GGML_TYPE_IQ3_S:
+            glm5_moe_prefill_small_down_kernel<GGML_TYPE_IQ3_S, DET_PAIR><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
+            break;
+        case GGML_TYPE_Q3_K:
+            glm5_moe_prefill_small_down_kernel<GGML_TYPE_Q3_K, DET_PAIR><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
+            break;
+        case GGML_TYPE_Q4_K:
+            glm5_moe_prefill_small_down_kernel<GGML_TYPE_Q4_K, DET_PAIR><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
+            break;
+        case GGML_TYPE_Q5_K:
+            glm5_moe_prefill_small_down_kernel<GGML_TYPE_Q5_K, DET_PAIR><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            glm5_moe_prefill_small_down_kernel<GGML_TYPE_IQ4_XS, DET_PAIR><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
+            break;
+        case GGML_TYPE_Q8_0:
+            glm5_moe_prefill_small_down_kernel<GGML_TYPE_Q8_0, DET_PAIR><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
+            break;
+        case GGML_TYPE_Q5_1:
+            glm5_moe_prefill_small_down_kernel<GGML_TYPE_Q5_1, DET_PAIR><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
+            break;
+        case GGML_TYPE_Q2_0:
+            glm5_moe_prefill_small_down_kernel<GGML_TYPE_Q2_0, DET_PAIR><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
+            break;
+        default:
+            glm5_moe_prefill_small_down_kernel<GGML_TYPE_Q6_K, DET_PAIR><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
             break;
     }
 }
@@ -6703,34 +6953,28 @@ extern "C" void launch_glm5_moe_prefill_small_down(
     int n_jobs,
     cudaStream_t stream
 ) {
-    if (n_jobs <= 0 || n_embd <= 0 || n_ff <= 0) return;
-    dim3 grid((n_embd + 15) / 16, n_jobs);
-    dim3 block(32, 8);
-    const auto* iq = reinterpret_cast<const block_q8_1*>(inter_q8);
-    switch (d_type) {
-        case GGML_TYPE_IQ2_S:
-            glm5_moe_prefill_small_down_kernel<GGML_TYPE_IQ2_S><<<grid, block, 0, stream>>>(
-                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
-            break;
-        case GGML_TYPE_IQ3_XXS:
-            glm5_moe_prefill_small_down_kernel<GGML_TYPE_IQ3_XXS><<<grid, block, 0, stream>>>(
-                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
-            break;
-        case GGML_TYPE_IQ3_S:
-            glm5_moe_prefill_small_down_kernel<GGML_TYPE_IQ3_S><<<grid, block, 0, stream>>>(
-                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
-            break;
-        case GGML_TYPE_Q3_K:
-            glm5_moe_prefill_small_down_kernel<GGML_TYPE_Q3_K><<<grid, block, 0, stream>>>(
-                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
-            break;
-        case GGML_TYPE_Q4_K:
-            glm5_moe_prefill_small_down_kernel<GGML_TYPE_Q4_K><<<grid, block, 0, stream>>>(
-                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
-            break;
-        default:
-            glm5_moe_prefill_small_down_kernel<GGML_TYPE_Q6_K><<<grid, block, 0, stream>>>(
-                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
-            break;
-    }
+    launch_glm5_moe_prefill_small_down_impl<false>(
+        d_type, exp_ptrs, slot_off, slot_nt, rows_all, wts_all,
+        d_off, d_row_bytes, inter_q8, out_f32, n_embd, n_ff, n_jobs, stream);
+}
+
+extern "C" void launch_glm5_moe_prefill_small_down_det(
+    int32_t d_type,
+    const uint64_t* exp_ptrs,
+    const int32_t* slot_off,
+    const int32_t* slot_nt,
+    const int32_t* pair_all,
+    const float* wts_all,
+    uint32_t d_off,
+    size_t d_row_bytes,
+    const void* inter_q8,
+    float* pair_out_f32,
+    int n_embd,
+    int n_ff,
+    int n_jobs,
+    cudaStream_t stream
+) {
+    launch_glm5_moe_prefill_small_down_impl<true>(
+        d_type, exp_ptrs, slot_off, slot_nt, pair_all, wts_all,
+        d_off, d_row_bytes, inter_q8, pair_out_f32, n_embd, n_ff, n_jobs, stream);
 }

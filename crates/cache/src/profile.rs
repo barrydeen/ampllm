@@ -41,6 +41,69 @@ impl CacheProfile {
         Ok(prof)
     }
 
+    /// Load JSON, `STRP`, or raw Maya little-endian `[n_layers][n_expert] u32` hit counts.
+    pub fn load_for_arch(
+        path: &Path,
+        arch: &str,
+        n_layers: usize,
+        n_expert: usize,
+    ) -> Result<Self> {
+        let bytes = std::fs::read(path)?;
+        if bytes.starts_with(b"STRP") {
+            return Self::from_strp_bytes(&bytes);
+        }
+        if bytes.first().is_some_and(|b| *b == b'{') {
+            return Self::load(path);
+        }
+        Self::from_counts_le_u32(arch, &bytes, n_layers, n_expert)
+    }
+
+    /// Parse raw little-endian `[n_layers][n_expert] u32` routing hit counts into a ranked profile.
+    pub fn from_counts_le_u32(
+        arch: &str,
+        bytes: &[u8],
+        n_layers: usize,
+        n_expert: usize,
+    ) -> Result<Self> {
+        let expected = n_layers * n_expert * 4;
+        if bytes.len() != expected {
+            bail!(
+                "invalid raw u32 CacheProfile size {} (expected {expected} bytes for {n_layers}x{n_expert})",
+                bytes.len()
+            );
+        }
+        let mut ranked_experts = Vec::with_capacity(n_layers);
+        let mut pairs: Vec<(u32, usize)> = Vec::with_capacity(n_layers * n_expert);
+        for l in 0..n_layers {
+            let mut layer_counts: Vec<(usize, u32)> = (0..n_expert)
+                .map(|e| {
+                    let off = (l * n_expert + e) * 4;
+                    let c = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+                    (e, c)
+                })
+                .collect();
+            layer_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            for &(e, c) in &layer_counts {
+                if c > 0 {
+                    pairs.push((c, l * n_expert + e));
+                }
+            }
+            ranked_experts.push(layer_counts.into_iter().map(|(e, _)| e).collect());
+        }
+        pairs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let global_ranked = pairs
+            .into_iter()
+            .map(|(_, le)| (le / n_expert, le % n_expert))
+            .collect();
+        Ok(Self {
+            arch: arch.to_owned(),
+            n_layer_phys: n_layers,
+            n_expert,
+            ranked_experts,
+            global_ranked,
+        })
+    }
+
     pub fn from_strp_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 24 || &bytes[0..4] != b"STRP" {
             bail!("invalid STRP profile header");

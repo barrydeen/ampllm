@@ -59,6 +59,12 @@ __device__ __forceinline__ void stage_mmq_lut(uint32_t* s_lut, int tid, int thre
     if constexpr (W_TYPE == GGML_TYPE_IQ2_S) {
         const uint32_t* g = reinterpret_cast<const uint32_t*>(d_iq2s_grid);
         for (int i = tid; i < 2048; i += threads) s_lut[i] = g[i];
+    } else if constexpr (W_TYPE == GGML_TYPE_IQ2_XS) {
+        const uint32_t* g = reinterpret_cast<const uint32_t*>(d_iq2xs_grid);
+        for (int i = tid; i < 1024; i += threads) s_lut[i] = g[i];
+    } else if constexpr (W_TYPE == GGML_TYPE_IQ2_XXS) {
+        const uint32_t* g = reinterpret_cast<const uint32_t*>(d_iq2xxs_grid);
+        for (int i = tid; i < 512; i += threads) s_lut[i] = g[i];
     } else if constexpr (W_TYPE == GGML_TYPE_IQ3_XXS) {
         for (int i = tid; i < 256; i += threads) s_lut[i] = d_iq3xxs_grid[i];
     } else if constexpr (W_TYPE == GGML_TYPE_IQ3_S) {
@@ -147,6 +153,154 @@ __device__ __forceinline__ void unpack_w_half16(
             sc_out  = dpair.x * (float)sc;
             sc1_out = dpair.y * (float)mn;
         }
+    } else if constexpr (W_TYPE == GGML_TYPE_Q5_K) {
+        const int b = k0 >> 8;
+        const int sub = (k0 >> 5) & 7;
+        const block_q5_K* blk = reinterpret_cast<const block_q5_K*>(w_row) + b;
+        const uint8_t* qs = blk->qs + 32 * (sub >> 1);
+        const int shift = 4 * (sub & 1);
+        const int j0 = half16 * 4;
+        uint32_t w[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t q4 = ((uint32_t)load_i32_align4(qs + 4 * (j0 + j)) >> shift) & 0x0F0F0F0Fu;
+            const uint32_t raw_qh = (uint32_t)load_i32_align4(blk->qh + 4 * (j0 + j));
+            w[j] = q4 | (((raw_qh >> sub) & 0x01010101u) << 4);
+        }
+        out16 = make_uint4(w[0], w[1], w[2], w[3]);
+        if (half16 == 0) {
+            float2 dpair = fp16x2_bits_to_f32(&blk->d);
+            uint8_t sc = 0, mn = 0;
+            get_scale_min_k4_dev(sub, blk->scales, sc, mn);
+            sc_out  = dpair.x * (float)sc;
+            sc1_out = dpair.y * (float)mn;
+        }
+    } else if constexpr (W_TYPE == GGML_TYPE_Q5_1) {
+        const int blk_idx = k0 >> 5;
+        const block_q5_1* blk = reinterpret_cast<const block_q5_1*>(w_row) + blk_idx;
+        const uint32_t qh = (uint32_t)load_i32_align2(blk->qh);
+        const uint32_t qh_half = (half16 == 0) ? qh : (qh >> 16);
+        const int qs_shift = half16 * 4;
+        uint32_t w[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t q4 = ((uint32_t)load_i32_align2(blk->qs + 4 * j) >> qs_shift) & 0x0F0F0F0Fu;
+            w[j] = q4 | expand_q5_1_hi4(qh_half >> (4 * j));
+        }
+        out16 = make_uint4(w[0], w[1], w[2], w[3]);
+        if (half16 == 0) {
+            sc_out  =  fp16_bits_to_f32(load_u16_align2(&blk->d));
+            sc1_out = -fp16_bits_to_f32(load_u16_align2(&blk->m));
+        }
+    } else if constexpr (W_TYPE == GGML_TYPE_Q2_0) {
+        const int blk_idx = k0 >> 6;
+        const int sub32 = (k0 >> 5) & 1;
+        const block_q2_0* blk = reinterpret_cast<const block_q2_0*>(w_row) + blk_idx;
+        const uint8_t* qp = blk->qs + sub32 * 8 + half16 * 4;
+        const uint32_t raw4 = (uint32_t)load_i32_align2(qp);
+        uint32_t w[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            w[j] = (uint32_t)unpack_q2_0_x4((raw4 >> (8 * j)) & 0xFFu);
+        }
+        out16 = make_uint4(w[0], w[1], w[2], w[3]);
+        if (half16 == 0) {
+            sc_out = fp16_bits_to_f32(load_u16_align2(&blk->d));
+        }
+    } else if constexpr (W_TYPE == GGML_TYPE_IQ4_XS) {
+        const int b = k0 >> 8;
+        const int sub = (k0 >> 5) & 7;
+        const block_iq4_xs* blk = reinterpret_cast<const block_iq4_xs*>(w_row) + b;
+        const uint8_t* qs = blk->qs + 16 * sub;
+        uint32_t w[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t q4 = (uint32_t)load_i32_align2(qs + 4 * j);
+            const uint32_t nibs = (half16 == 0) ? (q4 & 0x0F0F0F0Fu) : ((q4 >> 4) & 0x0F0F0F0Fu);
+            w[j] = (uint32_t)lut_iq4nl_x4(nibs);
+        }
+        out16 = make_uint4(w[0], w[1], w[2], w[3]);
+        if (half16 == 0) {
+            const float dw = fp16_bits_to_f32(load_u16_align2(&blk->d));
+            const uint16_t sh = load_u16_align2(&blk->scales_h);
+            const int ls = ((blk->scales_l[sub >> 1] >> (4 * (sub & 1))) & 0xF)
+                         | (((sh >> (2 * sub)) & 3) << 4);
+            sc_out = dw * (float)(ls - 32);
+        }
+    } else if constexpr (W_TYPE == GGML_TYPE_IQ2_XS) {
+        const int b = k0 >> 8;
+        const int sub = (k0 >> 5) & 7;
+        const block_iq2_xs* blk = reinterpret_cast<const block_iq2_xs*>(w_row) + b;
+        if (k32 == 0 && half16 == 0) {
+            blk_d_out = fp16_bits_to_f32(load_u16_align2(&blk->d)) * 0.125f;
+            blk_d_valid = true;
+        }
+        const uint8_t sc_byte = blk->scales[sub];
+        const int ls = (half16 == 0) ? (int)(sc_byte & 0x0Fu) : (int)(sc_byte >> 4);
+        is_out = (int16_t)(2 * ls + 1);
+        const uint64_t* lut = reinterpret_cast<const uint64_t*>(s_lut);
+        const uint32_t qw = (uint32_t)load_i32_align2(blk->qs + 8 * sub + 4 * half16);
+        uint32_t w[4];
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const uint32_t q16 = (i == 0) ? (qw & 0xFFFFu) : (qw >> 16);
+            const uint64_t g64 = lut[q16 & 511u];
+            const uint32_t s7 = q16 >> 9;
+            const uint32_t sbyte = s7 | ((uint32_t)(__popc(s7) & 1) << 7);
+            const unsigned s0 = __vcmpne4(((sbyte & 0x03u) << 7) | ((sbyte & 0x0Cu) << 21), 0u);
+            const unsigned s1 = __vcmpne4(((sbyte & 0x30u) << 3) | ((sbyte & 0xC0u) << 17), 0u);
+            w[2 * i + 0] = __vsub4((uint32_t)g64 ^ s0, s0);
+            w[2 * i + 1] = __vsub4((uint32_t)(g64 >> 32) ^ s1, s1);
+        }
+        out16 = make_uint4(w[0], w[1], w[2], w[3]);
+    } else if constexpr (W_TYPE == GGML_TYPE_IQ2_XXS) {
+        const int b = k0 >> 8;
+        const int sub = (k0 >> 5) & 7;
+        const block_iq2_xxs* blk = reinterpret_cast<const block_iq2_xxs*>(w_row) + b;
+        const uint32_t aux0 = (uint32_t)load_i32_align2(blk->qs + 8 * sub);
+        const uint32_t aux1 = (uint32_t)load_i32_align2(blk->qs + 8 * sub + 4);
+        if (half16 == 0) {
+            const float dw = fp16_bits_to_f32(load_u16_align2(&blk->d));
+            const int ls = (int)(aux1 >> 28);
+            sc_out = dw * 0.125f * (float)(2 * ls + 1);
+        }
+        const uint64_t* lut = reinterpret_cast<const uint64_t*>(s_lut);
+        uint32_t w[4];
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int l = half16 * 2 + i;
+            const uint32_t g_idx = (aux0 >> (8 * l)) & 0xFFu;
+            const uint32_t s7 = (aux1 >> (7 * l)) & 0x7Fu;
+            const uint32_t sbyte = s7 | ((uint32_t)(__popc(s7) & 1) << 7);
+            const uint64_t g64 = lut[g_idx];
+            const unsigned s0 = __vcmpne4(((sbyte & 0x03u) << 7) | ((sbyte & 0x0Cu) << 21), 0u);
+            const unsigned s1 = __vcmpne4(((sbyte & 0x30u) << 3) | ((sbyte & 0xC0u) << 17), 0u);
+            w[2 * i + 0] = __vsub4((uint32_t)g64 ^ s0, s0);
+            w[2 * i + 1] = __vsub4((uint32_t)(g64 >> 32) ^ s1, s1);
+        }
+        out16 = make_uint4(w[0], w[1], w[2], w[3]);
+    } else if constexpr (W_TYPE == GGML_TYPE_IQ1_S) {
+        const int b = k0 >> 8;
+        const int sub = (k0 >> 5) & 7;
+        const block_iq1_s* blk = reinterpret_cast<const block_iq1_s*>(w_row) + b;
+        const uint16_t qh = load_u16_align2(&blk->qh[sub]);
+        const uint32_t qs4 = (uint32_t)load_i32_align2(blk->qs + 4 * sub);
+        if (half16 == 0) {
+            const float dw = fp16_bits_to_f32(load_u16_align2(&blk->d));
+            const float dl = dw * (float)(2 * (int)((qh >> 12) & 7u) + 1);
+            sc_out = dl;
+            sc1_out = (qh & 0x8000u) ? (0.125f * dl) : (-0.125f * dl);
+        }
+        uint32_t w[4];
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int l = half16 * 2 + i;
+            const uint32_t g_idx = ((qs4 >> (8 * l)) & 0xFFu) | ((((uint32_t)qh >> (3 * l)) & 7u) << 8);
+            const uint64_t g64 = d_iq1s_grid[g_idx];
+            w[2 * i + 0] = (uint32_t)g64;
+            w[2 * i + 1] = (uint32_t)(g64 >> 32);
+        }
+        out16 = make_uint4(w[0], w[1], w[2], w[3]);
     } else if constexpr (W_TYPE == GGML_TYPE_IQ2_S) {
         const int b = k0 >> 8;
         const int sub = (k0 >> 5) & 7;
@@ -238,11 +392,12 @@ __device__ __forceinline__ void unpack_b_tile_k128(
     int tid,
     const uint32_t* s_lut,
     int8_t* __restrict__ sB,
-    float (&sB_sc)[(W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_Q6_K) ? 1 : BN][4][2],
-    float (&sB_d)[(W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_Q6_K) ? BN : 1],
-    int16_t (&sB_is)[(W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_Q6_K) ? BN : 1][4][2]
+    float (&sB_sc)[(W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_IQ2_XS || W_TYPE == GGML_TYPE_Q6_K) ? 1 : BN][4][2],
+    float (&sB_d)[(W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_IQ2_XS || W_TYPE == GGML_TYPE_Q6_K) ? BN : 1],
+    int16_t (&sB_is)[(W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_IQ2_XS || W_TYPE == GGML_TYPE_Q6_K) ? BN : 1][4][2]
 ) {
-    constexpr bool INT_FOLD_SC = (W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_Q6_K);
+    constexpr bool INT_FOLD_SC = (W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_IQ2_XS || W_TYPE == GGML_TYPE_Q6_K);
+    constexpr bool HAS_MIN = (W_TYPE == GGML_TYPE_Q4_K || W_TYPE == GGML_TYPE_Q5_K || W_TYPE == GGML_TYPE_Q5_1 || W_TYPE == GGML_TYPE_IQ1_S);
     #pragma unroll 1
     for (int idx = tid; idx < BN * 8; idx += THREADS) {
         const int r = idx >> 3;
@@ -265,7 +420,7 @@ __device__ __forceinline__ void unpack_b_tile_k128(
                 sB_d[r] = blk_d_valid ? blk_d : 0.0f;
             }
             sB_is[r][k32][h16] = is_val;
-        } else if constexpr (W_TYPE == GGML_TYPE_Q4_K) {
+        } else if constexpr (HAS_MIN) {
             if (h16 == 0) {
                 sB_sc[r][k32][0] = sc0;
                 sB_sc[r][k32][1] = sc1;
@@ -284,13 +439,14 @@ __device__ __forceinline__ void mma_k32_b_pairs(
     const float (&sa0)[MI],
     const float (&sa1)[MI],
     const int8_t* __restrict__ sB,
-    const float (&sB_sc)[(W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_Q6_K) ? 1 : BN][4][2],
-    const float (&sB_d)[(W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_Q6_K) ? BN : 1],
-    const int16_t (&sB_is)[(W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_Q6_K) ? BN : 1][4][2],
+    const float (&sB_sc)[(W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_IQ2_XS || W_TYPE == GGML_TYPE_Q6_K) ? 1 : BN][4][2],
+    const float (&sB_d)[(W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_IQ2_XS || W_TYPE == GGML_TYPE_Q6_K) ? BN : 1],
+    const int16_t (&sB_is)[(W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_IQ2_XS || W_TYPE == GGML_TYPE_Q6_K) ? BN : 1][4][2],
     int wn, int lane, int col_pair, int k32, int k_byte,
     float (&acc)[MI][NJ][4]
 ) {
-    constexpr bool INT_FOLD_SC = (W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_Q6_K);
+    constexpr bool INT_FOLD_SC = (W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_IQ2_XS || W_TYPE == GGML_TYPE_Q6_K);
+    constexpr bool HAS_MIN = (W_TYPE == GGML_TYPE_Q4_K || W_TYPE == GGML_TYPE_Q5_K || W_TYPE == GGML_TYPE_Q5_1 || W_TYPE == GGML_TYPE_IQ1_S);
     #pragma unroll
     for (int np = 0; np < NJ / 2; ++np) {
         const int row_b = wn + np * 16 + ((lane >> 4) * 8) + (lane & 7);
@@ -327,13 +483,13 @@ __device__ __forceinline__ void mma_k32_b_pairs(
                 const float sb0_x = sB_sc[c0 + 0][k32][0];
                 const float sb1_x = sB_sc[c0 + 1][k32][0];
                 float sb0_y = 0.0f, sb1_y = 0.0f;
-                if constexpr (W_TYPE == GGML_TYPE_Q4_K) {
+                if constexpr (HAS_MIN) {
                     sb0_y = sB_sc[c0 + 0][k32][1];
                     sb1_y = sB_sc[c0 + 1][k32][1];
                 }
                 #pragma unroll
                 for (int mi = 0; mi < MI; ++mi) {
-                    if constexpr (W_TYPE == GGML_TYPE_Q4_K) {
+                    if constexpr (HAS_MIN) {
                         int d[4];
                         mma16832_s8_zero(d, a_frag[mi][0], a_frag[mi][1], a_frag[mi][2], a_frag[mi][3], bf[nh][0], bf[nh][1]);
                         acc[mi][nj][0] += da0[mi] * sb0_x * (float)d[0] - sa0[mi] * sb0_y;
@@ -369,12 +525,13 @@ __device__ __forceinline__ void mmq_mma_accum_loop(
 ) {
     constexpr int MI = (BM / WM_WARPS) / 16;
     constexpr int NJ = (BN / WN_WARPS) / 8;
-    constexpr bool INT_FOLD_SC = (W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_Q6_K);
+    constexpr bool INT_FOLD_SC = (W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_IQ2_XS || W_TYPE == GGML_TYPE_Q6_K);
+    constexpr bool HAS_MIN = (W_TYPE == GGML_TYPE_Q4_K || W_TYPE == GGML_TYPE_Q5_K || W_TYPE == GGML_TYPE_Q5_1 || W_TYPE == GGML_TYPE_IQ1_S);
 
     __shared__ __align__(16) int8_t sA[BM * 128];
     __shared__ __align__(16) int8_t sB[BN * 128];
     __shared__ float sA_d[BM][4];
-    __shared__ float sA_s[(W_TYPE == GGML_TYPE_Q4_K) ? BM : 1][4];
+    __shared__ float sA_s[HAS_MIN ? BM : 1][4];
     __shared__ float sB_sc[INT_FOLD_SC ? 1 : BN][4][2];
     __shared__ float sB_d[INT_FOLD_SC ? BN : 1];
     __shared__ int16_t sB_is[INT_FOLD_SC ? BN : 1][4][2];
@@ -404,13 +561,13 @@ __device__ __forceinline__ void mmq_mma_accum_loop(
                 if (h16 == 0) {
                     const float2 ds = fp16x2_bits_to_f32(&xb->d);
                     sA_d[r][k32] = ds.x;
-                    if constexpr (W_TYPE == GGML_TYPE_Q4_K) {
+                    if constexpr (HAS_MIN) {
                         sA_s[r][k32] = ds.y;
                     }
                 }
             } else if (h16 == 0) {
                 sA_d[r][k32] = 0.0f;
-                if constexpr (W_TYPE == GGML_TYPE_Q4_K) {
+                if constexpr (HAS_MIN) {
                     sA_s[r][k32] = 0.0f;
                 }
             }
@@ -444,7 +601,7 @@ __device__ __forceinline__ void mmq_mma_accum_loop(
                 const int r1 = r0 + 8;
                 da0[mi] = sA_d[r0][k32];
                 da1[mi] = sA_d[r1][k32];
-                if constexpr (W_TYPE == GGML_TYPE_Q4_K) {
+                if constexpr (HAS_MIN) {
                     sa0[mi] = sA_s[r0][k32];
                     sa1[mi] = sA_s[r1][k32];
                 } else {
@@ -483,8 +640,9 @@ gemm_mmq_mma_kernel(
     constexpr int MI = (BM / WM_WARPS) / 16;
     constexpr int NJ = (BN / WN_WARPS) / 8;
     constexpr int LUT_WORDS = (W_TYPE == GGML_TYPE_IQ2_S) ? 2048
-        : ((W_TYPE == GGML_TYPE_IQ3_S) ? 512
-        : ((W_TYPE == GGML_TYPE_IQ3_XXS) ? 256 : 4));
+        : ((W_TYPE == GGML_TYPE_IQ2_XS) ? 1024
+        : ((W_TYPE == GGML_TYPE_IQ2_XXS || W_TYPE == GGML_TYPE_IQ3_S) ? 512
+        : ((W_TYPE == GGML_TYPE_IQ3_XXS) ? 256 : 4)));
 
     __shared__ __align__(16) uint32_t s_lut[LUT_WORDS];
 
@@ -497,7 +655,8 @@ gemm_mmq_mma_kernel(
     const int wn = (warp % WN_WARPS) * (NJ * 8);
 
     stage_mmq_lut<W_TYPE>(s_lut, tid, THREADS);
-    if constexpr (W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_IQ3_S || W_TYPE == GGML_TYPE_IQ3_XXS) {
+    if constexpr (W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_IQ2_XS || W_TYPE == GGML_TYPE_IQ2_XXS ||
+                  W_TYPE == GGML_TYPE_IQ3_S || W_TYPE == GGML_TYPE_IQ3_XXS) {
         __syncthreads();
     }
 
@@ -610,8 +769,9 @@ gemm_mmq_mma_grouped_kernel(
     constexpr int MI = (BM / WM_WARPS) / 16;
     constexpr int NJ = (BN / WN_WARPS) / 8;
     constexpr int LUT_WORDS = (W_TYPE == GGML_TYPE_IQ2_S) ? 2048
-        : ((W_TYPE == GGML_TYPE_IQ3_S) ? 512
-        : ((W_TYPE == GGML_TYPE_IQ3_XXS) ? 256 : 4));
+        : ((W_TYPE == GGML_TYPE_IQ2_XS) ? 1024
+        : ((W_TYPE == GGML_TYPE_IQ2_XXS || W_TYPE == GGML_TYPE_IQ3_S) ? 512
+        : ((W_TYPE == GGML_TYPE_IQ3_XXS) ? 256 : 4)));
 
     __shared__ __align__(16) uint32_t s_lut[LUT_WORDS];
 
@@ -628,7 +788,8 @@ gemm_mmq_mma_grouped_kernel(
     const int wn = (warp % WN_WARPS) * (NJ * 8);
 
     stage_mmq_lut<W_TYPE>(s_lut, tid, THREADS);
-    if constexpr (W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_IQ3_S || W_TYPE == GGML_TYPE_IQ3_XXS) {
+    if constexpr (W_TYPE == GGML_TYPE_IQ2_S || W_TYPE == GGML_TYPE_IQ2_XS || W_TYPE == GGML_TYPE_IQ2_XXS ||
+                  W_TYPE == GGML_TYPE_IQ3_S || W_TYPE == GGML_TYPE_IQ3_XXS) {
         __syncthreads();
     }
 
@@ -848,6 +1009,15 @@ extern "C" void launch_gemm_mmq_mma_grouped(
     if (n_m_tiles <= 0 || n <= 0 || k <= 0) return;
     const auto* a = reinterpret_cast<const block_q8_1*>(a_q8);
     switch (w_type) {
+        case GGML_TYPE_IQ2_XXS:
+            dispatch_mmq_grouped<GGML_TYPE_IQ2_XXS>(a, exp_ptrs, b_byte_offset, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, exp_row_off, exp_nt, tile_exp_id, tile_m_off, n_m_tiles, n, k, alpha, use_atomic_scatter, tile_mode, stream);
+            break;
+        case GGML_TYPE_IQ2_XS:
+            dispatch_mmq_grouped<GGML_TYPE_IQ2_XS>(a, exp_ptrs, b_byte_offset, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, exp_row_off, exp_nt, tile_exp_id, tile_m_off, n_m_tiles, n, k, alpha, use_atomic_scatter, tile_mode, stream);
+            break;
+        case GGML_TYPE_IQ1_S:
+            dispatch_mmq_grouped<GGML_TYPE_IQ1_S>(a, exp_ptrs, b_byte_offset, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, exp_row_off, exp_nt, tile_exp_id, tile_m_off, n_m_tiles, n, k, alpha, use_atomic_scatter, tile_mode, stream);
+            break;
         case GGML_TYPE_IQ2_S:
             dispatch_mmq_grouped<GGML_TYPE_IQ2_S>(a, exp_ptrs, b_byte_offset, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, exp_row_off, exp_nt, tile_exp_id, tile_m_off, n_m_tiles, n, k, alpha, use_atomic_scatter, tile_mode, stream);
             break;
@@ -865,6 +1035,18 @@ extern "C" void launch_gemm_mmq_mma_grouped(
             break;
         case GGML_TYPE_Q4_K:
             dispatch_mmq_grouped<GGML_TYPE_Q4_K>(a, exp_ptrs, b_byte_offset, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, exp_row_off, exp_nt, tile_exp_id, tile_m_off, n_m_tiles, n, k, alpha, use_atomic_scatter, tile_mode, stream);
+            break;
+        case GGML_TYPE_Q5_K:
+            dispatch_mmq_grouped<GGML_TYPE_Q5_K>(a, exp_ptrs, b_byte_offset, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, exp_row_off, exp_nt, tile_exp_id, tile_m_off, n_m_tiles, n, k, alpha, use_atomic_scatter, tile_mode, stream);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            dispatch_mmq_grouped<GGML_TYPE_IQ4_XS>(a, exp_ptrs, b_byte_offset, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, exp_row_off, exp_nt, tile_exp_id, tile_m_off, n_m_tiles, n, k, alpha, use_atomic_scatter, tile_mode, stream);
+            break;
+        case GGML_TYPE_Q5_1:
+            dispatch_mmq_grouped<GGML_TYPE_Q5_1>(a, exp_ptrs, b_byte_offset, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, exp_row_off, exp_nt, tile_exp_id, tile_m_off, n_m_tiles, n, k, alpha, use_atomic_scatter, tile_mode, stream);
+            break;
+        case GGML_TYPE_Q2_0:
+            dispatch_mmq_grouped<GGML_TYPE_Q2_0>(a, exp_ptrs, b_byte_offset, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, exp_row_off, exp_nt, tile_exp_id, tile_m_off, n_m_tiles, n, k, alpha, use_atomic_scatter, tile_mode, stream);
             break;
         default:
             break;
@@ -899,6 +1081,15 @@ extern "C" void launch_gemm_mmq_mma_tiled(
     const auto* a = reinterpret_cast<const block_q8_1*>(a_q8);
     const auto* b = reinterpret_cast<const uint8_t*>(b_quant);
     switch (w_type) {
+        case GGML_TYPE_IQ2_XXS:
+            dispatch_mmq_tile<GGML_TYPE_IQ2_XXS>(a, b, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, m, n, k, alpha, beta, force_tile, stream);
+            break;
+        case GGML_TYPE_IQ2_XS:
+            dispatch_mmq_tile<GGML_TYPE_IQ2_XS>(a, b, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, m, n, k, alpha, beta, force_tile, stream);
+            break;
+        case GGML_TYPE_IQ1_S:
+            dispatch_mmq_tile<GGML_TYPE_IQ1_S>(a, b, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, m, n, k, alpha, beta, force_tile, stream);
+            break;
         case GGML_TYPE_IQ2_S:
             dispatch_mmq_tile<GGML_TYPE_IQ2_S>(a, b, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, m, n, k, alpha, beta, force_tile, stream);
             break;
@@ -916,6 +1107,18 @@ extern "C" void launch_gemm_mmq_mma_tiled(
             break;
         case GGML_TYPE_Q4_K:
             dispatch_mmq_tile<GGML_TYPE_Q4_K>(a, b, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, m, n, k, alpha, beta, force_tile, stream);
+            break;
+        case GGML_TYPE_Q5_K:
+            dispatch_mmq_tile<GGML_TYPE_Q5_K>(a, b, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, m, n, k, alpha, beta, force_tile, stream);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            dispatch_mmq_tile<GGML_TYPE_IQ4_XS>(a, b, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, m, n, k, alpha, beta, force_tile, stream);
+            break;
+        case GGML_TYPE_Q5_1:
+            dispatch_mmq_tile<GGML_TYPE_Q5_1>(a, b, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, m, n, k, alpha, beta, force_tile, stream);
+            break;
+        case GGML_TYPE_Q2_0:
+            dispatch_mmq_tile<GGML_TYPE_Q2_0>(a, b, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, m, n, k, alpha, beta, force_tile, stream);
             break;
         default:
             break;

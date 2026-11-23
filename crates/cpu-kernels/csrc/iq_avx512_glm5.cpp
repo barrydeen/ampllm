@@ -585,9 +585,11 @@ extern "C" {
 
 void ampllm_cpu_quantize_q8_k(const float* x, void* out_q8k, int n) {
     const int nb = n / QK_K;
+    const int rem = n - nb * QK_K;
     block_q8_K* y = (block_q8_K*)out_q8k;
     const __m512 abs_mask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
-    const __m512i one8 = _mm512_set1_epi8(1);
+    const __m512 lo = _mm512_set1_ps(-127.0f);
+    const __m512 hi = _mm512_set1_ps(127.0f);
     for (int i = 0; i < nb; ++i) {
         const float* xp = x + (size_t)i * QK_K;
         __m512 mx = _mm512_setzero_ps();
@@ -600,22 +602,58 @@ void ampllm_cpu_quantize_q8_k(const float* x, void* out_q8k, int n) {
         const float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
         y[i].d = d;
         const __m512 mul = _mm512_set1_ps(id);
-        const __m512 lo = _mm512_set1_ps(-127.0f);
-        const __m512 hi = _mm512_set1_ps(127.0f);
-        for (int g = 0; g < 4; ++g) {
-            __m512i acc64[4];
-            for (int c = 0; c < 4; ++c) {
-                __m512 v = _mm512_roundscale_ps(_mm512_mul_ps(_mm512_loadu_ps(xp + (g * 4 + c) * 16), mul), _MM_FROUND_TO_NEAREST_INT);
-                v = _mm512_min_ps(_mm512_max_ps(v, lo), hi);
-                const __m128i qi = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(v));
-                _mm_storeu_si128((__m128i*)(y[i].qs + (g * 4 + c) * 16), qi);
-                // bsums per 16 elements
-                int32_t s = _mm512_reduce_add_epi32(_mm512_cvtps_epi32(v));
-                y[i].bsums[g * 4 + c] = (int16_t)s;
-                (void)acc64;
-            }
+        for (int c = 0; c < 16; ++c) {
+            __m512 v = _mm512_roundscale_ps(_mm512_mul_ps(_mm512_loadu_ps(xp + c * 16), mul), _MM_FROUND_TO_NEAREST_INT);
+            v = _mm512_min_ps(_mm512_max_ps(v, lo), hi);
+            const __m512i vi = _mm512_cvtps_epi32(v);
+            const __m128i qi = _mm512_cvtepi32_epi8(vi);
+            _mm_storeu_si128((__m128i*)(y[i].qs + c * 16), qi);
+            y[i].bsums[c] = (int16_t)_mm512_reduce_add_epi32(vi);
         }
-        (void)one8;
+    }
+    if (rem > 0) {
+        const float* xp = x + (size_t)nb * QK_K;
+        const int n_sub16 = rem / 16;
+        __m512 mx = _mm512_setzero_ps();
+        for (int c = 0; c < n_sub16; ++c) {
+            const __m512 v = _mm512_loadu_ps(xp + c * 16);
+            mx = _mm512_max_ps(mx, _mm512_and_ps(v, abs_mask));
+        }
+        for (int j = n_sub16 * 16; j < rem; ++j) {
+            float av = std::fabs(xp[j]);
+            mx = _mm512_max_ps(mx, _mm512_set1_ps(av));
+        }
+        const float amax = _mm512_reduce_max_ps(mx);
+        const float d = amax / 127.0f;
+        const float id = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+        y[nb].d = d;
+        const __m512 mul = _mm512_set1_ps(id);
+        for (int c = 0; c < n_sub16; ++c) {
+            __m512 v = _mm512_roundscale_ps(_mm512_mul_ps(_mm512_loadu_ps(xp + c * 16), mul), _MM_FROUND_TO_NEAREST_INT);
+            v = _mm512_min_ps(_mm512_max_ps(v, lo), hi);
+            const __m512i vi = _mm512_cvtps_epi32(v);
+            const __m128i qi = _mm512_cvtepi32_epi8(vi);
+            _mm_storeu_si128((__m128i*)(y[nb].qs + c * 16), qi);
+            y[nb].bsums[c] = (int16_t)_mm512_reduce_add_epi32(vi);
+        }
+        if (n_sub16 * 16 < rem) {
+            int rem_tail = rem - n_sub16 * 16;
+            int16_t bsum = 0;
+            for (int j = 0; j < rem_tail; ++j) {
+                float qf = std::nearbyint(xp[n_sub16 * 16 + j] * id);
+                int q = (int)std::fmin(127.0f, std::fmax(-127.0f, qf));
+                y[nb].qs[n_sub16 * 16 + j] = (int8_t)q;
+                bsum += (int16_t)q;
+            }
+            std::memset(y[nb].qs + rem, 0, QK_K - rem);
+            y[nb].bsums[n_sub16] = bsum;
+            if (n_sub16 + 1 < 16) {
+                std::memset(y[nb].bsums + n_sub16 + 1, 0, sizeof(int16_t) * (16 - (n_sub16 + 1)));
+            }
+        } else {
+            std::memset(y[nb].qs + rem, 0, QK_K - rem);
+            std::memset(y[nb].bsums + n_sub16, 0, sizeof(int16_t) * (16 - n_sub16));
+        }
     }
 }
 
