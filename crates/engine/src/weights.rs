@@ -7,8 +7,49 @@ pub struct DeviceTensor {
     pub buf: DeviceBuffer,
     pub q8_planar_q: Option<DeviceBuffer>,
     pub q8_planar_d: Option<DeviceBuffer>,
+    pub f16_buf: Option<DeviceBuffer>,
     pub ggml_type: GgmlType,
     pub dims: Vec<u64>,
+}
+
+fn want_f16_copy(name: &str) -> bool {
+    name.ends_with("ffn_gate_inp.weight")
+        || name.ends_with("attn_sink_proj.weight")
+        || name.ends_with("attn_k_conv_proj.weight")
+        || name.ends_with("attn_v_conv_proj.weight")
+}
+
+fn build_f16_copy(
+    bytes: &[u8],
+    ggml_type: GgmlType,
+    device: i32,
+    stream: &CudaStream,
+) -> Result<Option<DeviceBuffer>> {
+    let f16_host: Vec<u16> = match ggml_type {
+        GgmlType::F32 => bytes
+            .chunks_exact(4)
+            .map(|c| {
+                let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                half::f16::from_f32(v).to_bits()
+            })
+            .collect(),
+        GgmlType::Bf16 => bytes
+            .chunks_exact(2)
+            .map(|c| {
+                let b = u16::from_le_bytes([c[0], c[1]]);
+                let v = f32::from_bits((b as u32) << 16);
+                half::f16::from_f32(v).to_bits()
+            })
+            .collect(),
+        GgmlType::F16 => bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect(),
+        _ => return Ok(None),
+    };
+    let buf = DeviceBuffer::alloc(device, f16_host.len() * 2)?;
+    buf.copy_from_host_async(bytemuck::cast_slice(&f16_host), stream)?;
+    Ok(Some(buf))
 }
 
 fn build_q8_0_planar(
@@ -48,18 +89,29 @@ impl DeviceTensor {
     pub fn from_gguf(gguf: &GgufFile, name: &str, device: i32, stream: &CudaStream) -> Result<Self> {
         let info = gguf.tensor_info(name)?;
         let bytes = gguf.tensor_bytes(name)?;
-        let buf = DeviceBuffer::alloc(device, bytes.len())?;
-        buf.copy_from_host_async(bytes, stream)?;
         let (q8_planar_q, q8_planar_d) =
             if info.ggml_type == GgmlType::Q8_0 && info.dims.len() == 2 && name != "token_embd.weight" {
                 build_q8_0_planar(bytes, info.dims[0] as usize, info.dims[1] as usize, device, stream)?
             } else {
                 (None, None)
             };
+        let f16_buf = if want_f16_copy(name) {
+            build_f16_copy(bytes, info.ggml_type, device, stream)?
+        } else {
+            None
+        };
+        let buf = if q8_planar_q.is_some() {
+            DeviceBuffer::alloc(device, 0)?
+        } else {
+            let b = DeviceBuffer::alloc(device, bytes.len())?;
+            b.copy_from_host_async(bytes, stream)?;
+            b
+        };
         Ok(Self {
             buf,
             q8_planar_q,
             q8_planar_d,
+            f16_buf,
             ggml_type: info.ggml_type,
             dims: info.dims.clone(),
         })
@@ -87,6 +139,7 @@ impl DeviceTensor {
                 buf,
                 q8_planar_q: None,
                 q8_planar_d: None,
+                f16_buf: None,
                 ggml_type: info.ggml_type,
                 dims: vec![row_count as u64],
             });
@@ -100,18 +153,29 @@ impl DeviceTensor {
         if e > bytes.len() {
             bail!("row shard out of bounds for {name}: {e} > {}", bytes.len());
         }
-        let buf = DeviceBuffer::alloc(device, e - s)?;
-        buf.copy_from_host(&bytes[s..e])?;
         let (q8_planar_q, q8_planar_d) =
             if info.ggml_type == GgmlType::Q8_0 && name != "token_embd.weight" {
                 build_q8_0_planar(&bytes[s..e], info.dims[0] as usize, row_count, device, stream)?
             } else {
                 (None, None)
             };
+        let f16_buf = if want_f16_copy(name) {
+            build_f16_copy(&bytes[s..e], info.ggml_type, device, stream)?
+        } else {
+            None
+        };
+        let buf = if q8_planar_q.is_some() {
+            DeviceBuffer::alloc(device, 0)?
+        } else {
+            let b = DeviceBuffer::alloc(device, e - s)?;
+            b.copy_from_host(&bytes[s..e])?;
+            b
+        };
         Ok(Self {
             buf,
             q8_planar_q,
             q8_planar_d,
+            f16_buf,
             ggml_type: info.ggml_type,
             dims: vec![info.dims[0], row_count as u64],
         })
@@ -144,17 +208,28 @@ impl DeviceTensor {
             let s = r * full_rb + off_b;
             staged.extend_from_slice(&bytes[s..s + len_b]);
         }
-        let buf = DeviceBuffer::alloc(device, staged.len())?;
-        buf.copy_from_host(&staged)?;
         let (q8_planar_q, q8_planar_d) = if info.ggml_type == GgmlType::Q8_0 {
             build_q8_0_planar(&staged, col_count, n_rows, device, stream)?
         } else {
             (None, None)
         };
+        let f16_buf = if want_f16_copy(name) {
+            build_f16_copy(&staged, info.ggml_type, device, stream)?
+        } else {
+            None
+        };
+        let buf = if q8_planar_q.is_some() {
+            DeviceBuffer::alloc(device, 0)?
+        } else {
+            let b = DeviceBuffer::alloc(device, staged.len())?;
+            b.copy_from_host(&staged)?;
+            b
+        };
         Ok(Self {
             buf,
             q8_planar_q,
             q8_planar_d,
+            f16_buf,
             ggml_type: info.ggml_type,
             dims: vec![col_count as u64, n_rows as u64],
         })
@@ -463,6 +538,7 @@ impl ModelWeights {
                     buf: mq_buf,
                     q8_planar_q: None,
                     q8_planar_d: None,
+                    f16_buf: None,
                     ggml_type: GgmlType::F32,
                     dims: vec![c as u64, 4],
                 };

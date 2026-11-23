@@ -8,6 +8,7 @@ use std::ops::Range;
 pub enum KvQuantMode {
     F16,
     Q8_0,
+    Fp8,
 }
 
 pub struct SlotKvConv {
@@ -52,6 +53,7 @@ impl KvConvCache {
         let token_kv_bytes = match kv_mode {
             KvQuantMode::F16 => gqa_dim * 2,
             KvQuantMode::Q8_0 => (gqa_dim / 32) * 34,
+            KvQuantMode::Fp8 => gqa_dim,
         };
 
         let mut slots = Vec::with_capacity(cfg.n_layer_logical);
@@ -63,7 +65,9 @@ impl KvConvCache {
                 }
             }
             let ring_cap = if info.is_swa {
-                cfg.sliding_window.min(max_ctx)
+                // Keep extra headroom (>= 2048) so speculative windows (up to 8 ahead)
+                // never clobber live SWA positions before rollback.
+                (cfg.sliding_window + 16).next_power_of_two()
             } else {
                 max_ctx
             };

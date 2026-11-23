@@ -43,6 +43,8 @@ fn main() {
         "quant_gemv.cu",
         "moe_grouped.cu",
         "inkling_ops.cu",
+        "inkling2_fast.cu",
+        "inkling2_draft.cu",
         "flash_attn_rel.cu",
         "doorbell.cu",
         "comm_p2p.cu",

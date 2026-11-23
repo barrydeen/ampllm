@@ -25,6 +25,7 @@ pub struct EngineConfig {
     pub save_profile: Option<PathBuf>,
     pub dma_prefill_threshold: usize,
     pub use_spec: bool,
+    pub draft_path: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -42,6 +43,7 @@ impl Default for EngineConfig {
             save_profile: None,
             dma_prefill_threshold: 8,
             use_spec: true,
+            draft_path: None,
         }
     }
 }

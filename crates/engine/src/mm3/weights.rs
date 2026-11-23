@@ -26,7 +26,7 @@ impl Mm3KvFormat {
     pub fn from_kv_mode(mode: KvQuantMode) -> Self {
         match mode {
             KvQuantMode::F16 => Self::Bf16,
-            KvQuantMode::Q8_0 => Self::Int8HadV,
+            KvQuantMode::Q8_0 | KvQuantMode::Fp8 => Self::Int8HadV,
         }
     }
 }

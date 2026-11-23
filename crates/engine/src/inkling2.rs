@@ -1,5 +1,6 @@
 use crate::config::{EngineConfig, MultiGpuMode};
 use crate::helper::HelperGpuEngine;
+use crate::inkling2_draft::{suffix_propose, SpecController, DSPARK_BLOCK};
 use crate::kv_cache::KvQuantMode;
 use crate::pipeline::PipelineGpuEngine;
 use crate::sampling::{sample_next_token, SamplingParams};
@@ -40,6 +41,7 @@ pub struct StreamGenerateResult {
 
 pub struct Inkling2Engine {
     pub cfg: Inkling2Config,
+    pub max_ctx: usize,
     backend: EngineBackend,
     snapshots: VecDeque<PrefixSnapshot>,
     pub committed_tokens: Vec<u32>,
@@ -67,6 +69,7 @@ impl Inkling2Engine {
 
     pub fn load(gguf: &GgufFile, engine_cfg: EngineConfig) -> Result<Self> {
         let cfg = Inkling2Config::from_gguf(gguf)?;
+        let max_ctx = engine_cfg.max_ctx;
         let backend = match engine_cfg.multi_gpu {
             MultiGpuMode::Single => EngineBackend::Single(Box::new(SingleGpuEngine::load(gguf, engine_cfg)?)),
             MultiGpuMode::Helper => EngineBackend::Helper(Box::new(HelperGpuEngine::load(gguf, engine_cfg)?)),
@@ -75,6 +78,7 @@ impl Inkling2Engine {
         };
         Ok(Self {
             cfg,
+            max_ctx,
             backend,
             snapshots: VecDeque::with_capacity(4),
             committed_tokens: Vec::new(),
@@ -369,28 +373,184 @@ impl Inkling2Engine {
         let mut generated = Vec::new();
         let mut full_seq = prompt_tokens.to_vec();
         let mut yielded = false;
+        let mut draft_n = 0usize;
+        let mut draft_accepted = 0usize;
         let t_dec = Instant::now();
 
-        for step in 0..params.max_tokens {
-            if params.stop_token_ids.contains(&next_tok) {
-                break;
-            }
-            generated.push(next_tok);
-            full_seq.push(next_tok);
-            let keep_going = on_token(next_tok);
-            if !keep_going || step + 1 >= params.max_tokens {
-                break;
-            }
-            if (opts.should_yield)(generated.len()) {
-                yielded = true;
-                break;
-            }
-            let (g_nxt, l_opt) = self.forward_tokens(&[next_tok], need_logits)?;
-            next_tok = if let Some(ref logits) = l_opt {
-                sample_next_token(logits, params, &mut rng)
-            } else {
-                g_nxt
+        let use_spec = params.temperature == 0.0
+            && match &self.backend {
+                EngineBackend::Single(e) => e.can_spec_decode(),
+                _ => false,
             };
+
+        if use_spec {
+            let mut ctl = SpecController::new();
+            let EngineBackend::Single(ref mut s_eng) = self.backend else {
+                unreachable!();
+            };
+            let has_drafter = s_eng.has_neural_drafter();
+            let max_ctx = self.max_ctx;
+            let spec_prof = std::env::var_os("AMPLLM_SPEC_PROF").is_some();
+            let mut prof_win_steps = 0usize;
+            let mut prof_plain_steps = 0usize;
+            let mut prof_draft_ms = 0.0f64;
+            let mut prof_verify_ms = 0.0f64;
+            let mut prof_commit_ms = 0.0f64;
+            let mut prof_plain_ms = 0.0f64;
+            let mut prof_sum_w = 0usize;
+
+            while generated.len() < params.max_tokens {
+                if params.stop_token_ids.contains(&next_tok) {
+                    break;
+                }
+                generated.push(next_tok);
+                full_seq.push(next_tok);
+                let keep_going = on_token(next_tok);
+                if !keep_going || generated.len() >= params.max_tokens {
+                    break;
+                }
+                if (opts.should_yield)(generated.len()) {
+                    yielded = true;
+                    break;
+                }
+                let room_ctx = max_ctx.saturating_sub(s_eng.cur_pos + 1);
+                let room_toks = params.max_tokens - generated.len();
+                let max_w = DSPARK_BLOCK.min(room_ctx + 1).min(room_toks);
+
+                if max_w < 2 {
+                    let t_step = Instant::now();
+                    let argmax = s_eng.forward_window_spec(&[next_tok])?;
+                    s_eng.commit_window_spec(1, 1)?;
+                    self.committed_tokens.push(next_tok);
+                    let ms = t_step.elapsed().as_secs_f64() * 1e3;
+                    ctl.record_plain(ms);
+                    prof_plain_steps += 1;
+                    prof_plain_ms += ms;
+                    next_tok = argmax[0];
+                    continue;
+                }
+
+                let suffix_opt = suffix_propose(&full_seq, max_w - 1);
+                let suf_len = suffix_opt.as_ref().map(|v| v.len()).unwrap_or(0);
+                let (w, is_suffix) = ctl.pick(max_w, suf_len, has_drafter);
+
+                if w < 2 {
+                    let t_step = Instant::now();
+                    let argmax = s_eng.forward_window_spec(&[next_tok])?;
+                    s_eng.commit_window_spec(1, 1)?;
+                    self.committed_tokens.push(next_tok);
+                    let ms = t_step.elapsed().as_secs_f64() * 1e3;
+                    ctl.record_plain(ms);
+                    prof_plain_steps += 1;
+                    prof_plain_ms += ms;
+                    next_tok = argmax[0];
+                    continue;
+                }
+
+                let t_step = Instant::now();
+                let proposals = w - 1;
+                let mut window = Vec::with_capacity(w);
+                window.push(next_tok);
+                if is_suffix {
+                    let suf = suffix_opt.as_ref().unwrap();
+                    let take = proposals.min(suf.len());
+                    window.extend_from_slice(&suf[..take]);
+                } else {
+                    let dr = s_eng.propose_draft(next_tok, proposals)?;
+                    window.extend_from_slice(&dr[..proposals]);
+                }
+                let t_after_draft = Instant::now();
+                let actual_w = window.len();
+                let actual_p = actual_w - 1;
+                let target_out = s_eng.forward_window_spec(&window)?;
+                let t_after_verify = Instant::now();
+
+                let mut acc = 0usize;
+                while acc < actual_p && window[1 + acc] == target_out[acc] {
+                    acc += 1;
+                }
+                draft_n += actual_p;
+
+                let mut stopped = false;
+                let mut kept_drafts = 0usize;
+                for j in 0..acc {
+                    let dt = window[1 + j];
+                    if params.stop_token_ids.contains(&dt) {
+                        stopped = true;
+                        break;
+                    }
+                    generated.push(dt);
+                    full_seq.push(dt);
+                    kept_drafts += 1;
+                    let keep = on_token(dt);
+                    if !keep || generated.len() >= params.max_tokens {
+                        stopped = true;
+                        break;
+                    }
+                    if (opts.should_yield)(generated.len()) {
+                        yielded = true;
+                        stopped = true;
+                        break;
+                    }
+                }
+                draft_accepted += kept_drafts;
+                let keep_in_kv = 1 + kept_drafts;
+                s_eng.commit_window_spec(keep_in_kv, actual_w)?;
+                let t_after_commit = Instant::now();
+                self.committed_tokens.extend_from_slice(&window[..keep_in_kv]);
+                let step_ms = t_after_commit.duration_since(t_step).as_secs_f64() * 1e3;
+                ctl.record_window(actual_w, acc, step_ms, is_suffix);
+                if spec_prof {
+                    prof_win_steps += 1;
+                    prof_sum_w += actual_w;
+                    prof_draft_ms += t_after_draft.duration_since(t_step).as_secs_f64() * 1e3;
+                    prof_verify_ms += t_after_verify.duration_since(t_after_draft).as_secs_f64() * 1e3;
+                    prof_commit_ms += t_after_commit.duration_since(t_after_verify).as_secs_f64() * 1e3;
+                }
+
+                if stopped {
+                    break;
+                }
+                next_tok = target_out[acc];
+            }
+
+            if spec_prof {
+                let ws = prof_win_steps.max(1) as f64;
+                let ps = prof_plain_steps.max(1) as f64;
+                eprintln!(
+                    "spec_prof: win_steps={} plain_steps={} avg_draft_ms={:.3} avg_verify_ms={:.3} avg_commit_ms={:.3} avg_plain_ms={:.3} avg_w={:.2} avg_acc={:.2}",
+                    prof_win_steps,
+                    prof_plain_steps,
+                    prof_draft_ms / ws,
+                    prof_verify_ms / ws,
+                    prof_commit_ms / ws,
+                    prof_plain_ms / ps,
+                    prof_sum_w as f64 / ws,
+                    draft_accepted as f64 / ws,
+                );
+            }
+        } else {
+            for step in 0..params.max_tokens {
+                if params.stop_token_ids.contains(&next_tok) {
+                    break;
+                }
+                generated.push(next_tok);
+                full_seq.push(next_tok);
+                let keep_going = on_token(next_tok);
+                if !keep_going || step + 1 >= params.max_tokens {
+                    break;
+                }
+                if (opts.should_yield)(generated.len()) {
+                    yielded = true;
+                    break;
+                }
+                let (g_nxt, l_opt) = self.forward_tokens(&[next_tok], need_logits)?;
+                next_tok = if let Some(ref logits) = l_opt {
+                    sample_next_token(logits, params, &mut rng)
+                } else {
+                    g_nxt
+                };
+            }
         }
         let decode_s = t_dec.elapsed().as_secs_f64();
 
@@ -414,8 +574,8 @@ impl Inkling2Engine {
                 generated_tokens: generated,
                 prefill_tps,
                 decode_tps,
-                draft_n: 0,
-                draft_accepted: 0,
+                draft_n,
+                draft_accepted,
             },
             yielded,
             prefill_snapshot,

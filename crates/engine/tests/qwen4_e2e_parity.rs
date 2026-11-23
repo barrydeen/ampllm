@@ -88,6 +88,7 @@ fn test_qwen4_e2e_parity_and_bench() {
         save_profile: None,
         dma_prefill_threshold: 8,
         use_spec: true,
+        draft_path: None,
     };
     let mut engine = Qwen4Engine::load(gguf, cfg).expect("load Qwen4Engine");
     let initial_mtp_k = engine.mtp_k();

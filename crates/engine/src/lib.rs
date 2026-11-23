@@ -3,6 +3,7 @@ pub mod glm5;
 pub mod helper;
 pub mod hy4;
 pub mod inkling2;
+pub mod inkling2_draft;
 pub mod kv_cache;
 pub mod mm3;
 pub mod pipeline;
@@ -108,7 +109,7 @@ impl AnyEngine {
 
     pub fn max_ctx(&self) -> usize {
         match self {
-            AnyEngine::Inkling2(e) => e.cfg.sliding_window.max(32768),
+            AnyEngine::Inkling2(e) => e.max_ctx,
             AnyEngine::Glm5(e) => e.max_ctx,
             AnyEngine::Hy4(e) => e.max_ctx,
             AnyEngine::Qwen4(e) => e.max_ctx,

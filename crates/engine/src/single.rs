@@ -1,4 +1,5 @@
 use crate::config::EngineConfig;
+use crate::inkling2_draft::{Inkling2Drafter, DSPARK_BLOCK, DSPARK_MAX_PROPOSALS};
 use crate::kv_cache::KvConvCache;
 use crate::rank_state::{GpuRankState, StaticMixPtrTables};
 use crate::scratch::ActivationScratch;
@@ -10,7 +11,7 @@ use ampllm_cache::{
 use ampllm_cpu_kernels::{
     run_cpu_moe_batch, run_cpu_moe_m1, CpuBatchSlot, CpuExpertJob, CpuMoeScratch, CpuThreadPool,
 };
-use ampllm_cuda_kernels::cuda_rt::{copy_d2h_raw_async, copy_h2d_raw_async};
+use ampllm_cuda_kernels::cuda_rt::{copy_d2h_raw_async, copy_h2d_raw_async, mem_info};
 use ampllm_cuda_kernels::ffi::{launch_add_f32, launch_doorbell_signal, launch_doorbell_wait_and_add};
 use ampllm_cuda_kernels::{
     set_device, CudaEvent, CudaGraphExec, CudaStream, DeviceBuffer, PinnedMappedBuffer,
@@ -51,9 +52,14 @@ pub struct SingleGpuEngine {
     pub rank: GpuRankState,
     pub vram_cache: VramExpertCache,
     pub tracker: EwmaTracker,
+    pub drafter: Option<Inkling2Drafter>,
     hybrid: Option<HybridOffloadState>,
     graph_short_kv: Option<(u64, CudaGraphExec)>,
     graph_split_kv: Option<(u64, CudaGraphExec)>,
+    window_graphs: Vec<Option<(u64, CudaGraphExec)>>,
+    host_toks_pin: PinnedMappedBuffer<i32>,
+    host_pos_pin: PinnedMappedBuffer<i32>,
+    host_argmax_pin: PinnedMappedBuffer<i32>,
     pub cur_pos: usize,
 }
 
@@ -70,8 +76,68 @@ impl SingleGpuEngine {
         stream.sync()?;
 
         let exp_sizes = layer_expert_sizes(gguf, &cfg)?;
+        let total_exp_bytes: usize = exp_sizes
+            .iter()
+            .map(|&(gu, dn)| align_up_256(gu) + align_up_256(dn))
+            .sum::<usize>()
+            * cfg.n_expert;
+
+        let resolved_draft = if !engine_cfg.use_spec {
+            None
+        } else if let Some(ref p) = engine_cfg.draft_path {
+            Some(p.clone())
+        } else {
+            gguf.shard_paths
+                .first()
+                .and_then(|p| p.parent())
+                .and_then(|dir| {
+                    ["dspark-Inkling-2-Mini-Q8_0.gguf", "dspark.gguf"]
+                        .iter()
+                        .map(|f| dir.join(f))
+                        .find(|cand| cand.is_file())
+                })
+        };
+
+        let drafter = if let Some(ref dpath) = resolved_draft {
+            let (free_now, _) = mem_info(device)?;
+            let est_ctx_bytes = (engine_cfg.max_ctx * cfg.n_head_kv * cfg.head_dim * 2) + 450 * 1024 * 1024;
+            if engine_cfg.draft_path.is_some() || free_now >= total_exp_bytes + est_ctx_bytes + 512 * 1024 * 1024 {
+                if let (Some(tok_e), Some(tok_n), Some(out_w)) = (
+                    weights.tok_embd.as_ref(),
+                    weights.tok_embd_norm.as_ref(),
+                    weights.output.as_ref(),
+                ) {
+                    match Inkling2Drafter::load(
+                        dpath,
+                        &cfg,
+                        tok_e,
+                        tok_n,
+                        out_w,
+                        engine_cfg.max_ctx,
+                        device,
+                        &stream,
+                    ) {
+                        Ok(d) => Some(d),
+                        Err(err) => {
+                            eprintln!("warning: failed to load DSpark drafter ({}): {err}", dpath.display());
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let budget_bytes = match engine_cfg.expert_cache {
-            CacheBudget::Auto => resolve_auto_budget_bytes(device, 1024)?,
+            CacheBudget::Auto => {
+                let reserve_mb = if drafter.is_some() { 512 } else { 1024 };
+                resolve_auto_budget_bytes(device, reserve_mb)?
+            }
             CacheBudget::Mb(mb) => mb * 1024 * 1024,
         };
         let layer_caps = plan_layer_capacities(&cfg, &exp_sizes, budget_bytes, None);
@@ -176,6 +242,14 @@ impl SingleGpuEngine {
             None
         };
 
+        let mut window_graphs = Vec::with_capacity(DSPARK_BLOCK + 1);
+        for _ in 0..=DSPARK_BLOCK {
+            window_graphs.push(None);
+        }
+        let host_toks_pin = PinnedMappedBuffer::<i32>::alloc(DSPARK_BLOCK)?;
+        let host_pos_pin = PinnedMappedBuffer::<i32>::alloc(DSPARK_BLOCK)?;
+        let host_argmax_pin = PinnedMappedBuffer::<i32>::alloc(DSPARK_BLOCK)?;
+
         let mut this = Self {
             engine_cfg,
             rank: GpuRankState {
@@ -189,11 +263,17 @@ impl SingleGpuEngine {
             },
             vram_cache,
             tracker,
+            drafter,
             hybrid,
             graph_short_kv: None,
             graph_split_kv: None,
+            window_graphs,
+            host_toks_pin,
+            host_pos_pin,
+            host_argmax_pin,
             cur_pos: 0,
         };
+        this.rank.init_conv_hist_ptrs()?;
         this.warmup_decode_graphs()?;
         Ok(this)
     }
@@ -212,9 +292,14 @@ impl SingleGpuEngine {
             .map(|h| h.arena.total_bytes() as f64 / (1024.0 * 1024.0))
             .unwrap_or(0.0);
         let kv_mb = self.rank.kv_cache.total_bytes() as f64 / (1024.0 * 1024.0);
+        let draft_mb = self
+            .drafter
+            .as_ref()
+            .map(|d| d.vram_bytes as f64 / (1024.0 * 1024.0))
+            .unwrap_or(0.0);
         let threads = self.hybrid.as_ref().map(|h| h.cpu_pool.num_threads()).unwrap_or(0);
         format!(
-            "Single(GPU {}) slots={resident}/{total_possible} (all_resident={}), expert_vram={vram_mb:.1} MiB, kv_vram={kv_mb:.1} MiB, host_arena={arena_mb:.1} MiB, cpu_threads={threads}, kv={:?}, cuda_graph={}",
+            "Single(GPU {}) slots={resident}/{total_possible} (all_resident={}), expert_vram={vram_mb:.1} MiB, kv_vram={kv_mb:.1} MiB, draft_vram={draft_mb:.1} MiB, host_arena={arena_mb:.1} MiB, cpu_threads={threads}, kv={:?}, cuda_graph={}",
             self.rank.device,
             self.vram_cache.all_resident,
             self.rank.kv_cache.kv_mode,
@@ -315,7 +400,29 @@ impl SingleGpuEngine {
         let max_kv_len = (self.cur_pos + m_usize) as i32;
         let trace = std::env::var_os("AMPLLM_TRACE").is_some() && self.cur_pos == 0 && m_usize == 5;
 
-        if m_usize == 1 && !trace && self.vram_cache.all_resident && self.engine_cfg.use_cuda_graph
+        if m_usize == 1
+            && !trace
+            && !capture_logits
+            && self.vram_cache.all_resident
+            && self.engine_cfg.use_cuda_graph
+            && self.drafter.is_none()
+            && self
+                .rank
+                .weights
+                .output
+                .as_ref()
+                .map_or(false, |o| o.q8_planar_q.is_some())
+        {
+            let argmax = self.forward_window_spec(tokens)?;
+            self.cur_pos += 1;
+            return Ok((argmax[0], None));
+        }
+
+        if m_usize == 1
+            && !trace
+            && self.vram_cache.all_resident
+            && self.engine_cfg.use_cuda_graph
+            && self.drafter.is_none()
         {
             self.rank.scratch.token_ids.copy_from_host_async(
                 bytemuck::cast_slice(&tok_i32),
@@ -359,6 +466,23 @@ impl SingleGpuEngine {
         } else {
             self.rank.enqueue_inputs(&tok_i32, &pos_i32)?;
             self.forward_chunk_eager(m, max_kv_len, trace)?;
+            if let Some(ref d) = self.drafter {
+                self.rank.record_final_tap(m)?;
+                d.write_context(
+                    self.rank.scratch.taps.ptr as *const f32,
+                    self.rank.scratch.max_batch,
+                    0,
+                    m_usize,
+                    self.cur_pos,
+                    &self.rank.stream,
+                );
+                d.set_f_rnn(
+                    self.rank.scratch.taps.ptr as *const f32,
+                    self.rank.scratch.max_batch,
+                    m_usize - 1,
+                    &self.rank.stream,
+                );
+            }
         }
 
         self.rank.stream.sync()?;
@@ -393,18 +517,188 @@ impl SingleGpuEngine {
         }
         set_device(self.rank.device)?;
         let epoch = self.vram_cache.cache_epoch;
-        if self.graph_short_kv.as_ref().map(|(e, _)| *e != epoch).unwrap_or(true) {
-            let g = CudaGraphExec::capture(&self.rank.stream, || {
-                self.enqueue_forward_m1_body(false)
-            })?;
-            self.graph_short_kv = Some((epoch, g));
+        let can_fast_window = self
+            .rank
+            .weights
+            .output
+            .as_ref()
+            .map_or(false, |o| o.q8_planar_q.is_some());
+        if !can_fast_window {
+            if self.graph_short_kv.as_ref().map(|(e, _)| *e != epoch).unwrap_or(true) {
+                let g = CudaGraphExec::capture(&self.rank.stream, || {
+                    self.enqueue_forward_m1_body(false)
+                })?;
+                self.graph_short_kv = Some((epoch, g));
+            }
+            if self.graph_split_kv.as_ref().map(|(e, _)| *e != epoch).unwrap_or(true) {
+                let g = CudaGraphExec::capture(&self.rank.stream, || {
+                    self.enqueue_forward_m1_body(true)
+                })?;
+                self.graph_split_kv = Some((epoch, g));
+            }
+        } else {
+            let has_drafter = self.drafter.is_some();
+            let max_w = if self.engine_cfg.use_spec || has_drafter {
+                DSPARK_BLOCK
+            } else {
+                1
+            };
+            for i in 0..max_w {
+                self.host_toks_pin.as_mut_slice()[i] = 0;
+                self.host_pos_pin.as_mut_slice()[i] = i as i32;
+            }
+            self.rank.scratch.token_ids.copy_from_host_async(
+                bytemuck::cast_slice(&self.host_toks_pin.as_slice()[..max_w]),
+                &self.rank.stream,
+            )?;
+            self.rank.scratch.pos_ids.copy_from_host_async(
+                bytemuck::cast_slice(&self.host_pos_pin.as_slice()[..max_w]),
+                &self.rank.stream,
+            )?;
+            for t in 1..=max_w {
+                if self.window_graphs[t].as_ref().map(|(e, _)| *e != epoch).unwrap_or(true) {
+                    let g = CudaGraphExec::capture(&self.rank.stream, || {
+                        self.rank.enqueue_forward_window(
+                            t as i32,
+                            true,
+                            false,
+                            has_drafter,
+                            t > 1,
+                            |ip| self.vram_cache.layer_ptrs_dev(ip),
+                        )
+                    })?;
+                    self.window_graphs[t] = Some((epoch, g));
+                }
+                self.window_graphs[t].as_ref().unwrap().1.launch(&self.rank.stream)?;
+            }
+            if let Some(ref mut d) = self.drafter {
+                d.warmup_graphs(&self.rank.stream)?;
+            }
+            self.rank.stream.sync()?;
+            self.rank.kv_cache.reset()?;
         }
-        if self.graph_split_kv.as_ref().map(|(e, _)| *e != epoch).unwrap_or(true) {
-            let g = CudaGraphExec::capture(&self.rank.stream, || {
-                self.enqueue_forward_m1_body(true)
-            })?;
-            self.graph_split_kv = Some((epoch, g));
+        Ok(())
+    }
+
+    pub fn can_spec_decode(&self) -> bool {
+        self.engine_cfg.use_spec
+            && self.vram_cache.all_resident
+            && self.engine_cfg.use_cuda_graph
+            && self
+                .rank
+                .weights
+                .output
+                .as_ref()
+                .map_or(false, |o| o.q8_planar_q.is_some())
+    }
+
+    pub fn has_neural_drafter(&self) -> bool {
+        self.drafter.is_some()
+    }
+
+    pub fn propose_draft(&mut self, anchor: u32, proposals: usize) -> Result<[u32; DSPARK_MAX_PROPOSALS]> {
+        let d = self.drafter.as_mut().expect("drafter required");
+        d.propose(anchor, self.cur_pos, proposals, &self.rank.stream)
+    }
+
+    pub fn forward_window_spec(&mut self, tokens: &[u32]) -> Result<Vec<u32>> {
+        let t = tokens.len();
+        if t == 0 || t > DSPARK_BLOCK {
+            bail!("forward_window_spec invalid width {t}");
         }
+        set_device(self.rank.device)?;
+        for (i, &tok) in tokens.iter().enumerate() {
+            self.host_toks_pin.as_mut_slice()[i] = tok as i32;
+            self.host_pos_pin.as_mut_slice()[i] = (self.cur_pos + i) as i32;
+        }
+        self.rank.scratch.token_ids.copy_from_host_async(
+            bytemuck::cast_slice(&self.host_toks_pin.as_slice()[..t]),
+            &self.rank.stream,
+        )?;
+        self.rank.scratch.pos_ids.copy_from_host_async(
+            bytemuck::cast_slice(&self.host_pos_pin.as_slice()[..t]),
+            &self.rank.stream,
+        )?;
+
+        let stage_prof = {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::OnceLock;
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            static DONE_M1: AtomicBool = AtomicBool::new(false);
+            static DONE_MN: AtomicBool = AtomicBool::new(false);
+            if *ENABLED.get_or_init(|| std::env::var_os("AMPLLM_STAGE_PROF").is_some()) {
+                (t == 1 && self.cur_pos >= 10 && !DONE_M1.swap(true, Ordering::Relaxed))
+                    || (t >= 5 && !DONE_MN.swap(true, Ordering::Relaxed))
+            } else {
+                false
+            }
+        };
+
+        if stage_prof {
+            let has_drafter = self.drafter.is_some();
+            self.rank.enqueue_forward_window_profiled(
+                t as i32,
+                true,
+                false,
+                has_drafter,
+                t > 1,
+                |ip| self.vram_cache.layer_ptrs_dev(ip),
+            )?;
+        } else {
+            let epoch = self.vram_cache.cache_epoch;
+            if self.window_graphs[t].as_ref().map(|(e, _)| *e != epoch).unwrap_or(true) {
+                let has_drafter = self.drafter.is_some();
+                let g = CudaGraphExec::capture(&self.rank.stream, || {
+                    self.rank.enqueue_forward_window(
+                        t as i32,
+                        true,
+                        false,
+                        has_drafter,
+                        t > 1,
+                        |ip| self.vram_cache.layer_ptrs_dev(ip),
+                    )
+                })?;
+                self.window_graphs[t] = Some((epoch, g));
+            }
+            self.window_graphs[t].as_ref().unwrap().1.launch(&self.rank.stream)?;
+        }
+
+        unsafe {
+            copy_d2h_raw_async(
+                bytemuck::cast_slice_mut(&mut self.host_argmax_pin.as_mut_slice()[..t]),
+                self.rank.scratch.argmax_ids.ptr,
+                &self.rank.stream,
+            )?;
+        }
+        self.rank.stream.sync()?;
+
+        Ok(self.host_argmax_pin.as_slice()[..t]
+            .iter()
+            .map(|&v| v as u32)
+            .collect())
+    }
+
+    pub fn commit_window_spec(&mut self, accept_total: usize, total_window: usize) -> Result<()> {
+        if accept_total < total_window {
+            self.rank.enqueue_conv_rollback(accept_total as i32);
+        }
+        if let Some(ref d) = self.drafter {
+            d.write_context(
+                self.rank.scratch.taps.ptr as *const f32,
+                self.rank.scratch.max_batch,
+                0,
+                accept_total,
+                self.cur_pos,
+                &self.rank.stream,
+            );
+            d.set_f_rnn(
+                self.rank.scratch.taps.ptr as *const f32,
+                self.rank.scratch.max_batch,
+                accept_total - 1,
+                &self.rank.stream,
+            );
+        }
+        self.cur_pos += accept_total;
         Ok(())
     }
 
@@ -412,10 +706,14 @@ impl SingleGpuEngine {
         let m_usize = m as usize;
         let n_embd = self.rank.cfg.n_embd;
         let topk = self.rank.cfg.n_expert_used;
+        let record_taps = self.drafter.is_some();
         let mut recent_active = vec![Vec::<usize>::new(); self.rank.cfg.n_layer_phys];
         let exec_order = self.rank.cfg.execution_order();
 
-        for &slot in &exec_order {
+        for (vis, &slot) in exec_order.iter().enumerate() {
+            if record_taps {
+                self.rank.maybe_record_visit_tap(vis, m)?;
+            }
             let ip = self.rank.cfg.logical_layers[slot].phys_layer;
             self.rank.enqueue_attn_through_wo(slot, m, max_kv_len, true)?;
             self.rank.enqueue_post_wo_to_router(slot, m)?;

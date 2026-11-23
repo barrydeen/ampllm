@@ -18,6 +18,7 @@ enum CliKvMode {
     F16,
     #[value(name = "q8_0")]
     Q8_0,
+    Fp8,
 }
 
 impl From<CliKvMode> for KvQuantMode {
@@ -25,6 +26,7 @@ impl From<CliKvMode> for KvQuantMode {
         match v {
             CliKvMode::F16 => KvQuantMode::F16,
             CliKvMode::Q8_0 => KvQuantMode::Q8_0,
+            CliKvMode::Fp8 => KvQuantMode::Fp8,
         }
     }
 }
@@ -125,6 +127,8 @@ enum Cmd {
         #[arg(long)]
         no_spec: bool,
         #[arg(long)]
+        draft: Option<PathBuf>,
+        #[arg(long)]
         load_profile: Option<PathBuf>,
         #[arg(long)]
         save_profile: Option<PathBuf>,
@@ -151,6 +155,8 @@ enum Cmd {
         no_cuda_graph: bool,
         #[arg(long)]
         no_spec: bool,
+        #[arg(long)]
+        draft: Option<PathBuf>,
         #[arg(long)]
         load_profile: Option<PathBuf>,
         #[arg(long)]
@@ -192,6 +198,7 @@ fn build_engine_cfg(
     cpu_threads: Option<usize>,
     no_cuda_graph: bool,
     no_spec: bool,
+    draft_path: Option<PathBuf>,
     load_profile: Option<PathBuf>,
     save_profile: Option<PathBuf>,
 ) -> EngineConfig {
@@ -202,6 +209,7 @@ fn build_engine_cfg(
         }
     });
     let resolved_kv = kv.map(Into::into).unwrap_or(match arch {
+        ModelArch::Inkling2 if max_ctx > 32768 => KvQuantMode::Fp8,
         ModelArch::Hy4 if max_ctx > 16384 => KvQuantMode::Q8_0,
         ModelArch::Qwen4Exp if max_ctx > 16384 => KvQuantMode::Q8_0,
         ModelArch::MinimaxM3 => KvQuantMode::Q8_0,
@@ -217,6 +225,7 @@ fn build_engine_cfg(
         cpu_threads,
         use_cuda_graph: !no_cuda_graph,
         use_spec: !no_spec,
+        draft_path,
         load_profile,
         save_profile,
         ..Default::default()
@@ -527,6 +536,7 @@ fn main() -> Result<()> {
                 threads,
                 no_cuda_graph,
                 false,
+                None,
                 load_profile,
                 save_profile,
             );
@@ -591,6 +601,7 @@ fn main() -> Result<()> {
             threads,
             no_cuda_graph,
             no_spec,
+            draft,
             load_profile,
             save_profile,
         } => {
@@ -607,6 +618,7 @@ fn main() -> Result<()> {
                 threads,
                 no_cuda_graph,
                 no_spec,
+                draft,
                 load_profile,
                 save_profile,
             );
@@ -622,7 +634,7 @@ fn main() -> Result<()> {
                     .map(|e| AnyEngine::Mm3(Box::new(e)))?,
             };
 
-            let (gen, pf_tps, dc_tps) = if !image.is_empty() {
+            let (gen, pf_tps, dc_tps, draft_n, draft_acc) = if !image.is_empty() {
                 if !engine.has_vision() {
                     anyhow::bail!(
                         "--image requires a multimodal model loaded with mmproj vision weights"
@@ -672,7 +684,7 @@ fn main() -> Result<()> {
                         &params,
                         |_| true,
                     )?;
-                    (res.generated_tokens, res.prefill_tps, res.decode_tps)
+                    (res.generated_tokens, res.prefill_tps, res.decode_tps, res.draft_n, res.draft_accepted)
                 } else if arch == ModelArch::MinimaxM3 {
                     let (rendered, _, _, img_sources) = ampllm_server::routes::format_mm3_chat(
                         &[msg],
@@ -702,7 +714,7 @@ fn main() -> Result<()> {
                         &params,
                         |_| true,
                     )?;
-                    (res.generated_tokens, res.prefill_tps, res.decode_tps)
+                    (res.generated_tokens, res.prefill_tps, res.decode_tps, res.draft_n, res.draft_accepted)
                 } else {
                     let hytk = tok
                         .hy4_tag_suffix()
@@ -733,7 +745,7 @@ fn main() -> Result<()> {
                     };
                     let res =
                         engine.generate_stream_with_images(&eval_ids, &spans, &params, |_| true)?;
-                    (res.generated_tokens, res.prefill_tps, res.decode_tps)
+                    (res.generated_tokens, res.prefill_tps, res.decode_tps, res.draft_n, res.draft_accepted)
                 }
             } else {
                 let mut ids = tok.encode(&prompt, true)?;
@@ -744,8 +756,15 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                let (gen, pf_tps, dc_tps, _) = engine.generate_greedy(&ids, max_tokens)?;
-                (gen, pf_tps, dc_tps)
+                let params = SamplingParams {
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    seed: 42,
+                    max_tokens,
+                    stop_token_ids: Vec::new(),
+                };
+                let res = engine.generate_stream(&ids, &params, |_| true)?;
+                (res.generated_tokens, res.prefill_tps, res.decode_tps, res.draft_n, res.draft_accepted)
             };
 
             let decoded = if arch == ModelArch::Hy4 {
@@ -757,8 +776,16 @@ fn main() -> Result<()> {
             };
             println!("{decoded}");
             let stats = engine.cache_stats();
+            let draft_str = if draft_n > 0 {
+                format!(
+                    " draft={draft_acc}/{draft_n} ({:.1}%)",
+                    100.0 * (draft_acc as f64) / (draft_n as f64)
+                )
+            } else {
+                String::new()
+            };
             eprintln!(
-                "\n[prefill={pf_tps:.1} tok/s, decode={dc_tps:.1} tok/s | hit_rate={:.1}% promotions={} | {}]",
+                "\n[prefill={pf_tps:.1} tok/s, decode={dc_tps:.1} tok/s{draft_str} | hit_rate={:.1}% promotions={} | {}]",
                 stats.vram_hit_rate() * 100.0,
                 stats.promotions,
                 engine.cache_summary()
@@ -777,6 +804,7 @@ fn main() -> Result<()> {
             threads,
             no_cuda_graph,
             no_spec,
+            draft,
             load_profile,
             save_profile,
             parallel,
@@ -807,6 +835,7 @@ fn main() -> Result<()> {
                 threads,
                 no_cuda_graph,
                 no_spec,
+                draft,
                 load_profile,
                 save_profile,
             );

@@ -126,6 +126,49 @@ __device__ __forceinline__ float ue4m3_to_f32_dev(uint8_t x) {
     return (x == 0x7Fu) ? 0.0f : v;
 }
 
+__device__ __forceinline__ float e4m3fn_to_f32(uint8_t x) {
+    const uint32_t ax = x & 0x7Fu;
+    if (ax == 0x7Fu) return 0.0f;
+    const uint32_t s = (uint32_t)(x & 0x80u) << 24;
+    const uint32_t e = (ax >> 3) & 0xFu;
+    const uint32_t m = ax & 7u;
+    if (e == 0u) {
+        const float sub = (float)m * 0x1.0p-9f;
+        return s ? -sub : sub;
+    }
+    return __uint_as_float(s | ((e + 120u) << 23) | (m << 20));
+}
+
+__device__ __forceinline__ uint8_t f32_to_e4m3fn(float v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    return (uint8_t)__nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+#else
+    const uint32_t u = __float_as_uint(v);
+    const uint8_t sign = (uint8_t)((u >> 24) & 0x80u);
+    const uint32_t ax = u & 0x7FFFFFFFu;
+    if (ax > 0x7F800000u) return sign | 0x7Fu;
+    if (ax >= 0x43E00000u) return sign | 0x7Eu;
+    if (ax < 0x3C800000u) {
+        const uint32_t sub = __float_as_uint(__fadd_rn(__uint_as_float(ax), 16384.0f)) - 0x46800000u;
+        return sign | (uint8_t)sub;
+    }
+    const uint32_t lsb = (ax >> 20) & 1u;
+    return sign | (uint8_t)(((ax + 0x7FFFFu + lsb) >> 20) - (120u << 3));
+#endif
+}
+
+__device__ __forceinline__ void e4m3x4_h4(uint32_t w, uint32_t& lo, uint32_t& hi) {
+    const uint32_t t = w & 0x78787878u;
+    uint32_t z = (t - 0x01010101u) & ~t & 0x80808080u;
+    z -= z >> 7;
+    const uint32_t v = w & 0x07070707u, u = v | (v >> 4);
+    const uint32_t dd = __byte_perm(0x070A1140u, 0x01020304u, __byte_perm(u, 0u, 0x4420u)) & z;
+    const uint32_t x0 = __byte_perm(w, 0u, 0x1404u), x1 = __byte_perm(w, 0u, 0x3424u);
+    const uint32_t y0 = __byte_perm(dd, 0u, 0x1404u), y1 = __byte_perm(dd, 0u, 0x3424u);
+    lo = x0 - (((x0 & 0x7F007F00u) + y0) >> 1) + 0x20002000u;
+    hi = x1 - (((x1 & 0x7F007F00u) + y1) >> 1) + 0x20002000u;
+}
+
 __device__ __forceinline__ float fp16_bits_to_f32(uint16_t bits) {
     __half h;
     *reinterpret_cast<uint16_t*>(&h) = bits;

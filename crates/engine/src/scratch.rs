@@ -46,8 +46,32 @@ pub struct ActivationScratch {
     pub attn_gate_buf: DeviceBuffer,
     pub attn_proj: DeviceBuffer,
     pub rel_table: DeviceBuffer, // [max_batch, n_head_local, rel_extent + 1]
-    pub split_out: DeviceBuffer, // [max_batch, n_head_local, 8, head_dim]
-    pub split_ml: DeviceBuffer,  // [max_batch, n_head_local, 8, 2]
+    pub split_out: DeviceBuffer, // [max(max_batch, 8), n_head_local, 64, head_dim]
+    pub split_ml: DeviceBuffer,  // [max(max_batch, 8), n_head_local, 64, 2]
+
+    // Fast FP16 staging + Inkling-2 verify/decode fast-path scratch
+    pub x16_0: DeviceBuffer,           // [max_batch, max(2 * n_embd, q_dim)] u16
+    pub x16_1: DeviceBuffer,           // [max_batch, max(2 * n_embd, q_dim)] u16
+    pub x16_2: DeviceBuffer,           // [max_batch, max(2 * n_embd, q_dim)] u16
+    pub q16: DeviceBuffer,             // [max_batch, q_dim] u16
+    pub out16: DeviceBuffer,           // [max_batch, q_dim] u16
+    pub x_limbs: DeviceBuffer,         // [8 * 2 * n_embd] u16
+    pub moe_inter_f16: DeviceBuffer,   // [64 * n_ff_exp_local] u16
+    pub grp_gu_ptrs: DeviceBuffer,     // [64] u64
+    pub grp_dn_ptrs: DeviceBuffer,     // [64] u64
+    pub grp_n: DeviceBuffer,           // [64] i32
+    pub grp_tok: DeviceBuffer,         // [64 * 8] i32
+    pub grp_row: DeviceBuffer,         // [64 * 8] i32
+    pub slot_sg: DeviceBuffer,         // [64] f32
+    pub slot_su: DeviceBuffer,         // [64] f32
+    pub slot_wt: DeviceBuffer,         // [64] f32
+    pub argmax_part_vals: DeviceBuffer,// [8 * 328] f32
+    pub argmax_part_ids: DeviceBuffer, // [8 * 328] i32
+    pub argmax_ids: DeviceBuffer,      // [8] i32
+    pub taps: DeviceBuffer,            // [4 * max_batch * n_embd] f32
+    pub rec_old_hist: DeviceBuffer,    // [n_layers_logical * n_sconv_channels * 3] f32
+    pub rec_x: DeviceBuffer,           // [n_layers_logical * 8 * n_sconv_channels] f32
+    pub conv_hist_ptrs_dev: DeviceBuffer, // [n_layers_logical] u64
 
     // MoE scratch
     pub router_logits: DeviceBuffer,  // [max_batch, n_expert]
@@ -94,6 +118,10 @@ impl ActivationScratch {
         let kv_dim = n_head_kv * cfg.head_dim;
         let rel_dim = n_head * cfg.d_rel;
         let dyn_dim = n_head_kv * cfg.shortconv_l_cache;
+        let x16_cols = q_dim.max(2 * e);
+        let split_slots = (max_batch * 8).max(8 * 64);
+        let n_slots = cfg.logical_layers.len().max(48);
+        let n_sconv_channels = 2 * kv_dim + 2 * e;
 
         let hid_bytes = max_batch * e * 4;
         let blocks = (0..6)
@@ -141,14 +169,36 @@ impl ActivationScratch {
             v_raw: DeviceBuffer::alloc(device, max_batch * kv_dim * 4)?,
             v_cur: DeviceBuffer::alloc(device, max_batch * kv_dim * 4)?,
             r_cur: DeviceBuffer::alloc(device, max_batch * rel_dim * 4)?,
-            dyn_proj: DeviceBuffer::alloc(device, max_batch * dyn_dim * 4)?,
+            dyn_proj: DeviceBuffer::alloc(device, 2 * max_batch * dyn_dim * 4)?,
             sinks: DeviceBuffer::alloc(device, max_batch * n_head * 4)?,
             attn_out: DeviceBuffer::alloc(device, max_batch * q_dim * 4)?,
             attn_gate_buf: DeviceBuffer::alloc(device, max_batch * q_dim * 4)?,
             attn_proj: DeviceBuffer::alloc(device, hid_bytes)?,
             rel_table: DeviceBuffer::alloc(device, max_batch * n_head * (cfg.rel_extent + 1) * 4)?,
-            split_out: DeviceBuffer::alloc(device, max_batch * n_head * 8 * cfg.head_dim * 4)?,
-            split_ml: DeviceBuffer::alloc(device, max_batch * n_head * 8 * 2 * 4)?,
+            split_out: DeviceBuffer::alloc(device, split_slots * n_head * cfg.head_dim * 4)?,
+            split_ml: DeviceBuffer::alloc(device, split_slots * n_head * 2 * 4)?,
+            x16_0: DeviceBuffer::alloc(device, max_batch * x16_cols * 2)?,
+            x16_1: DeviceBuffer::alloc(device, max_batch * x16_cols * 2)?,
+            x16_2: DeviceBuffer::alloc(device, max_batch * x16_cols * 2)?,
+            q16: DeviceBuffer::alloc(device, max_batch * q_dim * 2)?,
+            out16: DeviceBuffer::alloc(device, max_batch * q_dim * 2)?,
+            x_limbs: DeviceBuffer::alloc(device, 8 * 2 * e * 2)?,
+            moe_inter_f16: DeviceBuffer::alloc(device, 64 * n_ff_exp * 2)?,
+            grp_gu_ptrs: DeviceBuffer::alloc(device, 64 * 8)?,
+            grp_dn_ptrs: DeviceBuffer::alloc(device, 64 * 8)?,
+            grp_n: DeviceBuffer::alloc(device, 64 * 4)?,
+            grp_tok: DeviceBuffer::alloc(device, 64 * 8 * 4)?,
+            grp_row: DeviceBuffer::alloc(device, 64 * 8 * 4)?,
+            slot_sg: DeviceBuffer::alloc(device, 64 * 4)?,
+            slot_su: DeviceBuffer::alloc(device, 64 * 4)?,
+            slot_wt: DeviceBuffer::alloc(device, 64 * 4)?,
+            argmax_part_vals: DeviceBuffer::alloc(device, 8 * 656 * 4)?,
+            argmax_part_ids: DeviceBuffer::alloc(device, 8 * 656 * 4)?,
+            argmax_ids: DeviceBuffer::alloc(device, 8 * 4)?,
+            taps: DeviceBuffer::alloc(device, 4 * hid_bytes)?,
+            rec_old_hist: DeviceBuffer::alloc(device, n_slots * n_sconv_channels * 3 * 4)?,
+            rec_x: DeviceBuffer::alloc(device, n_slots * 8 * n_sconv_channels * 4)?,
+            conv_hist_ptrs_dev: DeviceBuffer::alloc(device, n_slots * 8)?,
             router_logits: DeviceBuffer::alloc(device, max_batch * cfg.n_expert * 4)?,
             expert_ids: DeviceBuffer::alloc(device, max_batch * cfg.n_expert_used * 4)?,
             expert_weights: DeviceBuffer::alloc(device, max_batch * cfg.n_expert_used * 4)?,

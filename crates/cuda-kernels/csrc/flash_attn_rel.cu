@@ -175,7 +175,7 @@ __global__ void flash_attn_rel_decode_m1_kernel(
         int slot = kp % ring_cap;
         float k0, k1, k2, k3, v0, v1, v2, v3;
 
-        if (!kv_is_q8) {
+        if (kv_is_q8 == 0) {
             size_t base = ((size_t)slot * n_head_kv + kv_h) * head_dim;
             k0 = fp16_bits_to_f32(k_f16[base + lane + 0]);
             k1 = fp16_bits_to_f32(k_f16[base + lane + 32]);
@@ -185,6 +185,18 @@ __global__ void flash_attn_rel_decode_m1_kernel(
             v1 = fp16_bits_to_f32(v_f16[base + lane + 32]);
             v2 = fp16_bits_to_f32(v_f16[base + lane + 64]);
             v3 = fp16_bits_to_f32(v_f16[base + lane + 96]);
+        } else if (kv_is_q8 == 2) {
+            const uint8_t* k_f8 = reinterpret_cast<const uint8_t*>(k_cache);
+            const uint8_t* v_f8 = reinterpret_cast<const uint8_t*>(v_cache);
+            size_t base = ((size_t)slot * n_head_kv + kv_h) * head_dim;
+            k0 = e4m3fn_to_f32(k_f8[base + lane + 0]) * (1.0f / 16.0f);
+            k1 = e4m3fn_to_f32(k_f8[base + lane + 32]) * (1.0f / 16.0f);
+            k2 = e4m3fn_to_f32(k_f8[base + lane + 64]) * (1.0f / 16.0f);
+            k3 = e4m3fn_to_f32(k_f8[base + lane + 96]) * (1.0f / 16.0f);
+            v0 = e4m3fn_to_f32(v_f8[base + lane + 0]) * (1.0f / 32.0f);
+            v1 = e4m3fn_to_f32(v_f8[base + lane + 32]) * (1.0f / 32.0f);
+            v2 = e4m3fn_to_f32(v_f8[base + lane + 64]) * (1.0f / 32.0f);
+            v3 = e4m3fn_to_f32(v_f8[base + lane + 96]) * (1.0f / 32.0f);
         } else {
             size_t b_base = ((size_t)slot * n_head_kv + kv_h) * nb_head;
             const block_q8_0* kb0 = k_q8 + b_base + 0;
@@ -393,7 +405,7 @@ __global__ void flash_attn_rel_split_kernel(
         int slot = kp % ring_cap;
         float k0, k1, k2, k3, v0, v1, v2, v3;
 
-        if (!kv_is_q8) {
+        if (kv_is_q8 == 0) {
             size_t base = ((size_t)slot * n_head_kv + kv_h) * head_dim;
             k0 = fp16_bits_to_f32(k_f16[base + lane + 0]);
             k1 = fp16_bits_to_f32(k_f16[base + lane + 32]);
@@ -403,6 +415,18 @@ __global__ void flash_attn_rel_split_kernel(
             v1 = fp16_bits_to_f32(v_f16[base + lane + 32]);
             v2 = fp16_bits_to_f32(v_f16[base + lane + 64]);
             v3 = fp16_bits_to_f32(v_f16[base + lane + 96]);
+        } else if (kv_is_q8 == 2) {
+            const uint8_t* k_f8 = reinterpret_cast<const uint8_t*>(k_cache);
+            const uint8_t* v_f8 = reinterpret_cast<const uint8_t*>(v_cache);
+            size_t base = ((size_t)slot * n_head_kv + kv_h) * head_dim;
+            k0 = e4m3fn_to_f32(k_f8[base + lane + 0]) * (1.0f / 16.0f);
+            k1 = e4m3fn_to_f32(k_f8[base + lane + 32]) * (1.0f / 16.0f);
+            k2 = e4m3fn_to_f32(k_f8[base + lane + 64]) * (1.0f / 16.0f);
+            k3 = e4m3fn_to_f32(k_f8[base + lane + 96]) * (1.0f / 16.0f);
+            v0 = e4m3fn_to_f32(v_f8[base + lane + 0]) * (1.0f / 32.0f);
+            v1 = e4m3fn_to_f32(v_f8[base + lane + 32]) * (1.0f / 32.0f);
+            v2 = e4m3fn_to_f32(v_f8[base + lane + 64]) * (1.0f / 32.0f);
+            v3 = e4m3fn_to_f32(v_f8[base + lane + 96]) * (1.0f / 32.0f);
         } else {
             size_t b_base = ((size_t)slot * n_head_kv + kv_h) * nb_head;
             const block_q8_0* kb0 = k_q8 + b_base + 0;
@@ -652,12 +676,19 @@ __global__ void prep_qkv_r_kv_store_kernel(
         }
         sum2 = warp_reduce_sum(sum2);
         float factor = fminf(1.0f, qk_clip_th / (sqrtf(sum2) + 1e-6f));
-        if (!kv_is_q8) {
+        if (kv_is_q8 == 0) {
             uint16_t* k_dst = reinterpret_cast<uint16_t*>(k_cache) + ((size_t)slot * n_head_kv + kh) * head_dim;
             for (int d = lane; d < head_dim; d += 32) {
                 float v = kh_ptr[d] * factor;
                 kh_ptr[d] = v;
                 k_dst[d] = f32_to_fp16_bits(v);
+            }
+        } else if (kv_is_q8 == 2) {
+            uint8_t* k_dst = reinterpret_cast<uint8_t*>(k_cache) + ((size_t)slot * n_head_kv + kh) * head_dim;
+            for (int d = lane; d < head_dim; d += 32) {
+                float v = kh_ptr[d] * factor;
+                kh_ptr[d] = v;
+                k_dst[d] = f32_to_e4m3fn(v * 16.0f);
             }
         } else {
             int nb_head = head_dim / 32;
@@ -718,12 +749,19 @@ __global__ void prep_qkv_r_kv_store_kernel(
         }
         sum2 = warp_reduce_sum(sum2);
         float inv_rms = rsqrtf(sum2 / (float)head_dim + eps);
-        if (!kv_is_q8) {
+        if (kv_is_q8 == 0) {
             uint16_t* v_dst = reinterpret_cast<uint16_t*>(v_cache) + ((size_t)slot * n_head_kv + kh) * head_dim;
             for (int d = lane; d < head_dim; d += 32) {
                 float v = vh_ptr[d] * inv_rms;
                 vh_ptr[d] = v;
                 v_dst[d] = f32_to_fp16_bits(v);
+            }
+        } else if (kv_is_q8 == 2) {
+            uint8_t* v_dst = reinterpret_cast<uint8_t*>(v_cache) + ((size_t)slot * n_head_kv + kh) * head_dim;
+            for (int d = lane; d < head_dim; d += 32) {
+                float v = vh_ptr[d] * inv_rms;
+                vh_ptr[d] = v;
+                v_dst[d] = f32_to_e4m3fn(v * 32.0f);
             }
         } else {
             int nb_head = head_dim / 32;

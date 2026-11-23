@@ -185,6 +185,7 @@ fn test_mm3_e2e_logits_parity_and_bench() {
             load_profile: profile_path.clone(),
             save_profile: None,
             dma_prefill_threshold: 8,
+            draft_path: None,
         };
         let mut engine = Mm3Engine::load(gguf, cfg_bf16).expect("load MM3 BF16 KV");
         let (rows, vocab, ref_ids, ref_logits) = read_mm3_logits(&ref_dir.join("logits_bf16.bin"));
@@ -277,6 +278,7 @@ fn test_mm3_e2e_logits_parity_and_bench() {
         load_profile: profile_path.clone(),
         save_profile: None,
         dma_prefill_threshold: 8,
+        draft_path: None,
     };
     let mut engine = Mm3Engine::load(gguf, cfg_int8).expect("load MM3 INT8+DSpark");
     let (rows, vocab, _, ref_int8_logits) = read_mm3_logits(&ref_dir.join("logits_int8.bin"));
@@ -410,6 +412,7 @@ fn test_mm3_e2e_logits_parity_and_bench() {
         load_profile: profile_path.clone(),
         save_profile: None,
         dma_prefill_threshold: 8,
+        draft_path: None,
     };
     let mut engine_off = Mm3Engine::load(gguf_off, cfg_off).expect("load MM3 INT8 dspark=OFF");
     run_suite(&mut engine_off, false, "dspark=OFF");
@@ -450,6 +453,7 @@ fn test_mm3_bisect_batch_vs_step1() {
         load_profile: profile_path.clone(),
         save_profile: None,
         dma_prefill_threshold: 8,
+        draft_path: None,
     };
     let mut engine = Mm3Engine::load(gguf, cfg_bf16).expect("load MM3 BF16 KV");
 

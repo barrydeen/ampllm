@@ -127,14 +127,20 @@ __global__ void mv_q8_planar_m1_kernel(
         uint32_t w = __ldg(qr + it * 32 + lane);
         float4 xv = __ldg(x_vec4 + it * 32 + lane);
         float dv = fp16_bits_to_f32(__ldg(d_row + it * 4 + (lane >> 3)));
-        acc += dv * (
-            (float)(int8_t)(w & 0xFFu) * xv.x +
-            (float)(int8_t)((w >> 8) & 0xFFu) * xv.y +
-            (float)(int8_t)((w >> 16) & 0xFFu) * xv.z +
-            (float)(int8_t)(w >> 24) * xv.w
-        );
+        float f0 = (float)(int8_t)(w & 0xFFu);
+        float f1 = (float)(int8_t)((w >> 8) & 0xFFu);
+        float f2 = (float)(int8_t)((w >> 16) & 0xFFu);
+        float f3 = (float)(int8_t)(w >> 24);
+        float p = __fmul_rn(f1, xv.y);
+        p = __fmaf_rn(f0, xv.x, p);
+        p = __fmaf_rn(f2, xv.z, p);
+        p = __fmaf_rn(f3, xv.w, p);
+        acc = __fmaf_rn(dv, p, acc);
     }
-    acc = warp_reduce_sum(acc);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        acc = __fadd_rn(acc, __shfl_xor_sync(0xffffffffu, acc, o));
+    }
 
     if (lane == 0) {
         if (seg == 0 && conv_w1 != nullptr && n1 == 0) {
