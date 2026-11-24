@@ -3715,7 +3715,7 @@ __global__ void __launch_bounds__(256) qwen4_router_doorbell_plan_dedup_kernel(
     __shared__ int32_t s_cold_eid[80];
     __shared__ int32_t s_cold_cnt[80];
     __shared__ int32_t s_cold_slot[80];
-    __shared__ int32_t s_fetch_cur[8];
+    __shared__ int32_t s_fetch_cur[24];
 
     for (int i = tid; i < 512; i += 256) {
         s_seen_res[i] = -1;
@@ -3853,7 +3853,7 @@ __global__ void __launch_bounds__(256) qwen4_router_doorbell_plan_dedup_kernel(
 
         int n_fetch = 0;
         if (gpu_pcie_div > 0 && ram_ptrs != nullptr && fetch_cap > 0 && dma_stage_base != 0ULL) {
-            const int cap_cap = (fetch_cap < 8) ? fetch_cap : 8;
+            const int cap_cap = (fetch_cap < 24) ? fetch_cap : 24;
             int max_gpu = n_cold / gpu_pcie_div;
             if (max_gpu > cap_cap) max_gpu = cap_cap;
             int fetch_cursor = 0;

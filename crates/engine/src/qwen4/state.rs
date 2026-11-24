@@ -351,10 +351,10 @@ impl GpuStageScratch {
         let off_small_rows = alloc_off(max_pairs * 4);
         let off_small_pair = alloc_off(64usize.max(max_verify) * cfg.n_expert_used * 4);
         let off_small_wts = alloc_off(max_pairs * 4);
-        let off_fetch_src_ptrs = alloc_off(QWEN4_DMA_BATCH * 8);
-        let off_fetch_dst_ptrs = alloc_off(QWEN4_DMA_BATCH * 8);
-        let off_fetch_off = alloc_off(QWEN4_DMA_BATCH * 4);
-        let off_fetch_nt = alloc_off(QWEN4_DMA_BATCH * 4);
+        let off_fetch_src_ptrs = alloc_off(QWEN4_DMA_SLOTS * 8);
+        let off_fetch_dst_ptrs = alloc_off(QWEN4_DMA_SLOTS * 8);
+        let off_fetch_off = alloc_off(QWEN4_DMA_SLOTS * 4);
+        let off_fetch_nt = alloc_off(QWEN4_DMA_SLOTS * 4);
         let off_fetch_rows = alloc_off(max_pairs * 4);
         let off_fetch_pair = alloc_off(max_verify * cfg.n_expert_used * 4);
         let off_fetch_wts = alloc_off(max_pairs * 4);

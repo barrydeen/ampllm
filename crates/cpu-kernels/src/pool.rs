@@ -61,17 +61,20 @@ pub fn discover_physical_cores_with_options(
             } else {
                 cpu_id
             };
-            if seen_groups.insert(first_sib) && (!exclude_cpu0 || first_sib != 0) {
+            if seen_groups.insert(first_sib) {
                 cores.push(first_sib);
             }
+        }
+        if exclude_cpu0 && cores.len() > 8 {
+            cores.retain(|&c| c != 0);
         }
     }
 
     if cores.is_empty() {
         let avail = thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let fallback = (avail / 2).max(1);
-        let start = usize::from(exclude_cpu0);
-        for c in start..fallback {
+        let skip0 = usize::from(exclude_cpu0 && fallback > 8);
+        for c in skip0..fallback {
             cores.push(c);
         }
         if cores.is_empty() {

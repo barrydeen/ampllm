@@ -2,7 +2,7 @@ use crate::qwen4::mtp::mtp_prefill_kv_parts;
 use crate::qwen4::ple::{PleCursor, PleEngine};
 use crate::qwen4::state::{
     GpuStageScratch, PleGpuState, Qwen4LayerState, Qwen4State, QWEN4_DMA_BATCH, QWEN4_DMA_RING,
-    QWEN4_META_SLOTS, QWEN4_PREFILL_GRP_WIN,
+    QWEN4_DMA_SLOTS, QWEN4_META_SLOTS, QWEN4_PREFILL_GRP_WIN,
 };
 use crate::qwen4::{
     drain_async_adapt_state, poll_async_adapt_state, promote_gpu_slice_sync,
@@ -2775,19 +2775,29 @@ pub fn forward_decode_verify_step(
         .and_then(|s| s.parse::<i32>().ok())
         .map(|v| v.max(0));
     let cpu_isa = active_cpu_isa();
-    let pcie_div = env_pcie_div.unwrap_or(match cpu_isa {
-        CpuIsaTier::Avx512 => 0,
-        CpuIsaTier::Avx2 => 2,
-        CpuIsaTier::Scalar => 1,
+    let low_core_host = state.pool.num_threads() <= 8;
+    let pcie_div = env_pcie_div.unwrap_or(match (cpu_isa, low_core_host) {
+        (CpuIsaTier::Avx512, _) => 0,
+        (CpuIsaTier::Avx2, true) => 2,
+        (CpuIsaTier::Avx2, false) => 3,
+        (CpuIsaTier::Scalar, _) => 1,
     });
-    let pcie_div_t1 = env_pcie_div.unwrap_or(match cpu_isa {
-        CpuIsaTier::Avx512 | CpuIsaTier::Avx2 => 0,
-        CpuIsaTier::Scalar => 2,
+    let pcie_div_t1 = env_pcie_div.unwrap_or(match (cpu_isa, low_core_host) {
+        (CpuIsaTier::Avx512, _) => 0,
+        (CpuIsaTier::Avx2, true) => 3,
+        (CpuIsaTier::Avx2, false) => 0,
+        (CpuIsaTier::Scalar, _) => 2,
     });
+    let default_pcie_max = match (cpu_isa, low_core_host) {
+        (CpuIsaTier::Avx512, _) => 2,
+        (CpuIsaTier::Avx2, true) => 12,
+        (CpuIsaTier::Avx2, false) => 8,
+        (CpuIsaTier::Scalar, _) => 16,
+    };
     let pcie_max = std::env::var("AMPLLM_QWEN4_PCIE_MAX")
         .ok()
         .and_then(|s| s.parse::<i32>().ok())
-        .unwrap_or(2)
+        .unwrap_or(default_pcie_max)
         .max(0);
 
     state.step_counter += 1;
@@ -3364,7 +3374,7 @@ pub fn forward_decode_verify_step(
             let mw = &lw.moe;
             let use_pcie_fetch = t >= 2 && es.all_pinned_cold && pcie_div > 0 && pcie_max > 0;
             let fetch_cap = if use_pcie_fetch {
-                pcie_max.min(QWEN4_DMA_BATCH as i32).min(8)
+                pcie_max.min(QWEN4_DMA_SLOTS as i32)
             } else {
                 0
             };
