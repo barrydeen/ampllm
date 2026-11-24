@@ -2437,7 +2437,7 @@ pub async fn chat_completions(
                 }
                 StreamEvent::Error(e) => {
                     events.push(Ok(
-                        Event::default().data(serde_json::json!({"error": e}).to_string())
+                        Event::default().data(openai_error_payload(&e).to_string())
                     ));
                 }
             }
@@ -2525,7 +2525,8 @@ pub async fn chat_completions(
                 break;
             }
             StreamEvent::Error(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(openai_error_payload(&e)))
+                    .into_response();
             }
         }
     }
@@ -2559,6 +2560,17 @@ pub async fn chat_completions(
         "timings": timings
     }))
     .into_response()
+}
+
+fn openai_error_payload(message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "param": serde_json::Value::Null,
+            "code": serde_json::Value::Null
+        }
+    })
 }
 
 pub async fn completions(
@@ -2660,7 +2672,7 @@ pub async fn completions(
                     )
                 }
                 StreamEvent::Error(e) => {
-                    Event::default().data(serde_json::json!({"error": e}).to_string())
+                    Event::default().data(openai_error_payload(&e).to_string())
                 }
             };
             futures::stream::iter(vec![Ok::<Event, Infallible>(item)])
@@ -2713,7 +2725,8 @@ pub async fn completions(
                 break;
             }
             StreamEvent::Error(e) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(openai_error_payload(&e)))
+                    .into_response();
             }
         }
     }

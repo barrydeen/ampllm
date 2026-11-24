@@ -101,6 +101,7 @@ extern "C" {
     fn cudaGraphExecDestroy(graph_exec: *mut c_void) -> c_int;
 
     fn cudaGetErrorString(err: c_int) -> *const c_char;
+    fn cudaGetLastError() -> c_int;
 }
 
 #[inline]
@@ -311,7 +312,11 @@ impl DeviceBuffer {
         set_device(device)?;
         let alloc_bytes = bytes.max(16);
         let mut ptr = ptr::null_mut();
-        cuda_check(unsafe { cudaMalloc(&mut ptr, alloc_bytes) }, "cudaMalloc")?;
+        let code = unsafe { cudaMalloc(&mut ptr, alloc_bytes) };
+        if code != 0 {
+            let _ = unsafe { cudaGetLastError() };
+            cuda_check(code, "cudaMalloc")?;
+        }
         Ok(Self {
             device,
             ptr,

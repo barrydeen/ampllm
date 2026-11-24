@@ -606,6 +606,7 @@ impl Glm5ModelWeights {
         max_ctx: usize,
         profile: Option<&CacheProfile>,
         max_vram_experts_override: Option<usize>,
+        extra_reserve0_bytes: usize,
     ) -> Result<Self> {
         let n_dev = ampllm_cuda_kernels::device_count()?;
         if n_dev < 2 {
@@ -778,7 +779,7 @@ impl Glm5ModelWeights {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(1384);
-        let reserve0 = reserve0_mb << 20;
+        let reserve0 = (reserve0_mb << 20).saturating_add(extra_reserve0_bytes);
         let reserve1 = reserve1_mb << 20;
         let avail0 = free0.saturating_sub(reserve0);
         let avail1 = free1.saturating_sub(reserve1 + head_bytes);
@@ -846,8 +847,8 @@ impl Glm5ModelWeights {
         let init_exp_budget0_mb = exp_budget0 >> 20;
         let init_exp_budget1_mb = exp_budget1 >> 20;
         tracing::info!(
-            "GLM-5.3 plan: free0={} MiB avail0={} MiB fix0={} MiB exp_budget0={} MiB | free1={} MiB avail1={} MiB fix1={} MiB exp_budget1={} MiB",
-            free0 >> 20, avail0 >> 20, fix0 >> 20, init_exp_budget0_mb,
+            "GLM-5.3 plan: free0={} MiB avail0={} MiB fix0={} MiB exp_budget0={} MiB vis_res0={} MiB | free1={} MiB avail1={} MiB fix1={} MiB exp_budget1={} MiB",
+            free0 >> 20, avail0 >> 20, fix0 >> 20, init_exp_budget0_mb, extra_reserve0_bytes >> 20,
             free1 >> 20, avail1 >> 20, fix1 >> 20, init_exp_budget1_mb
         );
 

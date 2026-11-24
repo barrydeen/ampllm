@@ -702,6 +702,7 @@ impl<B: InferenceBackend> SlotScheduler<B> {
             let prompt_ids = match self.backend.encode_prompt(&job.prompt) {
                 Ok(ids) => ids,
                 Err(e) => {
+                    tracing::error!("prompt encoding failed: {e:#}");
                     let _ = job.resp_tx.send(StreamEvent::Error(e.to_string()));
                     continue;
                 }
@@ -714,6 +715,7 @@ impl<B: InferenceBackend> SlotScheduler<B> {
                 {
                     Ok((ids, imgs)) => (ids, Some(imgs)),
                     Err(e) => {
+                        tracing::error!("image preparation failed: {e:#}");
                         let _ = job.resp_tx.send(StreamEvent::Error(format!("{e:#}")));
                         continue;
                     }
@@ -724,6 +726,7 @@ impl<B: InferenceBackend> SlotScheduler<B> {
 
             let max_ctx = self.backend.max_ctx();
             if eval_ids.len() >= max_ctx {
+                tracing::error!("prompt length {} >= max_ctx {max_ctx}", eval_ids.len());
                 let _ = job.resp_tx.send(StreamEvent::Error(format!(
                     "prompt length {} >= max_ctx {max_ctx}",
                     eval_ids.len()

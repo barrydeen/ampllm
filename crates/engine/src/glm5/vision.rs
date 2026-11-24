@@ -243,6 +243,29 @@ impl Glm5Vision {
         })
     }
 
+    /// Worst-case transient GPU 0 VRAM bytes needed by `encode_image` at `cfg.max_tokens`.
+    pub fn transient_vram_bytes(&self) -> usize {
+        let sm = self.cfg.spatial_merge;
+        let max_patches = self.cfg.max_tokens.saturating_mul(sm).saturating_mul(sm);
+        let d = self.cfg.dim;
+        let ff = self.cfg.ff;
+        let out_dim = self.cfg.out_dim;
+        let merger_ff = self.cfg.merger_ff;
+
+        let phase1 = max_patches
+            .saturating_mul(d * 2 + d * 4 + 8 + 3 * d * 4 + d * 4)
+            .saturating_add(max_patches.min(512).saturating_mul(ff * 10));
+        let phase2 = max_patches
+            .saturating_mul(d * 2)
+            .saturating_add(
+                self.cfg
+                    .max_tokens
+                    .min(512)
+                    .saturating_mul(out_dim * 10 + merger_ff * 10),
+            );
+        phase1.max(phase2)
+    }
+
     pub fn encode_image(
         &self,
         rgb: &[u8],
@@ -362,7 +385,6 @@ impl Glm5Vision {
 
             let pos_yx = DeviceBuffer::alloc(self.device, n_patches * 2 * 4)?;
             let qkv_f32 = DeviceBuffer::alloc(self.device, n_patches * 3 * d * 4)?;
-            let attn_f32 = DeviceBuffer::alloc(self.device, n_patches * d * 4)?;
             let tmp_f32 = DeviceBuffer::alloc(self.device, n_patches * d * 4)?;
             let ffn_tile = n_patches.min(512);
             let ff_gate_f32 = DeviceBuffer::alloc(self.device, ffn_tile * ff * 4)?;
@@ -432,11 +454,11 @@ impl Glm5Vision {
                         self.cfg.heads as i32,
                         self.cfg.head_dim as i32,
                         attn_scale,
-                        attn_f32.ptr.cast::<f32>(),
+                        tmp_f32.ptr.cast::<f32>(),
                         stream,
                     );
                     glm5::f32_to_f16(
-                        attn_f32.ptr.cast::<f32>(),
+                        tmp_f32.ptr.cast::<f32>(),
                         x_f16.ptr,
                         (n_patches * d) as i32,
                         stream,

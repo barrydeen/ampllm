@@ -134,7 +134,25 @@ impl Glm5Engine {
             None
         };
         let cpu_pool = Arc::new(CpuThreadPool::new(cfg.cpu_threads));
-        let weights = Glm5ModelWeights::load(&gguf, tok, &gcfg, max_ctx, profile.as_ref(), None)?;
+        let vision_reserve_bytes = vision.as_ref().map_or(0, |v| {
+            let default_mb = (v.transient_vram_bytes() + (128 << 20))
+                .div_ceil(1 << 20)
+                .max(512);
+            let mb = std::env::var("AMPLLM_VISION_RESERVE0_MB")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(default_mb);
+            mb << 20
+        });
+        let weights = Glm5ModelWeights::load(
+            &gguf,
+            tok,
+            &gcfg,
+            max_ctx,
+            profile.as_ref(),
+            None,
+            vision_reserve_bytes,
+        )?;
         let state = Glm5State::alloc(&weights, cpu_pool, max_ctx)?;
         tracing::info!("Glm5State ready: p2p_ok={}", state.p2p_ok);
         let chunk_size = state.max_prefill_chunk;
