@@ -192,6 +192,37 @@ __device__ __forceinline__ void unpack_w_half16(
             sc_out  =  fp16_bits_to_f32(load_u16_align2(&blk->d));
             sc1_out = -fp16_bits_to_f32(load_u16_align2(&blk->m));
         }
+    } else if constexpr (W_TYPE == GGML_TYPE_Q5_0) {
+        const int blk_idx = k0 >> 5;
+        const block_q5_0* blk = reinterpret_cast<const block_q5_0*>(w_row) + blk_idx;
+        const uint32_t qh = (uint32_t)load_i32_align2(blk->qh);
+        const uint32_t qh_half = (half16 == 0) ? qh : (qh >> 16);
+        const int qs_shift = half16 * 4;
+        uint32_t w[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t q4 = ((uint32_t)load_i32_align2(blk->qs + 4 * j) >> qs_shift) & 0x0F0F0F0Fu;
+            const uint32_t u5 = q4 | expand_q5_1_hi4(qh_half >> (4 * j));
+            w[j] = __vsub4(u5, 0x10101010u);
+        }
+        out16 = make_uint4(w[0], w[1], w[2], w[3]);
+        if (half16 == 0) {
+            sc_out = fp16_bits_to_f32(load_u16_align2(&blk->d));
+        }
+    } else if constexpr (W_TYPE == GGML_TYPE_IQ4_NL) {
+        const int blk_idx = k0 >> 5;
+        const block_iq4_nl* blk = reinterpret_cast<const block_iq4_nl*>(w_row) + blk_idx;
+        const uint32_t shift = (uint32_t)(half16 * 4);
+        uint32_t w[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t q4 = ((uint32_t)load_i32_align2(blk->qs + 4 * j) >> shift) & 0x0F0F0F0Fu;
+            w[j] = (uint32_t)lut_iq4nl_x4(q4);
+        }
+        out16 = make_uint4(w[0], w[1], w[2], w[3]);
+        if (half16 == 0) {
+            sc_out = fp16_bits_to_f32(load_u16_align2(&blk->d));
+        }
     } else if constexpr (W_TYPE == GGML_TYPE_Q2_0) {
         const int blk_idx = k0 >> 6;
         const int sub32 = (k0 >> 5) & 1;
@@ -1045,11 +1076,22 @@ extern "C" void launch_gemm_mmq_mma_grouped(
         case GGML_TYPE_Q5_1:
             dispatch_mmq_grouped<GGML_TYPE_Q5_1>(a, exp_ptrs, b_byte_offset, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, exp_row_off, exp_nt, tile_exp_id, tile_m_off, n_m_tiles, n, k, alpha, use_atomic_scatter, tile_mode, stream);
             break;
+        case GGML_TYPE_Q5_0:
+            dispatch_mmq_grouped<GGML_TYPE_Q5_0>(a, exp_ptrs, b_byte_offset, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, exp_row_off, exp_nt, tile_exp_id, tile_m_off, n_m_tiles, n, k, alpha, use_atomic_scatter, tile_mode, stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            dispatch_mmq_grouped<GGML_TYPE_IQ4_NL>(a, exp_ptrs, b_byte_offset, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, exp_row_off, exp_nt, tile_exp_id, tile_m_off, n_m_tiles, n, k, alpha, use_atomic_scatter, tile_mode, stream);
+            break;
         case GGML_TYPE_Q2_0:
             dispatch_mmq_grouped<GGML_TYPE_Q2_0>(a, exp_ptrs, b_byte_offset, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, exp_row_off, exp_nt, tile_exp_id, tile_m_off, n_m_tiles, n, k, alpha, use_atomic_scatter, tile_mode, stream);
             break;
-        default:
+        default: {
+            static std::atomic<int> s_grp_unsupported{0};
+            if (s_grp_unsupported.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::fprintf(stderr, "[CUDA ERROR] launch_gemm_mmq_mma_grouped: unsupported w_type=%d\n", w_type);
+            }
             break;
+        }
     }
     cudaError_t err = cudaPeekAtLastError();
     if (err != cudaSuccess) {
@@ -1117,11 +1159,22 @@ extern "C" void launch_gemm_mmq_mma_tiled(
         case GGML_TYPE_Q5_1:
             dispatch_mmq_tile<GGML_TYPE_Q5_1>(a, b, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, m, n, k, alpha, beta, force_tile, stream);
             break;
+        case GGML_TYPE_Q5_0:
+            dispatch_mmq_tile<GGML_TYPE_Q5_0>(a, b, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, m, n, k, alpha, beta, force_tile, stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            dispatch_mmq_tile<GGML_TYPE_IQ4_NL>(a, b, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, m, n, k, alpha, beta, force_tile, stream);
+            break;
         case GGML_TYPE_Q2_0:
             dispatch_mmq_tile<GGML_TYPE_Q2_0>(a, b, b_row_bytes, c_f32, rows_in_opt, rows_out_opt, wts_out_opt, m, n, k, alpha, beta, force_tile, stream);
             break;
-        default:
+        default: {
+            static std::atomic<int> s_tiled_unsupported{0};
+            if (s_tiled_unsupported.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::fprintf(stderr, "[CUDA ERROR] launch_gemm_mmq_mma_tiled: unsupported w_type=%d\n", w_type);
+            }
             break;
+        }
     }
     cudaError_t err = cudaPeekAtLastError();
     if (err != cudaSuccess) {

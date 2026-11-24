@@ -17,7 +17,7 @@ use ampllm_cpu_kernels::glm5_cpu::{
     quantize_glm5_cpu_x_q8_1, quantize_glm5_cpu_x_q8k, run_glm5_cpu_moe_grouped_prequant,
     Glm5CpuGroupedExpert, Glm5CpuScratch,
 };
-use ampllm_cpu_kernels::{tok_row_to_f32_cpu, CpuThreadPool};
+use ampllm_cpu_kernels::{active_cpu_isa, tok_row_to_f32_cpu, CpuIsaTier, CpuThreadPool};
 use ampllm_cuda_kernels::ffi::launch_quantize_q8_1;
 use ampllm_cuda_kernels::{
     copy_d2d_raw_async, copy_d2h_raw_async, copy_h2d_raw_async, copy_peer_raw_async, glm5, hy4,
@@ -794,9 +794,14 @@ fn run_prefill_moe_layer(
         let cpu_cnt = ((k_cold as f64) * cpu_frac.clamp(0.0, 1.0)).round() as usize;
         k_cold.saturating_sub(cpu_cnt)
     } else {
-        // Calibrated PCIe vs AVX-512 cost model for Qwen4 (n_embd=2560, n_ff=640, blob~3.1-4.0MB)
+        // Calibrated PCIe vs CPU cost model for Qwen4 (n_embd=2560, n_ff=640, blob~3.1-4.0MB)
         let cpu_max_nt = (t / 12).clamp(32, 256);
-        let cpu_scale = 8.0 / (cpu_pool.num_threads().max(1) as f64);
+        let isa_mult = match active_cpu_isa() {
+            CpuIsaTier::Avx512 => 1.0,
+            CpuIsaTier::Avx2 => 2.0,
+            CpuIsaTier::Scalar => 8.0,
+        };
+        let cpu_scale = (8.0 / (cpu_pool.num_threads().max(1) as f64)) * isa_mult;
         let blob_us = (mw.blob_bytes as f64) / 11_500.0;
         let comp_cost = |nt: usize| -> f64 {
             if nt <= small_max_nt {
@@ -2765,11 +2770,20 @@ pub fn forward_decode_verify_step(
     let n_gpus = state.gpus.len();
     let prof_on = profile.is_some();
 
-    let pcie_div = std::env::var("AMPLLM_QWEN4_PCIE_DIV")
+    let env_pcie_div = std::env::var("AMPLLM_QWEN4_PCIE_DIV")
         .ok()
         .and_then(|s| s.parse::<i32>().ok())
-        .unwrap_or(0)
-        .max(0);
+        .map(|v| v.max(0));
+    let cpu_isa = active_cpu_isa();
+    let pcie_div = env_pcie_div.unwrap_or(match cpu_isa {
+        CpuIsaTier::Avx512 => 0,
+        CpuIsaTier::Avx2 => 2,
+        CpuIsaTier::Scalar => 1,
+    });
+    let pcie_div_t1 = env_pcie_div.unwrap_or(match cpu_isa {
+        CpuIsaTier::Avx512 | CpuIsaTier::Avx2 => 0,
+        CpuIsaTier::Scalar => 2,
+    });
     let pcie_max = std::env::var("AMPLLM_QWEN4_PCIE_MAX")
         .ok()
         .and_then(|s| s.parse::<i32>().ok())
@@ -3395,6 +3409,12 @@ pub fn forward_decode_verify_step(
                         &g.stream,
                     );
                     if t == 1 {
+                        let (t1_div, t1_max) =
+                            if es.all_pinned_cold && pcie_div_t1 > 0 && pcie_max > 0 {
+                                (pcie_div_t1, pcie_max)
+                            } else {
+                                (0, 0)
+                            };
                         qwen4::router_doorbell_plan(
                             rlogits_p,
                             t as i32,
@@ -3402,8 +3422,8 @@ pub fn forward_decode_verify_step(
                             topk as i32,
                             es.dev_vram_ptrs.ptr.cast::<u64>(),
                             ram_p,
-                            0,
-                            0,
+                            t1_div,
+                            t1_max,
                             mixed,
                             n_embd as i32,
                             n_ff as i32,
@@ -3708,7 +3728,8 @@ pub fn forward_decode_verify_step(
     };
 
     let db_guard = state.doorbell.active_guard();
-    let gkey = (t, sparse, greedy_argmax, save_snap, pcie_div, pcie_max);
+    let eff_pcie_div = if t == 1 { pcie_div_t1 } else { pcie_div };
+    let gkey = (t, sparse, greedy_argmax, save_snap, eff_pcie_div, pcie_max);
 
     // GPU 0 execution / graph launch
     {

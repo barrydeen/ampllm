@@ -44,6 +44,53 @@ impl QuantMatrix {
     }
 }
 
+fn validate_qwen4_moe_type(role: &str, il: usize, ty: GgmlType) -> Result<()> {
+    let supported = match role {
+        "ffn_gate/up_exps.weight" => matches!(
+            ty,
+            GgmlType::Q2_0
+                | GgmlType::Q3K
+                | GgmlType::Q4K
+                | GgmlType::Q5_0
+                | GgmlType::Q5_1
+                | GgmlType::Q5K
+                | GgmlType::Q6K
+                | GgmlType::Q8_0
+                | GgmlType::Iq4Nl
+                | GgmlType::Iq4Xs
+                | GgmlType::Iq3S
+                | GgmlType::Iq3Xxs
+                | GgmlType::Iq2S
+                | GgmlType::Iq2Xs
+                | GgmlType::Iq2Xxs
+                | GgmlType::Iq1S
+        ),
+        _ => matches!(
+            ty,
+            GgmlType::Q2_0
+                | GgmlType::Q3K
+                | GgmlType::Q4K
+                | GgmlType::Q5_0
+                | GgmlType::Q5_1
+                | GgmlType::Q5K
+                | GgmlType::Q6K
+                | GgmlType::Q8_0
+                | GgmlType::Iq4Nl
+                | GgmlType::Iq4Xs
+                | GgmlType::Iq3S
+                | GgmlType::Iq3Xxs
+                | GgmlType::Iq2S
+        ),
+    };
+    if !supported {
+        anyhow::bail!(
+            "blk.{il}.{role}: unsupported GgmlType {ty:?} ({}) for Qwen4 MoE kernels",
+            ty as i32
+        );
+    }
+    Ok(())
+}
+
 pub struct HcWeights {
     pub norm: DeviceBuffer,
     pub down: QuantMatrix,
@@ -881,6 +928,8 @@ impl Qwen4Weights {
             }
             let gu_type = g_info.ggml_type;
             let d_type = d_info.ggml_type;
+            validate_qwen4_moe_type("ffn_gate/up_exps.weight", il, gu_type)?;
+            validate_qwen4_moe_type("ffn_down_exps.weight", il, d_type)?;
             let gu_rb = gu_type.row_bytes(n_embd);
             let d_rb = d_type.row_bytes(n_ff);
             let gate_bytes = n_ff * gu_rb;
@@ -1344,13 +1393,24 @@ impl Qwen4Weights {
         }
 
         // Drop non-PLE/non-embedding shards? No, we still need to read cold experts from them!
-        // Pack cold experts per GPU into pinned mapped host RAM when MemAvailable keeps >= 32 GiB headroom for PLE + OS.
+        // Pack cold experts per GPU into pinned mapped host RAM when MemAvailable leaves headroom for PLE + OS.
         let total_cold_bytes: usize = total_cold_per_gpu.iter().sum();
         let mem_avail = read_mem_available_bytes().unwrap_or(0);
-        let ple_reserve = 32usize * 1024 * 1024 * 1024;
-        let pin_cold = total_cold_bytes > 0
-            && std::env::var("AMPLLM_QWEN4_PIN_COLD").map_or(true, |v| v != "0")
-            && mem_avail >= total_cold_bytes.saturating_add(ple_reserve);
+        let ple_reserve = (self.ple_byte_len / 2)
+            .min(8usize * 1024 * 1024 * 1024)
+            .saturating_add(4usize * 1024 * 1024 * 1024);
+        let pin_cold_env = std::env::var("AMPLLM_QWEN4_PIN_COLD")
+            .ok()
+            .map(|v| v.trim().to_owned());
+        let pin_cold = if total_cold_bytes == 0 {
+            false
+        } else {
+            match pin_cold_env.as_deref() {
+                Some("0") => false,
+                Some("1") => true,
+                _ => mem_avail >= total_cold_bytes.saturating_add(ple_reserve),
+            }
+        };
 
         let mut free_ram_slots_all: Vec<Vec<(usize, u64)>> = vec![Vec::new(); n_layer];
 
@@ -1539,7 +1599,8 @@ impl Qwen4Weights {
         }
         let pf_ms = t_pf0.elapsed().as_secs_f64() * 1000.0;
         eprintln!(
-            "qwen4exp host: mem_avail={:.1}GiB pin_cold={} ple_prefault={} ({:.1}ms)",
+            "qwen4exp host: cpu_isa={} mem_avail={:.1}GiB pin_cold={} ple_prefault={} ({:.1}ms)",
+            ampllm_cpu_kernels::active_cpu_isa(),
             (mem_avail_after as f64) / 1073741824.0,
             all_pinned_cold,
             ple_prefaulted,

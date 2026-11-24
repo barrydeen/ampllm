@@ -601,9 +601,10 @@ impl Glm5ModelWeights {
         if n_dev < 2 {
             anyhow::bail!("GLM-5.3-Flash currently requires at least 2 CUDA GPUs (detected {n_dev})");
         }
-        if !ampllm_cpu_kernels::glm5_cpu::has_glm5_avx512() {
-            anyhow::bail!("GLM-5.3-Flash CPU MoE offloading requires an x86-64 CPU with AVX-512 (F, BW, VL, DQ, VNNI, VPOPCNTDQ)");
-        }
+        eprintln!(
+            "glm5 CPU MoE offload ISA: {}",
+            ampllm_cpu_kernels::active_cpu_isa()
+        );
         let s0 = CudaStream::new(0)?;
         let s1 = CudaStream::new(1)?;
 

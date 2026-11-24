@@ -12,6 +12,8 @@ fn main() {
     println!("cargo:rerun-if-changed=csrc/iq_avx512_glm5.cpp");
     println!("cargo:rerun-if-changed=csrc/iq_avx512_hy4.cpp");
     println!("cargo:rerun-if-changed=csrc/iq_avx512_mm3.cpp");
+    println!("cargo:rerun-if-changed=csrc/iq_avx2_fallback.cpp");
+    println!("cargo:rerun-if-changed=csrc/iq_scalar_fallback.cpp");
     println!("cargo:rerun-if-env-changed=CXX");
     println!("cargo:rerun-if-env-changed=AMPLLM_CPU_TUNE");
 
@@ -20,16 +22,39 @@ fn main() {
     let tune_flag = format!("-mtune={tune}");
     let lib = out_dir.join("libampllm_cpu_iq512.a");
 
-    let sources = ["iq_avx512_glm5.cpp", "iq_avx512_hy4.cpp", "iq_avx512_mm3.cpp"];
-    let mut objs = Vec::with_capacity(sources.len());
-    for file in &sources {
+    let avx512_sources = ["iq_avx512_glm5.cpp", "iq_avx512_hy4.cpp", "iq_avx512_mm3.cpp"];
+    let mut objs = Vec::with_capacity(avx512_sources.len() + 2);
+    let mut compile_unit = |file: &str, extra_flags: &[&str]| {
         let src = csrc_dir.join(file);
         let obj = out_dir.join(format!("{}.o", file.trim_end_matches(".cpp")));
+        let mut args: Vec<&str> = vec!["-O3", "-std=c++17", "-fPIC"];
+        args.extend_from_slice(extra_flags);
+        args.extend_from_slice(&[
+            "-I",
+            csrc_dir.to_str().unwrap(),
+            "-c",
+            src.to_str().unwrap(),
+            "-o",
+            obj.to_str().unwrap(),
+        ]);
         let out = Command::new(&cxx)
-            .args([
-                "-O3",
-                "-std=c++17",
-                "-fPIC",
+            .args(&args)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {cxx}: {e}"));
+
+        if !out.status.success() {
+            panic!(
+                "{cxx} failed compiling {file}:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        objs.push(obj);
+    };
+
+    for file in &avx512_sources {
+        compile_unit(
+            file,
+            &[
                 "-mavx512f",
                 "-mavx512bw",
                 "-mavx512vl",
@@ -41,24 +66,14 @@ fn main() {
                 "-mf16c",
                 "-mbmi2",
                 tune_flag.as_str(),
-                "-I",
-                csrc_dir.to_str().unwrap(),
-                "-c",
-                src.to_str().unwrap(),
-                "-o",
-                obj.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn {cxx}: {e}"));
-
-        if !out.status.success() {
-            panic!(
-                "{cxx} failed compiling {file}:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        objs.push(obj);
+            ],
+        );
     }
+    compile_unit(
+        "iq_avx2_fallback.cpp",
+        &["-mavx2", "-mfma", "-mf16c", tune_flag.as_str()],
+    );
+    compile_unit("iq_scalar_fallback.cpp", &["-mtune=generic"]);
 
     if lib.exists() {
         let _ = std::fs::remove_file(&lib);

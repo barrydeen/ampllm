@@ -6349,6 +6349,29 @@ __device__ __forceinline__ void unpack_sub_w_blk32(
             p.w[j + 0] = (int)((q4 & 0x0F0F0F0Fu) | expand_q5_1_hi4(qh >> (4 * j)));
             p.w[j + 4] = (int)(((q4 >> 4) & 0x0F0F0F0Fu) | expand_q5_1_hi4(qh >> (16 + 4 * j)));
         }
+    } else if constexpr (W_TYPE == GGML_TYPE_Q5_0) {
+        const block_q5_0* blk = reinterpret_cast<const block_q5_0*>(w_row) + blk32;
+        p.s0 = fp16_bits_to_f32(load_u16_align2(&blk->d));
+        p.s1 = 0.0f;
+        const uint32_t qh = (uint32_t)load_i32_align2(blk->qh);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t q4 = (uint32_t)load_i32_align2(blk->qs + 4 * j);
+            const uint32_t lo_u = (q4 & 0x0F0F0F0Fu) | expand_q5_1_hi4(qh >> (4 * j));
+            const uint32_t hi_u = ((q4 >> 4) & 0x0F0F0F0Fu) | expand_q5_1_hi4(qh >> (16 + 4 * j));
+            p.w[j + 0] = (int)__vsub4(lo_u, 0x10101010u);
+            p.w[j + 4] = (int)__vsub4(hi_u, 0x10101010u);
+        }
+    } else if constexpr (W_TYPE == GGML_TYPE_IQ4_NL) {
+        const block_iq4_nl* blk = reinterpret_cast<const block_iq4_nl*>(w_row) + blk32;
+        p.s0 = fp16_bits_to_f32(load_u16_align2(&blk->d));
+        p.s1 = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t q4 = (uint32_t)load_i32_align2(blk->qs + 4 * j);
+            p.w[j + 0] = lut_iq4nl_x4(q4 & 0x0F0F0F0Fu);
+            p.w[j + 4] = lut_iq4nl_x4((q4 >> 4) & 0x0F0F0F0Fu);
+        }
     } else if constexpr (W_TYPE == GGML_TYPE_Q2_0) {
         const block_q2_0* blk = reinterpret_cast<const block_q2_0*>(w_row) + (blk32 >> 1);
         p.s0 = fp16_bits_to_f32(load_u16_align2(&blk->d));
@@ -6535,7 +6558,7 @@ __device__ __forceinline__ float dot_unpacked_w_q8(
         #pragma unroll
         for (int j = 0; j < 8; ++j) sumi = dp4a_packed(p.w[j], u[j], sumi);
         return p.s0 * ds8.x * (float)sumi - p.s1 * ds8.y;
-    } else if constexpr (W_TYPE == GGML_TYPE_IQ3_XXS || W_TYPE == GGML_TYPE_IQ3_S || W_TYPE == GGML_TYPE_IQ4_XS || W_TYPE == GGML_TYPE_Q8_0 || W_TYPE == GGML_TYPE_Q2_0) {
+    } else if constexpr (W_TYPE == GGML_TYPE_IQ3_XXS || W_TYPE == GGML_TYPE_IQ3_S || W_TYPE == GGML_TYPE_IQ4_XS || W_TYPE == GGML_TYPE_Q8_0 || W_TYPE == GGML_TYPE_Q2_0 || W_TYPE == GGML_TYPE_Q5_0 || W_TYPE == GGML_TYPE_IQ4_NL) {
         int sumi = 0;
         #pragma unroll
         for (int j = 0; j < 8; ++j) sumi = dp4a_packed(p.w[j], u[j], sumi);
@@ -6631,7 +6654,7 @@ __global__ void __launch_bounds__(256, 2) glm5_moe_prefill_small_gu_kernel(
                 float ag[8] = {0}, au[8] = {0};
                 const uint8_t* gr = g_base + (size_t)r * row_bytes;
                 const uint8_t* ur = u_base + (size_t)r * row_bytes;
-                if constexpr (W_TYPE == GGML_TYPE_Q8_0 || W_TYPE == GGML_TYPE_Q5_1 || W_TYPE == GGML_TYPE_Q2_0) {
+                if constexpr (W_TYPE == GGML_TYPE_Q8_0 || W_TYPE == GGML_TYPE_Q5_1 || W_TYPE == GGML_TYPE_Q2_0 || W_TYPE == GGML_TYPE_Q5_0 || W_TYPE == GGML_TYPE_IQ4_NL) {
                     #pragma unroll 1
                     for (int blk32 = lane; blk32 < nb_x; blk32 += 32) {
                         Glm5SubPackedW wg, wu;
@@ -6753,7 +6776,7 @@ __global__ void __launch_bounds__(256, 2) glm5_moe_prefill_small_down_kernel(
             if (r >= n_embd) break;
             const uint8_t* dr = d_base + (size_t)r * row_bytes;
             float ad[8] = {0};
-            if constexpr (W_TYPE == GGML_TYPE_Q8_0 || W_TYPE == GGML_TYPE_Q5_1 || W_TYPE == GGML_TYPE_Q2_0) {
+            if constexpr (W_TYPE == GGML_TYPE_Q8_0 || W_TYPE == GGML_TYPE_Q5_1 || W_TYPE == GGML_TYPE_Q2_0 || W_TYPE == GGML_TYPE_Q5_0 || W_TYPE == GGML_TYPE_IQ4_NL) {
                 #pragma unroll 1
                 for (int blk32 = lane; blk32 < nb_ff; blk32 += 32) {
                     Glm5SubPackedW wd;
@@ -6861,10 +6884,25 @@ extern "C" void launch_glm5_moe_prefill_small_gu(
             glm5_moe_prefill_small_gu_kernel<GGML_TYPE_Q2_0><<<grid, block, 0, stream>>>(
                 exp_ptrs, slot_off, slot_nt, rows_all, u_off, gu_row_bytes, xq, iq, n_embd, n_ff, clamp_lim);
             break;
-        default:
+        case GGML_TYPE_Q5_0:
+            glm5_moe_prefill_small_gu_kernel<GGML_TYPE_Q5_0><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, u_off, gu_row_bytes, xq, iq, n_embd, n_ff, clamp_lim);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            glm5_moe_prefill_small_gu_kernel<GGML_TYPE_IQ4_NL><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, u_off, gu_row_bytes, xq, iq, n_embd, n_ff, clamp_lim);
+            break;
+        case GGML_TYPE_Q6_K:
             glm5_moe_prefill_small_gu_kernel<GGML_TYPE_Q6_K><<<grid, block, 0, stream>>>(
                 exp_ptrs, slot_off, slot_nt, rows_all, u_off, gu_row_bytes, xq, iq, n_embd, n_ff, clamp_lim);
             break;
+        default: {
+            static std::atomic<int> s_small_gu_unsupported{0};
+            if (s_small_gu_unsupported.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::fprintf(stderr, "[CUDA ERROR] launch_glm5_moe_prefill_small_gu: unsupported gu_type=%d\n", gu_type);
+            }
+            break;
+        }
     }
 }
 
@@ -6930,10 +6968,25 @@ static void launch_glm5_moe_prefill_small_down_impl(
             glm5_moe_prefill_small_down_kernel<GGML_TYPE_Q2_0, DET_PAIR><<<grid, block, 0, stream>>>(
                 exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
             break;
-        default:
+        case GGML_TYPE_Q5_0:
+            glm5_moe_prefill_small_down_kernel<GGML_TYPE_Q5_0, DET_PAIR><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            glm5_moe_prefill_small_down_kernel<GGML_TYPE_IQ4_NL, DET_PAIR><<<grid, block, 0, stream>>>(
+                exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
+            break;
+        case GGML_TYPE_Q6_K:
             glm5_moe_prefill_small_down_kernel<GGML_TYPE_Q6_K, DET_PAIR><<<grid, block, 0, stream>>>(
                 exp_ptrs, slot_off, slot_nt, rows_all, wts_all, d_off, d_row_bytes, iq, out_f32, n_embd, n_ff);
             break;
+        default: {
+            static std::atomic<int> s_small_dn_unsupported{0};
+            if (s_small_dn_unsupported.fetch_add(1, std::memory_order_relaxed) < 8) {
+                std::fprintf(stderr, "[CUDA ERROR] launch_glm5_moe_prefill_small_down: unsupported d_type=%d\n", d_type);
+            }
+            break;
+        }
     }
 }
 

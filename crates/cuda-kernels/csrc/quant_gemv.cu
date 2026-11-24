@@ -207,6 +207,8 @@ __global__ void fused_qkvrg_m1_kernel(
         sum = dot_row_nvfp4_sub(reinterpret_cast<const block_nvfp4*>(w_row), x_q8, K, lane);
     } else if (w_type == GGML_TYPE_IQ4_NL) {
         sum = dot_row_iq4_nl_sub(reinterpret_cast<const block_iq4_nl*>(w_row), x_q8, K, lane);
+    } else if (w_type == GGML_TYPE_Q5_0) {
+        sum = dot_row_q5_0_sub(reinterpret_cast<const block_q5_0*>(w_row), x_q8, K, lane);
     } else if (w_type == GGML_TYPE_Q4_0) {
         sum = dot_row_q4_0_sub(reinterpret_cast<const block_q4_0*>(w_row), x_q8, K, lane);
     } else if (w_type == GGML_TYPE_Q6_K) {
@@ -686,6 +688,7 @@ __global__ void embed_lookup_rmsnorm_kernel(
     else if (table_type == GGML_TYPE_F16 || table_type == GGML_TYPE_BF16) row_bytes = (size_t)n_embd * 2;
     else if (table_type == GGML_TYPE_Q8_0) row_bytes = (size_t)(n_embd / 32) * sizeof(block_q8_0);
     else if (table_type == GGML_TYPE_Q4_0) row_bytes = (size_t)(n_embd / 32) * sizeof(block_q4_0);
+    else if (table_type == GGML_TYPE_Q5_0) row_bytes = (size_t)(n_embd / 32) * sizeof(block_q5_0);
     else if (table_type == GGML_TYPE_IQ4_NL) row_bytes = (size_t)(n_embd / 32) * sizeof(block_iq4_nl);
     else if (table_type == GGML_TYPE_Q4_K) row_bytes = (size_t)(n_embd / 256) * sizeof(block_q4_K);
     else if (table_type == GGML_TYPE_Q5_K) row_bytes = (size_t)(n_embd / 256) * sizeof(block_q5_K);
@@ -714,6 +717,14 @@ __global__ void embed_lookup_rmsnorm_kernel(
             const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(row_ptr) + b;
             int q = (j < 16) ? (blk->qs[j] & 0xF) : (blk->qs[j - 16] >> 4);
             val = fp16_bits_to_f32(load_u16_unaligned(&blk->d)) * (float)(q - 8);
+        } else if (table_type == GGML_TYPE_Q5_0) {
+            int b = i >> 5;
+            int j = i & 31;
+            const block_q5_0* blk = reinterpret_cast<const block_q5_0*>(row_ptr) + b;
+            uint32_t qh = (uint32_t)load_i32_align2(blk->qh);
+            int lo = (j < 16) ? (blk->qs[j] & 0xF) : (blk->qs[j - 16] >> 4);
+            int hi = (int)((qh >> j) & 1u) << 4;
+            val = fp16_bits_to_f32(load_u16_unaligned(&blk->d)) * (float)((lo | hi) - 16);
         } else if (table_type == GGML_TYPE_IQ4_NL) {
             int b = i >> 5;
             int j = i & 31;
@@ -1525,6 +1536,10 @@ static void launch_mmvq_chunk(
         case GGML_TYPE_Q5_1:
             if (M == 1) mmvq_quant_kernel<block_q5_1, 32, dot_q5_1_q8_1, 1><<<grid_m1, block, 0, stream>>>(W, X_q8, Y, conv_w, add_res, conv_history, conv_offset, n_conv, N, K, M, skip_dev);
             else        mmvq_quant_kernel<block_q5_1, 32, dot_q5_1_q8_1, 8><<<grid_m8, block, 0, stream>>>(W, X_q8, Y, nullptr, nullptr, nullptr, 0, 0, N, K, M, nullptr);
+            break;
+        case GGML_TYPE_Q5_0:
+            if (M == 1) mmvq_quant_kernel<block_q5_0, 32, dot_q5_0_q8_1, 1><<<grid_m1, block, 0, stream>>>(W, X_q8, Y, conv_w, add_res, conv_history, conv_offset, n_conv, N, K, M, skip_dev);
+            else        mmvq_quant_kernel<block_q5_0, 32, dot_q5_0_q8_1, 8><<<grid_m8, block, 0, stream>>>(W, X_q8, Y, nullptr, nullptr, nullptr, 0, 0, N, K, M, nullptr);
             break;
         case GGML_TYPE_Q2_0:
             if (M == 1) mmvq_quant_kernel<block_q2_0, 64, dot_q2_0_q8_1, 1><<<grid_m1, block, 0, stream>>>(W, X_q8, Y, conv_w, add_res, conv_history, conv_offset, n_conv, N, K, M, skip_dev);

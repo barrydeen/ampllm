@@ -22,7 +22,7 @@ pub use mm3::{
 pub use quants::{
     dequantize_row_to_f32, ue4m3_to_f32, vec_dot_q_f32_ref, BlockIq1S, BlockIq2S, BlockIq2Xs,
     BlockIq2Xxs, BlockIq3S, BlockIq3Xxs, BlockIq4Nl, BlockIq4Xs, BlockNvfp4, BlockQ2_0, BlockQ3K,
-    BlockQ4K, BlockQ4_0, BlockQ5K, BlockQ5_1, BlockQ6K, BlockQ8_0, BlockQ8_1, KVALUES_IQ4NL,
-    KVALUES_NVFP4,
+    BlockQ4K, BlockQ4_0, BlockQ5K, BlockQ5_0, BlockQ5_1, BlockQ6K, BlockQ8_0, BlockQ8_1,
+    KVALUES_IQ4NL, KVALUES_NVFP4,
 };
 pub use qwen4::{Qwen4Config, Qwen4PleConfig, Qwen4VisionConfig};

@@ -7,6 +7,7 @@ use bytemuck::{Pod, Zeroable};
 use half::{bf16, f16};
 
 pub const QK4_0: usize = 32;
+pub const QK5_0: usize = 32;
 pub const QK5_1: usize = 32;
 pub const QK8_0: usize = 32;
 pub const QK4_NL: usize = 32;
@@ -30,6 +31,14 @@ pub const KVALUES_NVFP4: [i8; 16] = [
 pub struct BlockQ4_0 {
     pub d: [u8; 2],
     pub qs: [u8; QK4_0 / 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct BlockQ5_0 {
+    pub d: [u8; 2],
+    pub qh: [u8; 4],
+    pub qs: [u8; QK5_0 / 2],
 }
 
 #[repr(C)]
@@ -174,6 +183,7 @@ pub struct BlockIq3S {
 
 const _: () = {
     assert!(std::mem::size_of::<BlockQ4_0>() == 18);
+    assert!(std::mem::size_of::<BlockQ5_0>() == 22);
     assert!(std::mem::size_of::<BlockQ5_1>() == 24);
     assert!(std::mem::size_of::<BlockQ8_0>() == 34);
     assert!(std::mem::size_of::<BlockQ8_1>() == 36);
@@ -263,6 +273,20 @@ pub fn dequantize_row_to_f32(ggml_type: GgmlType, src: &[u8], dst: &mut [f32]) {
                     let x1 = ((b.qs[j] >> 4) as i32) - 8;
                     out[j] = d * (x0 as f32);
                     out[j + QK4_0 / 2] = d * (x1 as f32);
+                }
+            }
+        }
+        GgmlType::Q5_0 => {
+            assert_eq!(k % QK5_0, 0);
+            let blocks: &[BlockQ5_0] = bytemuck::cast_slice(src);
+            for (b, out) in blocks.iter().zip(dst.chunks_exact_mut(QK5_0)) {
+                let d = f16_bytes_to_f32(b.d);
+                let qh = u32::from_le_bytes(b.qh);
+                for j in 0..(QK5_0 / 2) {
+                    let x0 = (((b.qs[j] & 0x0F) | ((((qh >> j) & 1) as u8) << 4)) as i32) - 16;
+                    let x1 = (((b.qs[j] >> 4) | ((((qh >> (j + 16)) & 1) as u8) << 4)) as i32) - 16;
+                    out[j] = d * (x0 as f32);
+                    out[j + QK5_0 / 2] = d * (x1 as f32);
                 }
             }
         }
@@ -748,6 +772,21 @@ mod tests {
         let ones5 = vec![1.0f32; QK5_1];
         let expected_dot5: f32 = out5.iter().sum();
         assert!((vec_dot_q_f32_ref(GgmlType::Q5_1, bytemuck::bytes_of(&bq5), &ones5) - expected_dot5).abs() < 1e-4);
+
+        // Q5_0: same bit packing as Q5_1, signed (x - 16) * d
+        let bq5_0 = BlockQ5_0 {
+            d: f16::from_f32(0.5).to_le_bytes(),
+            qh: qh_bits.to_le_bytes(),
+            qs: qs5,
+        };
+        let mut out5_0 = vec![0.0f32; QK5_0];
+        dequantize_row_to_f32(GgmlType::Q5_0, bytemuck::bytes_of(&bq5_0), &mut out5_0);
+        assert_eq!(out5_0[0], 0.5 * (19.0 - 16.0));
+        assert_eq!(out5_0[1], 0.5 * (7.0 - 16.0));
+        assert_eq!(out5_0[16], 0.5 * (2.0 - 16.0));
+        assert_eq!(out5_0[17], 0.5 * (21.0 - 16.0));
+        let expected_dot5_0: f32 = out5_0.iter().sum();
+        assert!((vec_dot_q_f32_ref(GgmlType::Q5_0, bytemuck::bytes_of(&bq5_0), &ones5) - expected_dot5_0).abs() < 1e-4);
 
         // Q2_0: codes {0,1,2,3} -> {-1, 0, +1, +2} * d
         // byte 0xE4 = 0b11_10_01_00 -> codes [0, 1, 2, 3] -> values [-1, 0, +1, +2] * d

@@ -1,6 +1,31 @@
 use crate::pool::CpuThreadPool;
 use ampllm_gguf::GgmlType;
 use std::ffi::c_void;
+use std::sync::OnceLock;
+
+/// CPU SIMD tier used by `glm5_cpu` / `mm3_cpu` kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuIsaTier {
+    Avx512,
+    Avx2,
+    Scalar,
+}
+
+impl CpuIsaTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CpuIsaTier::Avx512 => "avx512",
+            CpuIsaTier::Avx2 => "avx2",
+            CpuIsaTier::Scalar => "scalar",
+        }
+    }
+}
+
+impl std::fmt::Display for CpuIsaTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 pub fn has_glm5_avx512() -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -18,16 +43,87 @@ pub fn has_glm5_avx512() -> bool {
     }
 }
 
+pub fn has_glm5_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("f16c")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Hardware-supported best CPU ISA tier on this machine.
+pub fn hw_cpu_isa() -> CpuIsaTier {
+    if has_glm5_avx512() {
+        CpuIsaTier::Avx512
+    } else if has_glm5_avx2() {
+        CpuIsaTier::Avx2
+    } else {
+        CpuIsaTier::Scalar
+    }
+}
+
+static ACTIVE_CPU_ISA: OnceLock<CpuIsaTier> = OnceLock::new();
+
+/// Active CPU ISA tier for C/C++ CPU kernels.
+/// Honors `AMPLLM_CPU_ISA` (`avx512`, `avx2`, `scalar`, `auto`), clamped to hardware support.
+pub fn active_cpu_isa() -> CpuIsaTier {
+    *ACTIVE_CPU_ISA.get_or_init(|| {
+        let hw = hw_cpu_isa();
+        match std::env::var("AMPLLM_CPU_ISA")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("auto") => hw,
+            Some("avx512") => {
+                if hw == CpuIsaTier::Avx512 {
+                    CpuIsaTier::Avx512
+                } else {
+                    eprintln!(
+                        "[cpu-isa] AMPLLM_CPU_ISA=avx512 requested, but CPU only supports {}; clamping",
+                        hw
+                    );
+                    hw
+                }
+            }
+            Some("avx2") => match hw {
+                CpuIsaTier::Avx512 | CpuIsaTier::Avx2 => CpuIsaTier::Avx2,
+                CpuIsaTier::Scalar => {
+                    eprintln!(
+                        "[cpu-isa] AMPLLM_CPU_ISA=avx2 requested, but CPU lacks AVX2+FMA+F16C; clamping to scalar"
+                    );
+                    CpuIsaTier::Scalar
+                }
+            },
+            Some("scalar") => CpuIsaTier::Scalar,
+            Some(other) => {
+                eprintln!(
+                    "[cpu-isa] unknown AMPLLM_CPU_ISA='{}' (expected auto|avx512|avx2|scalar); using {}",
+                    other, hw
+                );
+                hw
+            }
+        }
+    })
+}
+
 /// Size in bytes of one 256-element GGML `block_q8_K`.
 pub const Q8K_BLOCK_BYTES: usize = 292;
 /// Size in bytes of 8x 32-element `Q8_1` sub-blocks (`block_q8_1_g8`).
 pub const Q8_1_G8_BLOCK_BYTES: usize = 352;
 
-#[repr(C, align(64))]
+#[repr(C, align(4))]
 #[derive(Clone, Copy)]
 pub struct CpuBlockQ8K {
     pub raw: [u8; Q8K_BLOCK_BYTES],
 }
+
+const _: () = assert!(std::mem::size_of::<CpuBlockQ8K>() == Q8K_BLOCK_BYTES);
 
 impl Default for CpuBlockQ8K {
     fn default() -> Self {
@@ -59,108 +155,335 @@ impl Default for CpuBlockQ8_1G8 {
     }
 }
 
-extern "C" {
-    pub fn ampllm_cpu_quantize_q8_k(x: *const f32, out_q8k: *mut c_void, n: i32);
-    pub fn ampllm_cpu_quantize_q8_1_g8(x: *const f32, out_g8: *mut c_void, n: i32);
+mod ffi {
+    use std::ffi::c_void;
 
-    pub fn ampllm_cpu_iq_fused_gu_rows(
-        ggml_type: i32,
-        gate_w: *const u8,
-        up_w: *const u8,
-        row_bytes: usize,
-        n_in: i32,
-        x_q8k: *const *const c_void,
-        nt: i32,
-        ff_out: *const *mut f32,
-        r0: i32,
-        r1: i32,
-        swiglu_limit: f32,
-    );
+    extern "C" {
+        pub fn ampllm_cpu_quantize_q8_k(x: *const f32, out_q8k: *mut c_void, n: i32);
+        pub fn ampllm_cpu_quantize_q8_1_g8(x: *const f32, out_g8: *mut c_void, n: i32);
 
-    pub fn ampllm_cpu_iq_down_rows(
-        ggml_type: i32,
-        down_w: *const u8,
-        row_bytes: usize,
-        n_in: i32,
-        ff_q8k: *const *const c_void,
-        nt: i32,
-        out: *const *mut f32,
-        r0: i32,
-        r1: i32,
-        weight_scale: f32,
-        accumulate: i32,
-    );
+        pub fn ampllm_cpu_iq_fused_gu_rows(
+            ggml_type: i32,
+            gate_w: *const u8,
+            up_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            x_q8k: *const *const c_void,
+            nt: i32,
+            ff_out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            swiglu_limit: f32,
+        );
 
-    pub fn ampllm_cpu_hy4_fused_gu_rows(
-        ggml_type: i32,
-        gate_w: *const u8,
-        up_w: *const u8,
-        row_bytes: usize,
-        n_in: i32,
-        x_q8k: *const *const c_void,
-        nt: i32,
-        ff_out: *const *mut f32,
-        r0: i32,
-        r1: i32,
-        swiglu_limit: f32,
-    );
+        pub fn ampllm_cpu_iq_down_rows(
+            ggml_type: i32,
+            down_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            ff_q8k: *const *const c_void,
+            nt: i32,
+            out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            weight_scale: f32,
+            accumulate: i32,
+        );
 
-    pub fn ampllm_cpu_hy4_fused_gu_rows_q8_1(
-        ggml_type: i32,
-        gate_w: *const u8,
-        up_w: *const u8,
-        row_bytes: usize,
-        n_in: i32,
-        x_q8_1: *const *const c_void,
-        nt: i32,
-        ff_out: *const *mut f32,
-        r0: i32,
-        r1: i32,
-        swiglu_limit: f32,
-    );
+        pub fn ampllm_cpu_hy4_fused_gu_rows(
+            ggml_type: i32,
+            gate_w: *const u8,
+            up_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            x_q8k: *const *const c_void,
+            nt: i32,
+            ff_out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            swiglu_limit: f32,
+        );
 
-    pub fn ampllm_cpu_hy4_down_rows(
-        ggml_type: i32,
-        down_w: *const u8,
-        row_bytes: usize,
-        n_in: i32,
-        ff_q8k: *const *const c_void,
-        nt: i32,
-        out: *const *mut f32,
-        r0: i32,
-        r1: i32,
-        weight_scale: f32,
-        accumulate: i32,
-    );
+        pub fn ampllm_cpu_hy4_fused_gu_rows_q8_1(
+            ggml_type: i32,
+            gate_w: *const u8,
+            up_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            x_q8_1: *const *const c_void,
+            nt: i32,
+            ff_out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            swiglu_limit: f32,
+        );
 
-    pub fn ampllm_cpu_hy4_down_rows_q8_1(
-        ggml_type: i32,
-        down_w: *const u8,
-        row_bytes: usize,
-        n_in: i32,
-        ff_q8_1: *const *const c_void,
-        nt: i32,
-        out: *const *mut f32,
-        r0: i32,
-        r1: i32,
-        weight_scale: f32,
-        accumulate: i32,
-    );
+        pub fn ampllm_cpu_hy4_down_rows(
+            ggml_type: i32,
+            down_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            ff_q8k: *const *const c_void,
+            nt: i32,
+            out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            weight_scale: f32,
+            accumulate: i32,
+        );
 
-    pub fn ampllm_cpu_bf16_to_q8_0(
-        src_bf16: *const u16,
-        src_f32: *const f32,
-        rows: usize,
-        k: i32,
-        out_q8_0: *mut u8,
-    );
+        pub fn ampllm_cpu_hy4_down_rows_q8_1(
+            ggml_type: i32,
+            down_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            ff_q8_1: *const *const c_void,
+            nt: i32,
+            out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            weight_scale: f32,
+            accumulate: i32,
+        );
 
-    pub fn ampllm_cpu_tok_row_to_f32(
-        ggml_type: i32,
-        src: *const u8,
-        k: i32,
-        dst_f32: *mut f32,
-    );
+        pub fn ampllm_cpu_bf16_to_q8_0(
+            src_bf16: *const u16,
+            src_f32: *const f32,
+            rows: usize,
+            k: i32,
+            out_q8_0: *mut u8,
+        );
+
+        pub fn ampllm_cpu_tok_row_to_f32(
+            ggml_type: i32,
+            src: *const u8,
+            k: i32,
+            dst_f32: *mut f32,
+        );
+
+        // AVX2+FMA+F16C fallback symbols
+        pub fn ampllm_cpu_quantize_q8_k_avx2(x: *const f32, out_q8k: *mut c_void, n: i32);
+        pub fn ampllm_cpu_quantize_q8_1_g8_avx2(x: *const f32, out_g8: *mut c_void, n: i32);
+        pub fn ampllm_cpu_iq_fused_gu_rows_avx2(
+            ggml_type: i32,
+            gate_w: *const u8,
+            up_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            x_q8k: *const *const c_void,
+            nt: i32,
+            ff_out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            swiglu_limit: f32,
+        );
+        pub fn ampllm_cpu_iq_down_rows_avx2(
+            ggml_type: i32,
+            down_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            ff_q8k: *const *const c_void,
+            nt: i32,
+            out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            weight_scale: f32,
+            accumulate: i32,
+        );
+        pub fn ampllm_cpu_hy4_fused_gu_rows_avx2(
+            ggml_type: i32,
+            gate_w: *const u8,
+            up_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            x_q8k: *const *const c_void,
+            nt: i32,
+            ff_out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            swiglu_limit: f32,
+        );
+        pub fn ampllm_cpu_hy4_fused_gu_rows_q8_1_avx2(
+            ggml_type: i32,
+            gate_w: *const u8,
+            up_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            x_q8_1: *const *const c_void,
+            nt: i32,
+            ff_out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            swiglu_limit: f32,
+        );
+        pub fn ampllm_cpu_hy4_down_rows_avx2(
+            ggml_type: i32,
+            down_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            ff_q8k: *const *const c_void,
+            nt: i32,
+            out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            weight_scale: f32,
+            accumulate: i32,
+        );
+        pub fn ampllm_cpu_hy4_down_rows_q8_1_avx2(
+            ggml_type: i32,
+            down_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            ff_q8_1: *const *const c_void,
+            nt: i32,
+            out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            weight_scale: f32,
+            accumulate: i32,
+        );
+        pub fn ampllm_cpu_bf16_to_q8_0_avx2(
+            src_bf16: *const u16,
+            src_f32: *const f32,
+            rows: usize,
+            k: i32,
+            out_q8_0: *mut u8,
+        );
+        pub fn ampllm_cpu_tok_row_to_f32_avx2(
+            ggml_type: i32,
+            src: *const u8,
+            k: i32,
+            dst_f32: *mut f32,
+        );
+
+        // Portable scalar fallback symbols
+        pub fn ampllm_cpu_quantize_q8_k_scalar(x: *const f32, out_q8k: *mut c_void, n: i32);
+        pub fn ampllm_cpu_quantize_q8_1_g8_scalar(x: *const f32, out_g8: *mut c_void, n: i32);
+        pub fn ampllm_cpu_iq_fused_gu_rows_scalar(
+            ggml_type: i32,
+            gate_w: *const u8,
+            up_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            x_q8k: *const *const c_void,
+            nt: i32,
+            ff_out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            swiglu_limit: f32,
+        );
+        pub fn ampllm_cpu_iq_down_rows_scalar(
+            ggml_type: i32,
+            down_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            ff_q8k: *const *const c_void,
+            nt: i32,
+            out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            weight_scale: f32,
+            accumulate: i32,
+        );
+        pub fn ampllm_cpu_hy4_fused_gu_rows_scalar(
+            ggml_type: i32,
+            gate_w: *const u8,
+            up_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            x_q8k: *const *const c_void,
+            nt: i32,
+            ff_out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            swiglu_limit: f32,
+        );
+        pub fn ampllm_cpu_hy4_fused_gu_rows_q8_1_scalar(
+            ggml_type: i32,
+            gate_w: *const u8,
+            up_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            x_q8_1: *const *const c_void,
+            nt: i32,
+            ff_out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            swiglu_limit: f32,
+        );
+        pub fn ampllm_cpu_hy4_down_rows_scalar(
+            ggml_type: i32,
+            down_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            ff_q8k: *const *const c_void,
+            nt: i32,
+            out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            weight_scale: f32,
+            accumulate: i32,
+        );
+        pub fn ampllm_cpu_hy4_down_rows_q8_1_scalar(
+            ggml_type: i32,
+            down_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            ff_q8_1: *const *const c_void,
+            nt: i32,
+            out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            weight_scale: f32,
+            accumulate: i32,
+        );
+        pub fn ampllm_cpu_bf16_to_q8_0_scalar(
+            src_bf16: *const u16,
+            src_f32: *const f32,
+            rows: usize,
+            k: i32,
+            out_q8_0: *mut u8,
+        );
+        pub fn ampllm_cpu_tok_row_to_f32_scalar(
+            ggml_type: i32,
+            src: *const u8,
+            k: i32,
+            dst_f32: *mut f32,
+        );
+    }
+}
+
+/// Dispatched wrapper for `Q8_1_G8` quantization (honors `active_cpu_isa()`).
+#[inline(always)]
+pub unsafe fn ampllm_cpu_quantize_q8_1_g8(x: *const f32, out_g8: *mut c_void, n: i32) {
+    match active_cpu_isa() {
+        CpuIsaTier::Avx512 => ffi::ampllm_cpu_quantize_q8_1_g8(x, out_g8, n),
+        CpuIsaTier::Avx2 => ffi::ampllm_cpu_quantize_q8_1_g8_avx2(x, out_g8, n),
+        CpuIsaTier::Scalar => ffi::ampllm_cpu_quantize_q8_1_g8_scalar(x, out_g8, n),
+    }
+}
+
+/// Quantize a single vector `x[..n]` (`n % 32 == 0`) into `out_g8` using the active CPU ISA.
+#[inline]
+pub fn quantize_q8_1_g8_cpu(x: &[f32], out_g8: &mut [CpuBlockQ8_1G8]) {
+    debug_assert_eq!(x.len() % 32, 0);
+    debug_assert_eq!(out_g8.len(), x.len().div_ceil(256));
+    unsafe {
+        ampllm_cpu_quantize_q8_1_g8(
+            x.as_ptr(),
+            out_g8.as_mut_ptr() as *mut c_void,
+            x.len() as i32,
+        );
+    }
+}
+
+#[inline(always)]
+unsafe fn dispatch_quantize_q8_k(x: *const f32, out_q8k: *mut c_void, n: i32) {
+    match active_cpu_isa() {
+        CpuIsaTier::Avx512 => ffi::ampllm_cpu_quantize_q8_k(x, out_q8k, n),
+        CpuIsaTier::Avx2 => ffi::ampllm_cpu_quantize_q8_k_avx2(x, out_q8k, n),
+        CpuIsaTier::Scalar => ffi::ampllm_cpu_quantize_q8_k_scalar(x, out_q8k, n),
+    }
 }
 
 #[inline(always)]
@@ -178,48 +501,133 @@ unsafe fn dispatch_fused_gu_rows(
     r1: i32,
     swiglu_limit: f32,
 ) {
+    let isa = active_cpu_isa();
     if use_q8_1 && matches!(ggml_type, 12 | 13) {
-        ampllm_cpu_hy4_fused_gu_rows_q8_1(
-            ggml_type,
-            gate_w,
-            up_w,
-            row_bytes,
-            n_in,
-            x_q8k,
-            nt,
-            ff_out,
-            r0,
-            r1,
-            swiglu_limit,
-        );
-    } else if matches!(ggml_type, 7 | 8 | 12 | 13 | 14 | 23) {
-        ampllm_cpu_hy4_fused_gu_rows(
-            ggml_type,
-            gate_w,
-            up_w,
-            row_bytes,
-            n_in,
-            x_q8k,
-            nt,
-            ff_out,
-            r0,
-            r1,
-            swiglu_limit,
-        );
+        match isa {
+            CpuIsaTier::Avx512 => ffi::ampllm_cpu_hy4_fused_gu_rows_q8_1(
+                ggml_type,
+                gate_w,
+                up_w,
+                row_bytes,
+                n_in,
+                x_q8k,
+                nt,
+                ff_out,
+                r0,
+                r1,
+                swiglu_limit,
+            ),
+            CpuIsaTier::Avx2 => ffi::ampllm_cpu_hy4_fused_gu_rows_q8_1_avx2(
+                ggml_type,
+                gate_w,
+                up_w,
+                row_bytes,
+                n_in,
+                x_q8k,
+                nt,
+                ff_out,
+                r0,
+                r1,
+                swiglu_limit,
+            ),
+            CpuIsaTier::Scalar => ffi::ampllm_cpu_hy4_fused_gu_rows_q8_1_scalar(
+                ggml_type,
+                gate_w,
+                up_w,
+                row_bytes,
+                n_in,
+                x_q8k,
+                nt,
+                ff_out,
+                r0,
+                r1,
+                swiglu_limit,
+            ),
+        }
+    } else if matches!(ggml_type, 6 | 7 | 8 | 12 | 13 | 14 | 20 | 23 | 42) {
+        match isa {
+            CpuIsaTier::Avx512 => ffi::ampllm_cpu_hy4_fused_gu_rows(
+                ggml_type,
+                gate_w,
+                up_w,
+                row_bytes,
+                n_in,
+                x_q8k,
+                nt,
+                ff_out,
+                r0,
+                r1,
+                swiglu_limit,
+            ),
+            CpuIsaTier::Avx2 => ffi::ampllm_cpu_hy4_fused_gu_rows_avx2(
+                ggml_type,
+                gate_w,
+                up_w,
+                row_bytes,
+                n_in,
+                x_q8k,
+                nt,
+                ff_out,
+                r0,
+                r1,
+                swiglu_limit,
+            ),
+            CpuIsaTier::Scalar => ffi::ampllm_cpu_hy4_fused_gu_rows_scalar(
+                ggml_type,
+                gate_w,
+                up_w,
+                row_bytes,
+                n_in,
+                x_q8k,
+                nt,
+                ff_out,
+                r0,
+                r1,
+                swiglu_limit,
+            ),
+        }
     } else {
-        ampllm_cpu_iq_fused_gu_rows(
-            ggml_type,
-            gate_w,
-            up_w,
-            row_bytes,
-            n_in,
-            x_q8k,
-            nt,
-            ff_out,
-            r0,
-            r1,
-            swiglu_limit,
-        );
+        match isa {
+            CpuIsaTier::Avx512 => ffi::ampllm_cpu_iq_fused_gu_rows(
+                ggml_type,
+                gate_w,
+                up_w,
+                row_bytes,
+                n_in,
+                x_q8k,
+                nt,
+                ff_out,
+                r0,
+                r1,
+                swiglu_limit,
+            ),
+            CpuIsaTier::Avx2 => ffi::ampllm_cpu_iq_fused_gu_rows_avx2(
+                ggml_type,
+                gate_w,
+                up_w,
+                row_bytes,
+                n_in,
+                x_q8k,
+                nt,
+                ff_out,
+                r0,
+                r1,
+                swiglu_limit,
+            ),
+            CpuIsaTier::Scalar => ffi::ampllm_cpu_iq_fused_gu_rows_scalar(
+                ggml_type,
+                gate_w,
+                up_w,
+                row_bytes,
+                n_in,
+                x_q8k,
+                nt,
+                ff_out,
+                r0,
+                r1,
+                swiglu_limit,
+            ),
+        }
     }
 }
 
@@ -228,7 +636,7 @@ unsafe fn quantize_ff_blk(use_q8_1: bool, src: *const f32, dst: *mut c_void, n: 
     if use_q8_1 {
         ampllm_cpu_quantize_q8_1_g8(src, dst, n);
     } else {
-        ampllm_cpu_quantize_q8_k(src, dst, n);
+        dispatch_quantize_q8_k(src, dst, n);
     }
 }
 
@@ -246,48 +654,133 @@ unsafe fn dispatch_down_rows(
     weight_scale: f32,
     accumulate: i32,
 ) {
-    if matches!(ggml_type, 7 | 8) {
-        ampllm_cpu_hy4_down_rows_q8_1(
-            ggml_type,
-            down_w,
-            row_bytes,
-            n_in,
-            ff_q8,
-            nt,
-            out,
-            r0,
-            r1,
-            weight_scale,
-            accumulate,
-        );
+    let isa = active_cpu_isa();
+    if matches!(ggml_type, 6 | 7 | 8 | 20 | 42) {
+        match isa {
+            CpuIsaTier::Avx512 => ffi::ampllm_cpu_hy4_down_rows_q8_1(
+                ggml_type,
+                down_w,
+                row_bytes,
+                n_in,
+                ff_q8,
+                nt,
+                out,
+                r0,
+                r1,
+                weight_scale,
+                accumulate,
+            ),
+            CpuIsaTier::Avx2 => ffi::ampllm_cpu_hy4_down_rows_q8_1_avx2(
+                ggml_type,
+                down_w,
+                row_bytes,
+                n_in,
+                ff_q8,
+                nt,
+                out,
+                r0,
+                r1,
+                weight_scale,
+                accumulate,
+            ),
+            CpuIsaTier::Scalar => ffi::ampllm_cpu_hy4_down_rows_q8_1_scalar(
+                ggml_type,
+                down_w,
+                row_bytes,
+                n_in,
+                ff_q8,
+                nt,
+                out,
+                r0,
+                r1,
+                weight_scale,
+                accumulate,
+            ),
+        }
     } else if matches!(ggml_type, 12 | 13 | 14 | 23) {
-        ampllm_cpu_hy4_down_rows(
-            ggml_type,
-            down_w,
-            row_bytes,
-            n_in,
-            ff_q8,
-            nt,
-            out,
-            r0,
-            r1,
-            weight_scale,
-            accumulate,
-        );
+        match isa {
+            CpuIsaTier::Avx512 => ffi::ampllm_cpu_hy4_down_rows(
+                ggml_type,
+                down_w,
+                row_bytes,
+                n_in,
+                ff_q8,
+                nt,
+                out,
+                r0,
+                r1,
+                weight_scale,
+                accumulate,
+            ),
+            CpuIsaTier::Avx2 => ffi::ampllm_cpu_hy4_down_rows_avx2(
+                ggml_type,
+                down_w,
+                row_bytes,
+                n_in,
+                ff_q8,
+                nt,
+                out,
+                r0,
+                r1,
+                weight_scale,
+                accumulate,
+            ),
+            CpuIsaTier::Scalar => ffi::ampllm_cpu_hy4_down_rows_scalar(
+                ggml_type,
+                down_w,
+                row_bytes,
+                n_in,
+                ff_q8,
+                nt,
+                out,
+                r0,
+                r1,
+                weight_scale,
+                accumulate,
+            ),
+        }
     } else {
-        ampllm_cpu_iq_down_rows(
-            ggml_type,
-            down_w,
-            row_bytes,
-            n_in,
-            ff_q8,
-            nt,
-            out,
-            r0,
-            r1,
-            weight_scale,
-            accumulate,
-        );
+        match isa {
+            CpuIsaTier::Avx512 => ffi::ampllm_cpu_iq_down_rows(
+                ggml_type,
+                down_w,
+                row_bytes,
+                n_in,
+                ff_q8,
+                nt,
+                out,
+                r0,
+                r1,
+                weight_scale,
+                accumulate,
+            ),
+            CpuIsaTier::Avx2 => ffi::ampllm_cpu_iq_down_rows_avx2(
+                ggml_type,
+                down_w,
+                row_bytes,
+                n_in,
+                ff_q8,
+                nt,
+                out,
+                r0,
+                r1,
+                weight_scale,
+                accumulate,
+            ),
+            CpuIsaTier::Scalar => ffi::ampllm_cpu_iq_down_rows_scalar(
+                ggml_type,
+                down_w,
+                row_bytes,
+                n_in,
+                ff_q8,
+                nt,
+                out,
+                r0,
+                r1,
+                weight_scale,
+                accumulate,
+            ),
+        }
     }
 }
 
@@ -297,13 +790,29 @@ pub fn bf16_to_q8_0_cpu(src_bf16: &[u16], rows: usize, k: usize, out: &mut [u8])
     debug_assert!(src_bf16.len() >= rows * k);
     debug_assert!(out.len() >= rows * (k / 32) * 34);
     unsafe {
-        ampllm_cpu_bf16_to_q8_0(
-            src_bf16.as_ptr(),
-            std::ptr::null(),
-            rows,
-            k as i32,
-            out.as_mut_ptr(),
-        );
+        match active_cpu_isa() {
+            CpuIsaTier::Avx512 => ffi::ampllm_cpu_bf16_to_q8_0(
+                src_bf16.as_ptr(),
+                std::ptr::null(),
+                rows,
+                k as i32,
+                out.as_mut_ptr(),
+            ),
+            CpuIsaTier::Avx2 => ffi::ampllm_cpu_bf16_to_q8_0_avx2(
+                src_bf16.as_ptr(),
+                std::ptr::null(),
+                rows,
+                k as i32,
+                out.as_mut_ptr(),
+            ),
+            CpuIsaTier::Scalar => ffi::ampllm_cpu_bf16_to_q8_0_scalar(
+                src_bf16.as_ptr(),
+                std::ptr::null(),
+                rows,
+                k as i32,
+                out.as_mut_ptr(),
+            ),
+        }
     }
 }
 
@@ -313,13 +822,29 @@ pub fn f32_to_q8_0_cpu(src_f32: &[f32], rows: usize, k: usize, out: &mut [u8]) {
     debug_assert!(src_f32.len() >= rows * k);
     debug_assert!(out.len() >= rows * (k / 32) * 34);
     unsafe {
-        ampllm_cpu_bf16_to_q8_0(
-            std::ptr::null(),
-            src_f32.as_ptr(),
-            rows,
-            k as i32,
-            out.as_mut_ptr(),
-        );
+        match active_cpu_isa() {
+            CpuIsaTier::Avx512 => ffi::ampllm_cpu_bf16_to_q8_0(
+                std::ptr::null(),
+                src_f32.as_ptr(),
+                rows,
+                k as i32,
+                out.as_mut_ptr(),
+            ),
+            CpuIsaTier::Avx2 => ffi::ampllm_cpu_bf16_to_q8_0_avx2(
+                std::ptr::null(),
+                src_f32.as_ptr(),
+                rows,
+                k as i32,
+                out.as_mut_ptr(),
+            ),
+            CpuIsaTier::Scalar => ffi::ampllm_cpu_bf16_to_q8_0_scalar(
+                std::ptr::null(),
+                src_f32.as_ptr(),
+                rows,
+                k as i32,
+                out.as_mut_ptr(),
+            ),
+        }
     }
 }
 
@@ -327,7 +852,17 @@ pub fn f32_to_q8_0_cpu(src_f32: &[f32], rows: usize, k: usize, out: &mut [u8]) {
 pub fn tok_row_to_f32_cpu(ty: GgmlType, src: &[u8], dst: &mut [f32]) {
     debug_assert!(src.len() >= ty.row_bytes(dst.len()));
     unsafe {
-        ampllm_cpu_tok_row_to_f32(ty as i32, src.as_ptr(), dst.len() as i32, dst.as_mut_ptr());
+        match active_cpu_isa() {
+            CpuIsaTier::Avx512 => {
+                ffi::ampllm_cpu_tok_row_to_f32(ty as i32, src.as_ptr(), dst.len() as i32, dst.as_mut_ptr())
+            }
+            CpuIsaTier::Avx2 => {
+                ffi::ampllm_cpu_tok_row_to_f32_avx2(ty as i32, src.as_ptr(), dst.len() as i32, dst.as_mut_ptr())
+            }
+            CpuIsaTier::Scalar => {
+                ffi::ampllm_cpu_tok_row_to_f32_scalar(ty as i32, src.as_ptr(), dst.len() as i32, dst.as_mut_ptr())
+            }
+        }
     }
 }
 
@@ -336,7 +871,7 @@ pub fn quantize_f32_to_q8_k_cpu(x: &[f32], out: &mut [CpuBlockQ8K]) {
     debug_assert_eq!(x.len() % 32, 0);
     debug_assert_eq!(out.len(), x.len().div_ceil(256));
     unsafe {
-        ampllm_cpu_quantize_q8_k(x.as_ptr(), out.as_mut_ptr() as *mut c_void, x.len() as i32);
+        dispatch_quantize_q8_k(x.as_ptr(), out.as_mut_ptr() as *mut c_void, x.len() as i32);
     }
 }
 
@@ -433,7 +968,10 @@ pub fn run_glm5_cpu_moe_m1(
     let dn_rb = dn_type.row_bytes(n_ff);
     let gu_ty_i = gu_type as i32;
     let dn_ty_i = dn_type as i32;
-    let use_q8_1 = matches!(dn_type, GgmlType::Q5_1 | GgmlType::Q8_0);
+    let use_q8_1 = matches!(
+        dn_type,
+        GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::Iq4Nl | GgmlType::Q2_0
+    );
     let fq_blk_bytes = if use_q8_1 {
         Q8_1_G8_BLOCK_BYTES
     } else {
@@ -684,7 +1222,7 @@ pub fn quantize_glm5_cpu_x_q8k(
         pool.parallel_for(m_tokens, |t0, t1| {
             for t in t0..t1 {
                 unsafe {
-                    ampllm_cpu_quantize_q8_k(
+                    dispatch_quantize_q8_k(
                         (x_f32_base as *const f32).add(t * n_embd),
                         (x_q8k_base as *mut CpuBlockQ8K).add(t * nb_x) as *mut c_void,
                         n_embd as i32,
@@ -768,7 +1306,10 @@ pub fn run_glm5_cpu_moe_grouped_prequant(
     let dn_rb = dn_type.row_bytes(n_ff);
     let gu_ty_i = gu_type as i32;
     let dn_ty_i = dn_type as i32;
-    let use_q8_1 = matches!(dn_type, GgmlType::Q5_1 | GgmlType::Q8_0);
+    let use_q8_1 = matches!(
+        dn_type,
+        GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::Iq4Nl | GgmlType::Q2_0
+    );
     let fq_blk_bytes = if use_q8_1 {
         Q8_1_G8_BLOCK_BYTES
     } else {
@@ -1045,7 +1586,10 @@ pub fn run_glm5_cpu_moe_grouped_small(
         }
         return;
     }
-    let q8_1_dn = matches!(dn_type, GgmlType::Q5_1 | GgmlType::Q8_0);
+    let q8_1_dn = matches!(
+        dn_type,
+        GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::Iq4Nl | GgmlType::Q2_0
+    );
     if m_tokens > 8
         || groups.len() > 80
         || n_ff == 0
@@ -1144,7 +1688,10 @@ pub fn run_glm5_cpu_moe_grouped_small(
     let dn_rb = dn_type.row_bytes(n_ff);
     let gu_ty_i = gu_type as i32;
     let dn_ty_i = dn_type as i32;
-    let use_q8_1 = matches!(dn_type, GgmlType::Q5_1 | GgmlType::Q8_0);
+    let use_q8_1 = matches!(
+        dn_type,
+        GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::Iq4Nl | GgmlType::Q2_0
+    );
     let use_x_q8_1 = matches!(gu_type, GgmlType::Q4K | GgmlType::Q5K);
     let fq_blk_bytes = if use_q8_1 {
         Q8_1_G8_BLOCK_BYTES

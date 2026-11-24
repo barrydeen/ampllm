@@ -55,6 +55,17 @@ fn fill_random_quant_rows(ty: GgmlType, n: usize, k: usize, seed: u64) -> Vec<u8
                     }
                 }
             }
+            GgmlType::Q5_0 => {
+                let nb = k / 32;
+                for b in 0..nb {
+                    let off = b * 22;
+                    let d = f16::from_f32(0.02 + rng.next_f32().abs() * 0.06).to_le_bytes();
+                    dst[off..off + 2].copy_from_slice(&d);
+                    for j in 2..22 {
+                        dst[off + j] = (rng.next_u32() & 0xFF) as u8;
+                    }
+                }
+            }
             GgmlType::Q5_1 => {
                 let nb = k / 32;
                 for b in 0..nb {
@@ -64,6 +75,17 @@ fn fill_random_quant_rows(ty: GgmlType, n: usize, k: usize, seed: u64) -> Vec<u8
                     dst[off..off + 2].copy_from_slice(&d);
                     dst[off + 2..off + 4].copy_from_slice(&m);
                     for j in 4..24 {
+                        dst[off + j] = (rng.next_u32() & 0xFF) as u8;
+                    }
+                }
+            }
+            GgmlType::Q2_0 => {
+                let nb = k / 64;
+                for b in 0..nb {
+                    let off = b * 18;
+                    let d = f16::from_f32(0.03 + rng.next_f32().abs() * 0.06).to_le_bytes();
+                    dst[off..off + 2].copy_from_slice(&d);
+                    for j in 2..18 {
                         dst[off + j] = (rng.next_u32() & 0xFF) as u8;
                     }
                 }
@@ -221,10 +243,7 @@ fn test_cpu_simd_quant_parity_and_iq4nl_bench() {
 
 #[test]
 fn test_glm5_avx512_iq_and_q_k_parity_and_16core_bw() {
-    if !ampllm_cpu_kernels::glm5_cpu::has_glm5_avx512() {
-        eprintln!("skipping test_glm5_avx512_iq_and_q_k_parity_and_16core_bw: CPU lacks AVX-512 VNNI/VPOPCNTDQ");
-        return;
-    }
+    println!("Testing GLM5 CPU ISA tier: {}", ampllm_cpu_kernels::active_cpu_isa());
     let n_embd = 4096usize;
     let n_ff = 2048usize;
     let clamp = 10.0f32;
@@ -455,10 +474,6 @@ fn test_glm5_avx512_iq_and_q_k_parity_and_16core_bw() {
 
 #[test]
 fn test_glm5_wide_gu_and_prequant_parity() {
-    if !ampllm_cpu_kernels::glm5_cpu::has_glm5_avx512() {
-        eprintln!("skipping test_glm5_wide_gu_and_prequant_parity: CPU lacks AVX-512 VNNI/VPOPCNTDQ");
-        return;
-    }
     let n_embd = 4096usize;
     let n_ff = 2048usize;
     let clamp = 10.0f32;
@@ -575,10 +590,6 @@ fn test_glm5_wide_gu_and_prequant_parity() {
 
 #[test]
 fn test_hy4_avx512_iq4xs_q5k_q6k_q80_parity() {
-    if !ampllm_cpu_kernels::glm5_cpu::has_glm5_avx512() {
-        eprintln!("skipping test_hy4_avx512_iq4xs_q5k_q6k_q80_parity: CPU lacks AVX-512 VNNI");
-        return;
-    }
     let n_embd = 1536usize;
     let n_ff = 1536usize;
     let clamp = 7.0f32;
@@ -709,7 +720,14 @@ fn test_hy4_avx512_iq4xs_q5k_q6k_q80_parity() {
                 u = u.clamp(-clamp, clamp);
                 ff[r] = (g / (1.0 + (-g).exp())) * u;
             }
-            let ff_dq = quant_dequant(&ff, n_ff, matches!(ty, GgmlType::Q5_1 | GgmlType::Q8_0));
+            let ff_dq = quant_dequant(
+                &ff,
+                n_ff,
+                matches!(
+                    ty,
+                    GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::Iq4Nl | GgmlType::Q2_0
+                ),
+            );
             let mut out = vec![0.0f32; n_embd];
             let mut d_row = vec![0.0f32; n_ff];
             for r in 0..n_embd {
@@ -890,7 +908,10 @@ fn test_qwen4_avx512_q4k_q51_q80_640_and_iq4nl_parity() {
             ff[r] = (g / (1.0 + (-g).exp())) * u;
         }
         let ff_vec = if quant_act {
-            if matches!(dn_ty, GgmlType::Q5_1 | GgmlType::Q8_0) {
+            if matches!(
+                dn_ty,
+                GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::Q8_0 | GgmlType::Iq4Nl | GgmlType::Q2_0
+            ) {
                 let mut ff_q81 = vec![CpuBlockQ8_1G8::default(); n_ff.div_ceil(256)];
                 for b in 0..ff_q81.len() {
                     let b0 = b * 256;
@@ -926,6 +947,11 @@ fn test_qwen4_avx512_q4k_q51_q80_640_and_iq4nl_parity() {
         (GgmlType::Q5K, GgmlType::Q8_0, 2560usize, 640usize, 7usize, 2u64),
         (GgmlType::Q4K, GgmlType::Q5_1, 512usize, 288usize, 4usize, 3u64),
         (GgmlType::Q4K, GgmlType::Q8_0, 512usize, 352usize, 2usize, 4u64),
+        (GgmlType::Iq4Nl, GgmlType::Iq4Nl, 2560usize, 640usize, 8usize, 5u64),
+        (GgmlType::Q5_0, GgmlType::Q5_0, 2560usize, 640usize, 7usize, 6u64),
+        (GgmlType::Iq3S, GgmlType::Iq4Nl, 2560usize, 640usize, 8usize, 7u64),
+        (GgmlType::Q4K, GgmlType::Q5_0, 1536usize, 1536usize, 6usize, 8u64),
+        (GgmlType::Q2_0, GgmlType::Q2_0, 2560usize, 640usize, 8usize, 9u64),
     ];
 
     for (gu_ty, dn_ty, n_embd, n_ff, m_toks, seed) in configs {
@@ -1117,8 +1143,16 @@ fn test_qwen4_avx512_q4k_q51_q80_640_and_iq4nl_parity() {
         }
     }
 
-    // `tok_row_to_f32_cpu` parity for Qwen3.8 PLE `IQ4_NL` (`k=160`) and `Q5_1` (`k=640`)
-    for (ty, k) in [(GgmlType::Iq4Nl, 160usize), (GgmlType::Iq4Nl, 2560usize), (GgmlType::Q5_1, 640usize)] {
+    // `tok_row_to_f32_cpu` parity for Qwen3.8 PLE / embeddings (`k=160`, `2560`, `640`)
+    for (ty, k) in [
+        (GgmlType::Iq4Nl, 160usize),
+        (GgmlType::Iq4Nl, 2560usize),
+        (GgmlType::Q5_1, 640usize),
+        (GgmlType::Q5_0, 640usize),
+        (GgmlType::Q2_0, 640usize),
+        (GgmlType::Q4_0, 640usize),
+        (GgmlType::Q3K, 512usize),
+    ] {
         let w = fill_random_quant_rows(ty, 1, k, 991 + k as u64);
         let mut fast = vec![0.0f32; k];
         let mut ref_deq = vec![0.0f32; k];
@@ -1136,10 +1170,6 @@ fn test_qwen4_avx512_q4k_q51_q80_640_and_iq4nl_parity() {
 
 #[test]
 fn test_mm3_avx512_iq2xxs_iq2xs_iq1s_and_mixed_swigluoai_parity() {
-    if !ampllm_cpu_kernels::glm5_cpu::has_glm5_avx512() {
-        eprintln!("skipping MM3 AVX-512 parity test: host lacks required AVX-512 ISA");
-        return;
-    }
 
     let fill_mm3_rows = |ty: GgmlType, n: usize, k: usize, seed: u64| -> Vec<u8> {
         let mut rng = Rng(seed);

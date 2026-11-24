@@ -146,7 +146,7 @@ template <> struct FmtX<21> { // IQ3_S
 template <int TY, int NT>
 void gu_fused_iq(const uint8_t* gate_w, const uint8_t* up_w, size_t row_bytes, int n,
                  const void* const* act, float* const* ff, int r0, int r1, float swiglu_limit) {
-    const bool clamp = std::isfinite(swiglu_limit);
+    const bool clamp = std::isfinite(swiglu_limit) && swiglu_limit > 0.0f;
     const block_q8_K* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*)act[t];
     const int nb = n / QK_K;
@@ -459,7 +459,7 @@ template <int TY>
 void gu_fused_iq_wide(const uint8_t* gate_w, const uint8_t* up_w, size_t row_bytes, int n,
                       const void* const* act, int T, float* const* ff, int r0, int r1, float swiglu_limit) {
     constexpr int kTile = 16, kRows = 4;
-    const bool clamp = std::isfinite(swiglu_limit);
+    const bool clamp = std::isfinite(swiglu_limit) && swiglu_limit > 0.0f;
     const int nb = n / QK_K;
     static thread_local std::vector<uint8_t> ubuf;
     static thread_local std::vector<float> accg, accu;
@@ -677,7 +677,7 @@ void ampllm_cpu_iq_fused_gu_rows(
         case 22: gu_fused_nt<22>(nt, gate_w, up_w, row_bytes, n_in, x_q8k, ff_out, r0, r1, swiglu_limit); break;
         case 11: {
             const int nb = n_in / QK_K;
-            const bool clamp = std::isfinite(swiglu_limit);
+            const bool clamp = std::isfinite(swiglu_limit) && swiglu_limit > 0.0f;
             for (int r = r0; r < r1; ++r) {
                 const block_q3_K* gr = (const block_q3_K*)(gate_w + (size_t)r * row_bytes);
                 const block_q3_K* ur = (const block_q3_K*)(up_w + (size_t)r * row_bytes);

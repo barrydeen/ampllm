@@ -27,6 +27,13 @@ struct block_q8_1_g8 {
 };
 static_assert(sizeof(block_q8_1_g8) == 352, "block_q8_1_g8 size mismatch");
 
+struct block_q5_0 {
+    uint16_t d;
+    uint8_t qh[4];
+    uint8_t qs[16];
+};
+static_assert(sizeof(block_q5_0) == 22, "block_q5_0 size mismatch");
+
 struct block_q5_1 {
     uint16_t d;
     uint16_t m;
@@ -34,6 +41,12 @@ struct block_q5_1 {
     uint8_t qs[16];
 };
 static_assert(sizeof(block_q5_1) == 24, "block_q5_1 size mismatch");
+
+struct block_q2_0 {
+    uint16_t d;
+    uint8_t qs[16];
+};
+static_assert(sizeof(block_q2_0) == 18, "block_q2_0 size mismatch");
 
 struct block_iq4_nl {
     uint16_t d;
@@ -82,14 +95,18 @@ static_assert(sizeof(block_iq4_xs) == 136, "block_iq4_xs size mismatch");
 
 constexpr int GGML_TYPE_F32 = 0;
 constexpr int GGML_TYPE_F16 = 1;
+constexpr int GGML_TYPE_Q4_0 = 2;
+constexpr int GGML_TYPE_Q5_0 = 6;
 constexpr int GGML_TYPE_Q5_1 = 7;
 constexpr int GGML_TYPE_Q8_0 = 8;
+constexpr int GGML_TYPE_Q3_K = 11;
 constexpr int GGML_TYPE_Q4_K = 12;
 constexpr int GGML_TYPE_Q5_K = 13;
 constexpr int GGML_TYPE_Q6_K = 14;
 constexpr int GGML_TYPE_IQ4_NL = 20;
 constexpr int GGML_TYPE_IQ4_XS = 23;
 constexpr int GGML_TYPE_BF16 = 30;
+constexpr int GGML_TYPE_Q2_0 = 42;
 
 constexpr int kPrefetchAhead = 2048;
 
@@ -932,6 +949,307 @@ void dot_rows_q5_1(
     }
 }
 
+template <int NT, typename PrepT = PrepQ8_0>
+void dot_rows_iq4_nl(
+    const uint8_t* w,
+    size_t rb,
+    int n_in,
+    const PrepT* const* xp,
+    int r0,
+    int r1,
+    float* const* acc_out
+) {
+    const __m256i m0f_256 = _mm256_set1_epi8(0x0F);
+    const __m512i lut = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i*)KVALUES_IQ4NL_U8));
+    const int nb_full = n_in / QK_K;
+    const int rem32 = (n_in - nb_full * QK_K) / 32;
+
+    auto load_iq4_nl_pair = [&](const block_iq4_nl* b0, const block_iq4_nl* b1) -> __m512i {
+        const __m128i q0 = _mm_loadu_si128((const __m128i*)b0->qs);
+        const __m128i q1 = b1 ? _mm_loadu_si128((const __m128i*)b1->qs) : _mm_setzero_si128();
+        const __m256i q01 = _mm256_set_m128i(q1, q0);
+        const __m256i lo = _mm256_and_si256(q01, m0f_256);
+        const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q01, 4), m0f_256);
+        const __m256i wb0 = _mm256_permute2x128_si256(lo, hi, 0x20);
+        const __m256i wb1 = _mm256_permute2x128_si256(lo, hi, 0x31);
+        const __m512i w4b = _mm512_inserti64x4(_mm512_castsi256_si512(wb0), wb1, 1);
+        return _mm512_shuffle_epi8(lut, w4b);
+    };
+
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = w + (size_t)r * rb;
+        __m256 accf[NT];
+        for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+
+        for (int i = 0; i < nb_full; ++i) {
+            const auto* b = reinterpret_cast<const block_iq4_nl*>(row + (size_t)(i * 8) * sizeof(block_iq4_nl));
+            _mm_prefetch((const char*)b + kPrefetchAhead, _MM_HINT_T0);
+            _mm_prefetch((const char*)b + kPrefetchAhead + 64, _MM_HINT_T0);
+
+            uint16_t dh[8];
+            for (int k = 0; k < 8; ++k) std::memcpy(&dh[k], &b[k].d, 2);
+            const __m256 dw8 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)dh));
+
+            const __m512i w01 = load_iq4_nl_pair(&b[0], &b[1]);
+            const __m512i w23 = load_iq4_nl_pair(&b[2], &b[3]);
+            const __m512i w45 = load_iq4_nl_pair(&b[4], &b[5]);
+            const __m512i w67 = load_iq4_nl_pair(&b[6], &b[7]);
+
+            for (int t = 0; t < NT; ++t) {
+                const PrepT& ax = xp[t][i];
+                const __m512i p01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, ax.x01);
+                const __m512i p23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, ax.x23);
+                const __m512i p45 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w45, ax.x45);
+                const __m512i p67 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w67, ax.x67);
+                const __m256i s8 = _mm256_sub_epi32(reduce8_quad_to_256(p01, p23, p45, p67), ax.bias8);
+                __m256 d_ax;
+                if constexpr (std::is_same_v<PrepT, PrepQ8_0_Q81>) {
+                    d_ax = ax.d8;
+                } else {
+                    d_ax = _mm256_set1_ps(ax.d);
+                }
+                accf[t] = _mm256_fmadd_ps(_mm256_mul_ps(dw8, d_ax), _mm256_cvtepi32_ps(s8), accf[t]);
+            }
+        }
+        if (rem32 > 0) {
+            const auto* bt = reinterpret_cast<const block_iq4_nl*>(row + (size_t)(nb_full * 8) * sizeof(block_iq4_nl));
+            uint16_t dh[8] = {};
+            for (int k = 0; k < rem32; ++k) std::memcpy(&dh[k], &bt[k].d, 2);
+            const __m256 dw8 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)dh));
+            auto load_tail = [&](int p) -> __m512i {
+                const int k0 = 2 * p, k1 = 2 * p + 1;
+                if (k1 < rem32) return load_iq4_nl_pair(&bt[k0], &bt[k1]);
+                if (k0 < rem32) return load_iq4_nl_pair(&bt[k0], nullptr);
+                return _mm512_setzero_si512();
+            };
+            const __m512i w01 = load_tail(0);
+            const __m512i w23 = load_tail(1);
+            const __m512i w45 = load_tail(2);
+            const __m512i w67 = load_tail(3);
+            for (int t = 0; t < NT; ++t) {
+                const PrepT& ax = xp[t][nb_full];
+                const __m512i p01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, ax.x01);
+                const __m512i p23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, ax.x23);
+                const __m512i p45 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w45, ax.x45);
+                const __m512i p67 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w67, ax.x67);
+                const __m256i s8 = _mm256_sub_epi32(reduce8_quad_to_256(p01, p23, p45, p67), ax.bias8);
+                __m256 d_ax;
+                if constexpr (std::is_same_v<PrepT, PrepQ8_0_Q81>) {
+                    d_ax = ax.d8;
+                } else {
+                    d_ax = _mm256_set1_ps(ax.d);
+                }
+                accf[t] = _mm256_fmadd_ps(_mm256_mul_ps(dw8, d_ax), _mm256_cvtepi32_ps(s8), accf[t]);
+            }
+        }
+        for (int t = 0; t < NT; ++t) {
+            acc_out[t][r - r0] = hsum_f32_256(accf[t]);
+        }
+    }
+}
+
+template <int NT, typename PrepT = PrepQ8_0>
+void dot_rows_q5_0(
+    const uint8_t* w,
+    size_t rb,
+    int n_in,
+    const PrepT* const* xp,
+    int r0,
+    int r1,
+    float* const* acc_out
+) {
+    const __m256i m0f_256 = _mm256_set1_epi8(0x0F);
+    const __m512i v16 = _mm512_set1_epi8(16);
+    const int nb_full = n_in / QK_K;
+    const int rem32 = (n_in - nb_full * QK_K) / 32;
+
+    auto load_q5_0_pair = [&](const block_q5_0* b0, const block_q5_0* b1) -> __m512i {
+        const __m128i q0 = _mm_loadu_si128((const __m128i*)b0->qs);
+        const __m128i q1 = b1 ? _mm_loadu_si128((const __m128i*)b1->qs) : _mm_setzero_si128();
+        const __m256i q01 = _mm256_set_m128i(q1, q0);
+        const __m256i lo = _mm256_and_si256(q01, m0f_256);
+        const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q01, 4), m0f_256);
+        const __m256i wb0 = _mm256_permute2x128_si256(lo, hi, 0x20);
+        const __m256i wb1 = _mm256_permute2x128_si256(lo, hi, 0x31);
+        const __m512i w4b = _mm512_inserti64x4(_mm512_castsi256_si512(wb0), wb1, 1);
+        uint32_t qh0 = 0, qh1 = 0;
+        std::memcpy(&qh0, b0->qh, 4);
+        if (b1) std::memcpy(&qh1, b1->qh, 4);
+        const __mmask64 km = (__mmask64)(((uint64_t)qh1 << 32) | (uint64_t)qh0);
+        return _mm512_mask_add_epi8(w4b, km, w4b, v16);
+    };
+
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = w + (size_t)r * rb;
+        __m256 accf[NT];
+        for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+
+        for (int i = 0; i < nb_full; ++i) {
+            const auto* b = reinterpret_cast<const block_q5_0*>(row + (size_t)(i * 8) * sizeof(block_q5_0));
+            _mm_prefetch((const char*)b + kPrefetchAhead, _MM_HINT_T0);
+            _mm_prefetch((const char*)b + kPrefetchAhead + 64, _MM_HINT_T0);
+
+            uint16_t dh[8];
+            for (int k = 0; k < 8; ++k) std::memcpy(&dh[k], &b[k].d, 2);
+            const __m256 dw8 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)dh));
+
+            const __m512i w01 = load_q5_0_pair(&b[0], &b[1]);
+            const __m512i w23 = load_q5_0_pair(&b[2], &b[3]);
+            const __m512i w45 = load_q5_0_pair(&b[4], &b[5]);
+            const __m512i w67 = load_q5_0_pair(&b[6], &b[7]);
+
+            for (int t = 0; t < NT; ++t) {
+                const PrepT& ax = xp[t][i];
+                const __m512i p01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, ax.x01);
+                const __m512i p23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, ax.x23);
+                const __m512i p45 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w45, ax.x45);
+                const __m512i p67 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w67, ax.x67);
+                const __m256i bias16 = _mm256_srai_epi32(ax.bias8, 3);
+                const __m256i s8 = _mm256_sub_epi32(reduce8_quad_to_256(p01, p23, p45, p67), bias16);
+                __m256 d_ax;
+                if constexpr (std::is_same_v<PrepT, PrepQ8_0_Q81>) {
+                    d_ax = ax.d8;
+                } else {
+                    d_ax = _mm256_set1_ps(ax.d);
+                }
+                accf[t] = _mm256_fmadd_ps(_mm256_mul_ps(dw8, d_ax), _mm256_cvtepi32_ps(s8), accf[t]);
+            }
+        }
+        if (rem32 > 0) {
+            const auto* bt = reinterpret_cast<const block_q5_0*>(row + (size_t)(nb_full * 8) * sizeof(block_q5_0));
+            uint16_t dh[8] = {};
+            for (int k = 0; k < rem32; ++k) std::memcpy(&dh[k], &bt[k].d, 2);
+            const __m256 dw8 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)dh));
+            auto load_tail = [&](int p) -> __m512i {
+                const int k0 = 2 * p, k1 = 2 * p + 1;
+                if (k1 < rem32) return load_q5_0_pair(&bt[k0], &bt[k1]);
+                if (k0 < rem32) return load_q5_0_pair(&bt[k0], nullptr);
+                return _mm512_setzero_si512();
+            };
+            const __m512i w01 = load_tail(0);
+            const __m512i w23 = load_tail(1);
+            const __m512i w45 = load_tail(2);
+            const __m512i w67 = load_tail(3);
+            for (int t = 0; t < NT; ++t) {
+                const PrepT& ax = xp[t][nb_full];
+                const __m512i p01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, ax.x01);
+                const __m512i p23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, ax.x23);
+                const __m512i p45 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w45, ax.x45);
+                const __m512i p67 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w67, ax.x67);
+                const __m256i bias16 = _mm256_srai_epi32(ax.bias8, 3);
+                const __m256i s8 = _mm256_sub_epi32(reduce8_quad_to_256(p01, p23, p45, p67), bias16);
+                __m256 d_ax;
+                if constexpr (std::is_same_v<PrepT, PrepQ8_0_Q81>) {
+                    d_ax = ax.d8;
+                } else {
+                    d_ax = _mm256_set1_ps(ax.d);
+                }
+                accf[t] = _mm256_fmadd_ps(_mm256_mul_ps(dw8, d_ax), _mm256_cvtepi32_ps(s8), accf[t]);
+            }
+        }
+        for (int t = 0; t < NT; ++t) {
+            acc_out[t][r - r0] = hsum_f32_256(accf[t]);
+        }
+    }
+}
+
+template <int NT, typename PrepT = PrepQ8_0>
+void dot_rows_q2_0(
+    const uint8_t* w,
+    size_t rb,
+    int n_in,
+    const PrepT* const* xp,
+    int r0,
+    int r1,
+    float* const* acc_out
+) {
+    const __m512i m03_0 = _mm512_set1_epi32(0x00000003);
+    const __m512i m03_1 = _mm512_set1_epi32(0x00000300);
+    const __m512i m03_2 = _mm512_set1_epi32(0x00030000);
+    const __m512i m03_3 = _mm512_set1_epi32(0x03000000);
+    const __m256i dup_idx = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3);
+    const int nb_full = n_in / QK_K;
+    const int rem64 = (n_in - nb_full * QK_K) / 64;
+
+    auto unpack_q2_0_blk = [&](const block_q2_0* b) -> __m512i {
+        const __m512i v = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)b->qs));
+        const __m512i e0 = _mm512_and_si512(v, m03_0);
+        const __m512i e1 = _mm512_and_si512(_mm512_slli_epi32(v, 6), m03_1);
+        const __m512i e2 = _mm512_and_si512(_mm512_slli_epi32(v, 12), m03_2);
+        const __m512i e3 = _mm512_and_si512(_mm512_slli_epi32(v, 18), m03_3);
+        return _mm512_or_si512(_mm512_or_si512(e0, e1), _mm512_or_si512(e2, e3));
+    };
+
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* row = w + (size_t)r * rb;
+        __m256 accf[NT];
+        for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+
+        for (int i = 0; i < nb_full; ++i) {
+            const auto* b = reinterpret_cast<const block_q2_0*>(row + (size_t)(i * 4) * sizeof(block_q2_0));
+            _mm_prefetch((const char*)b + kPrefetchAhead, _MM_HINT_T0);
+            _mm_prefetch((const char*)b + kPrefetchAhead + 64, _MM_HINT_T0);
+
+            uint16_t dh[8] = {};
+            for (int k = 0; k < 4; ++k) std::memcpy(&dh[k], &b[k].d, 2);
+            const __m256 dw4 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)dh));
+            const __m256 dw8 = _mm256_permutevar8x32_ps(dw4, dup_idx);
+
+            const __m512i w01 = unpack_q2_0_blk(&b[0]);
+            const __m512i w23 = unpack_q2_0_blk(&b[1]);
+            const __m512i w45 = unpack_q2_0_blk(&b[2]);
+            const __m512i w67 = unpack_q2_0_blk(&b[3]);
+
+            for (int t = 0; t < NT; ++t) {
+                const PrepT& ax = xp[t][i];
+                const __m512i p01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, ax.x01);
+                const __m512i p23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, ax.x23);
+                const __m512i p45 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w45, ax.x45);
+                const __m512i p67 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w67, ax.x67);
+                const __m256i bias1 = _mm256_srai_epi32(ax.bias8, 7);
+                const __m256i s8 = _mm256_sub_epi32(reduce8_quad_to_256(p01, p23, p45, p67), bias1);
+                __m256 d_ax;
+                if constexpr (std::is_same_v<PrepT, PrepQ8_0_Q81>) {
+                    d_ax = ax.d8;
+                } else {
+                    d_ax = _mm256_set1_ps(ax.d);
+                }
+                accf[t] = _mm256_fmadd_ps(_mm256_mul_ps(dw8, d_ax), _mm256_cvtepi32_ps(s8), accf[t]);
+            }
+        }
+        if (rem64 > 0) {
+            const auto* bt = reinterpret_cast<const block_q2_0*>(row + (size_t)(nb_full * 4) * sizeof(block_q2_0));
+            uint16_t dh[8] = {};
+            for (int k = 0; k < rem64; ++k) std::memcpy(&dh[k], &bt[k].d, 2);
+            const __m256 dw4 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)dh));
+            const __m256 dw8 = _mm256_permutevar8x32_ps(dw4, dup_idx);
+            const __m512i w01 = (0 < rem64) ? unpack_q2_0_blk(&bt[0]) : _mm512_setzero_si512();
+            const __m512i w23 = (1 < rem64) ? unpack_q2_0_blk(&bt[1]) : _mm512_setzero_si512();
+            const __m512i w45 = (2 < rem64) ? unpack_q2_0_blk(&bt[2]) : _mm512_setzero_si512();
+            const __m512i w67 = (3 < rem64) ? unpack_q2_0_blk(&bt[3]) : _mm512_setzero_si512();
+            for (int t = 0; t < NT; ++t) {
+                const PrepT& ax = xp[t][nb_full];
+                const __m512i p01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w01, ax.x01);
+                const __m512i p23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w23, ax.x23);
+                const __m512i p45 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w45, ax.x45);
+                const __m512i p67 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w67, ax.x67);
+                const __m256i bias1 = _mm256_srai_epi32(ax.bias8, 7);
+                const __m256i s8 = _mm256_sub_epi32(reduce8_quad_to_256(p01, p23, p45, p67), bias1);
+                __m256 d_ax;
+                if constexpr (std::is_same_v<PrepT, PrepQ8_0_Q81>) {
+                    d_ax = ax.d8;
+                } else {
+                    d_ax = _mm256_set1_ps(ax.d);
+                }
+                accf[t] = _mm256_fmadd_ps(_mm256_mul_ps(dw8, d_ax), _mm256_cvtepi32_ps(s8), accf[t]);
+            }
+        }
+        for (int t = 0; t < NT; ++t) {
+            acc_out[t][r - r0] = hsum_f32_256(accf[t]);
+        }
+    }
+}
+
 template <int NT, typename PrepT, void (*DotFn)(const uint8_t*, size_t, int, const PrepT* const*, int, int, float* const*)>
 void dispatch_gu_tile(
     const uint8_t* gate_w,
@@ -1186,6 +1504,18 @@ extern "C" void ampllm_cpu_hy4_fused_gu_rows(
             run_gu_type<block_q8_K, PrepQ8_0, prepare_q8_0, dot_rows_q8_0<1>, dot_rows_q8_0<2>, dot_rows_q8_0<4>, dot_rows_q8_0<8>, true>(
                 gate_w, up_w, row_bytes, n_in, x_q8k, nt, ff_out, r0, r1, swiglu_limit);
             break;
+        case GGML_TYPE_IQ4_NL:
+            run_gu_type<block_q8_K, PrepQ8_0, prepare_q8_0, dot_rows_iq4_nl<1>, dot_rows_iq4_nl<2>, dot_rows_iq4_nl<4>, dot_rows_iq4_nl<8>, true>(
+                gate_w, up_w, row_bytes, n_in, x_q8k, nt, ff_out, r0, r1, swiglu_limit);
+            break;
+        case GGML_TYPE_Q5_0:
+            run_gu_type<block_q8_K, PrepQ8_0, prepare_q8_0, dot_rows_q5_0<1>, dot_rows_q5_0<2>, dot_rows_q5_0<4>, dot_rows_q5_0<8>, true>(
+                gate_w, up_w, row_bytes, n_in, x_q8k, nt, ff_out, r0, r1, swiglu_limit);
+            break;
+        case GGML_TYPE_Q2_0:
+            run_gu_type<block_q8_K, PrepQ8_0, prepare_q8_0, dot_rows_q2_0<1>, dot_rows_q2_0<2>, dot_rows_q2_0<4>, dot_rows_q2_0<8>, true>(
+                gate_w, up_w, row_bytes, n_in, x_q8k, nt, ff_out, r0, r1, swiglu_limit);
+            break;
         default:
             break;
     }
@@ -1259,6 +1589,18 @@ extern "C" void ampllm_cpu_hy4_down_rows(
             run_dn_type<block_q8_K, PrepQ8_0, prepare_q8_0, dot_rows_q8_0<1>, dot_rows_q8_0<2>, dot_rows_q8_0<4>, dot_rows_q8_0<8>, true>(
                 down_w, row_bytes, n_in, ff_q8k, nt, out, r0, r1, weight_scale, acc);
             break;
+        case GGML_TYPE_IQ4_NL:
+            run_dn_type<block_q8_K, PrepQ8_0, prepare_q8_0, dot_rows_iq4_nl<1>, dot_rows_iq4_nl<2>, dot_rows_iq4_nl<4>, dot_rows_iq4_nl<8>, true>(
+                down_w, row_bytes, n_in, ff_q8k, nt, out, r0, r1, weight_scale, acc);
+            break;
+        case GGML_TYPE_Q5_0:
+            run_dn_type<block_q8_K, PrepQ8_0, prepare_q8_0, dot_rows_q5_0<1>, dot_rows_q5_0<2>, dot_rows_q5_0<4>, dot_rows_q5_0<8>, true>(
+                down_w, row_bytes, n_in, ff_q8k, nt, out, r0, r1, weight_scale, acc);
+            break;
+        case GGML_TYPE_Q2_0:
+            run_dn_type<block_q8_K, PrepQ8_0, prepare_q8_0, dot_rows_q2_0<1>, dot_rows_q2_0<2>, dot_rows_q2_0<4>, dot_rows_q2_0<8>, true>(
+                down_w, row_bytes, n_in, ff_q8k, nt, out, r0, r1, weight_scale, acc);
+            break;
         default:
             break;
     }
@@ -1286,6 +1628,18 @@ extern "C" void ampllm_cpu_hy4_down_rows_q8_1(
             break;
         case GGML_TYPE_Q8_0:
             run_dn_type<block_q8_1_g8, PrepQ8_0_Q81, prepare_q8_0_q81, dot_rows_q8_0<1, PrepQ8_0_Q81>, dot_rows_q8_0<2, PrepQ8_0_Q81>, dot_rows_q8_0<4, PrepQ8_0_Q81>, dot_rows_q8_0<8, PrepQ8_0_Q81>, true>(
+                down_w, row_bytes, n_in, ff_q8_1, nt, out, r0, r1, weight_scale, acc);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            run_dn_type<block_q8_1_g8, PrepQ8_0_Q81, prepare_q8_0_q81, dot_rows_iq4_nl<1, PrepQ8_0_Q81>, dot_rows_iq4_nl<2, PrepQ8_0_Q81>, dot_rows_iq4_nl<4, PrepQ8_0_Q81>, dot_rows_iq4_nl<8, PrepQ8_0_Q81>, true>(
+                down_w, row_bytes, n_in, ff_q8_1, nt, out, r0, r1, weight_scale, acc);
+            break;
+        case GGML_TYPE_Q5_0:
+            run_dn_type<block_q8_1_g8, PrepQ8_0_Q81, prepare_q8_0_q81, dot_rows_q5_0<1, PrepQ8_0_Q81>, dot_rows_q5_0<2, PrepQ8_0_Q81>, dot_rows_q5_0<4, PrepQ8_0_Q81>, dot_rows_q5_0<8, PrepQ8_0_Q81>, true>(
+                down_w, row_bytes, n_in, ff_q8_1, nt, out, r0, r1, weight_scale, acc);
+            break;
+        case GGML_TYPE_Q2_0:
+            run_dn_type<block_q8_1_g8, PrepQ8_0_Q81, prepare_q8_0_q81, dot_rows_q2_0<1, PrepQ8_0_Q81>, dot_rows_q2_0<2, PrepQ8_0_Q81>, dot_rows_q2_0<4, PrepQ8_0_Q81>, dot_rows_q2_0<8, PrepQ8_0_Q81>, true>(
                 down_w, row_bytes, n_in, ff_q8_1, nt, out, r0, r1, weight_scale, acc);
             break;
         default:
@@ -1525,6 +1879,103 @@ extern "C" void ampllm_cpu_tok_row_to_f32(
                         dst[j]      = dl * (float)KVALUES_IQ4NL[qs[j] & 0xF];
                         dst[j + 16] = dl * (float)KVALUES_IQ4NL[qs[j] >> 4];
                     }
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_Q5_0: {
+            const int nb = k / 32;
+            const auto* blks = reinterpret_cast<const block_q5_0*>(src);
+            for (int b = 0; b < nb; ++b) {
+                uint16_t dh;
+                std::memcpy(&dh, &blks[b].d, 2);
+                const float d = h2f(dh);
+                uint32_t qh = 0;
+                std::memcpy(&qh, blks[b].qh, 4);
+                float* dst = dst_f32 + b * 32;
+                for (int j = 0; j < 16; ++j) {
+                    const int x0 = (int)((blks[b].qs[j] & 0x0F) | (((qh >> j) & 1u) << 4)) - 16;
+                    const int x1 = (int)((blks[b].qs[j] >> 4) | (((qh >> (j + 16)) & 1u) << 4)) - 16;
+                    dst[j]      = d * (float)x0;
+                    dst[j + 16] = d * (float)x1;
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_Q4_0: {
+            const int nb = k / 32;
+            const auto* blks = reinterpret_cast<const block_q8_0*>(0);
+            (void)blks;
+            for (int b = 0; b < nb; ++b) {
+                const uint8_t* bp = src + (size_t)b * 18;
+                uint16_t dh;
+                std::memcpy(&dh, bp, 2);
+                const float d = h2f(dh);
+                float* dst = dst_f32 + b * 32;
+                for (int j = 0; j < 16; ++j) {
+                    dst[j]      = d * (float)((int)(bp[2 + j] & 0x0F) - 8);
+                    dst[j + 16] = d * (float)((int)(bp[2 + j] >> 4) - 8);
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_Q2_0: {
+            const int nb = k / 64;
+            const auto* blks = reinterpret_cast<const block_q2_0*>(src);
+            for (int b = 0; b < nb; ++b) {
+                uint16_t dh;
+                std::memcpy(&dh, &blks[b].d, 2);
+                const float d = h2f(dh);
+                float* dst = dst_f32 + b * 64;
+                for (int j = 0; j < 16; ++j) {
+                    const uint8_t q = blks[b].qs[j];
+                    for (int s = 0; s < 4; ++s) {
+                        dst[4 * j + s] = d * (float)((int)((q >> (2 * s)) & 3u) - 1);
+                    }
+                }
+            }
+            break;
+        }
+        case GGML_TYPE_Q3_K: {
+            const int nb = k / QK_K;
+            for (int b = 0; b < nb; ++b) {
+                const uint8_t* bp = src + (size_t)b * 110;
+                const uint8_t* hmask = bp;
+                const uint8_t* qs = bp + 32;
+                const uint8_t* sc_raw = bp + 96;
+                uint16_t dh;
+                std::memcpy(&dh, bp + 108, 2);
+                const float d_all = h2f(dh);
+                uint32_t aux[4] = {};
+                std::memcpy(aux, sc_raw, 12);
+                const uint32_t km1 = 0x03030303u, km2 = 0x0f0f0f0fu;
+                const uint32_t t0 = aux[0], t1 = aux[1], t2 = aux[2];
+                aux[0] = (t0 & km2) | (((t2 >> 0) & km1) << 4);
+                aux[1] = (t1 & km2) | (((t2 >> 2) & km1) << 4);
+                aux[2] = ((t0 >> 4) & km2) | (((t2 >> 4) & km1) << 4);
+                aux[3] = ((t1 >> 4) & km2) | (((t2 >> 6) & km1) << 4);
+                const int8_t* scales = reinterpret_cast<const int8_t*>(aux);
+                float* y = dst_f32 + b * 256;
+                int is = 0;
+                uint8_t m = 1;
+                const uint8_t* q = qs;
+                for (int n = 0; n < QK_K; n += 128) {
+                    int shift = 0;
+                    for (int j = 0; j < 4; ++j) {
+                        const float dl0 = d_all * (float)(scales[is++] - 32);
+                        for (int l = 0; l < 16; ++l) {
+                            const int qv = (int)((q[l] >> shift) & 3) - ((hmask[l] & m) ? 0 : 4);
+                            y[n + j * 32 + l] = dl0 * (float)qv;
+                        }
+                        const float dl1 = d_all * (float)(scales[is++] - 32);
+                        for (int l = 0; l < 16; ++l) {
+                            const int qv = (int)((q[l + 16] >> shift) & 3) - ((hmask[l + 16] & m) ? 0 : 4);
+                            y[n + j * 32 + 16 + l] = dl1 * (float)qv;
+                        }
+                        shift += 2;
+                        m <<= 1;
+                    }
+                    q += 32;
                 }
             }
             break;

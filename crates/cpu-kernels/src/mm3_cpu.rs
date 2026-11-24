@@ -1,43 +1,259 @@
-use crate::glm5_cpu::{CpuBlockQ8K, Q8K_BLOCK_BYTES};
+use crate::glm5_cpu::{active_cpu_isa, CpuBlockQ8K, CpuIsaTier, Q8K_BLOCK_BYTES};
 use crate::pool::CpuThreadPool;
 use ampllm_gguf::GgmlType;
 use std::ffi::c_void;
 
-extern "C" {
-    pub fn ampllm_cpu_mm3_quantize_q8_k(x: *const f32, out_q8k: *mut c_void, n: i32);
+mod ffi {
+    use std::ffi::c_void;
 
-    pub fn ampllm_cpu_mm3_fused_gu_rows(
-        gate_type: i32,
-        up_type: i32,
-        gate_w: *const u8,
-        up_w: *const u8,
-        gate_row_bytes: usize,
-        up_row_bytes: usize,
-        n_in: i32,
-        x_q8k: *const *const c_void,
-        nt: i32,
-        ff_out: *const *mut f32,
-        r0: i32,
-        r1: i32,
-        swiglu_alpha: f32,
-        swiglu_limit: f32,
-    );
+    extern "C" {
+        pub fn ampllm_cpu_mm3_quantize_q8_k(x: *const f32, out_q8k: *mut c_void, n: i32);
 
-    pub fn ampllm_cpu_mm3_down_rows(
-        down_type: i32,
-        down_w: *const u8,
-        row_bytes: usize,
-        n_in: i32,
-        ff_q8k: *const *const c_void,
-        nt: i32,
-        out: *const *mut f32,
-        r0: i32,
-        r1: i32,
-        weight_scale: f32,
-        accumulate: i32,
-    );
+        pub fn ampllm_cpu_mm3_fused_gu_rows(
+            gate_type: i32,
+            up_type: i32,
+            gate_w: *const u8,
+            up_w: *const u8,
+            gate_row_bytes: usize,
+            up_row_bytes: usize,
+            n_in: i32,
+            x_q8k: *const *const c_void,
+            nt: i32,
+            ff_out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            swiglu_alpha: f32,
+            swiglu_limit: f32,
+        );
 
-    pub fn ampllm_cpu_mm3_q6_k_row_to_f32(src: *const u8, k: i32, dst_f32: *mut f32);
+        pub fn ampllm_cpu_mm3_down_rows(
+            down_type: i32,
+            down_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            ff_q8k: *const *const c_void,
+            nt: i32,
+            out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            weight_scale: f32,
+            accumulate: i32,
+        );
+
+        pub fn ampllm_cpu_mm3_q6_k_row_to_f32(src: *const u8, k: i32, dst_f32: *mut f32);
+
+        // AVX2+FMA+F16C fallback symbols
+        pub fn ampllm_cpu_mm3_quantize_q8_k_avx2(x: *const f32, out_q8k: *mut c_void, n: i32);
+        pub fn ampllm_cpu_mm3_fused_gu_rows_avx2(
+            gate_type: i32,
+            up_type: i32,
+            gate_w: *const u8,
+            up_w: *const u8,
+            gate_row_bytes: usize,
+            up_row_bytes: usize,
+            n_in: i32,
+            x_q8k: *const *const c_void,
+            nt: i32,
+            ff_out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            swiglu_alpha: f32,
+            swiglu_limit: f32,
+        );
+        pub fn ampllm_cpu_mm3_down_rows_avx2(
+            down_type: i32,
+            down_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            ff_q8k: *const *const c_void,
+            nt: i32,
+            out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            weight_scale: f32,
+            accumulate: i32,
+        );
+        pub fn ampllm_cpu_mm3_q6_k_row_to_f32_avx2(src: *const u8, k: i32, dst_f32: *mut f32);
+
+        // Portable scalar fallback symbols
+        pub fn ampllm_cpu_mm3_quantize_q8_k_scalar(x: *const f32, out_q8k: *mut c_void, n: i32);
+        pub fn ampllm_cpu_mm3_fused_gu_rows_scalar(
+            gate_type: i32,
+            up_type: i32,
+            gate_w: *const u8,
+            up_w: *const u8,
+            gate_row_bytes: usize,
+            up_row_bytes: usize,
+            n_in: i32,
+            x_q8k: *const *const c_void,
+            nt: i32,
+            ff_out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            swiglu_alpha: f32,
+            swiglu_limit: f32,
+        );
+        pub fn ampllm_cpu_mm3_down_rows_scalar(
+            down_type: i32,
+            down_w: *const u8,
+            row_bytes: usize,
+            n_in: i32,
+            ff_q8k: *const *const c_void,
+            nt: i32,
+            out: *const *mut f32,
+            r0: i32,
+            r1: i32,
+            weight_scale: f32,
+            accumulate: i32,
+        );
+        pub fn ampllm_cpu_mm3_q6_k_row_to_f32_scalar(src: *const u8, k: i32, dst_f32: *mut f32);
+    }
+}
+
+#[inline(always)]
+pub unsafe fn ampllm_cpu_mm3_quantize_q8_k(x: *const f32, out_q8k: *mut c_void, n: i32) {
+    match active_cpu_isa() {
+        CpuIsaTier::Avx512 => ffi::ampllm_cpu_mm3_quantize_q8_k(x, out_q8k, n),
+        CpuIsaTier::Avx2 => ffi::ampllm_cpu_mm3_quantize_q8_k_avx2(x, out_q8k, n),
+        CpuIsaTier::Scalar => ffi::ampllm_cpu_mm3_quantize_q8_k_scalar(x, out_q8k, n),
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn ampllm_cpu_mm3_fused_gu_rows(
+    gate_type: i32,
+    up_type: i32,
+    gate_w: *const u8,
+    up_w: *const u8,
+    gate_row_bytes: usize,
+    up_row_bytes: usize,
+    n_in: i32,
+    x_q8k: *const *const c_void,
+    nt: i32,
+    ff_out: *const *mut f32,
+    r0: i32,
+    r1: i32,
+    swiglu_alpha: f32,
+    swiglu_limit: f32,
+) {
+    match active_cpu_isa() {
+        CpuIsaTier::Avx512 => ffi::ampllm_cpu_mm3_fused_gu_rows(
+            gate_type,
+            up_type,
+            gate_w,
+            up_w,
+            gate_row_bytes,
+            up_row_bytes,
+            n_in,
+            x_q8k,
+            nt,
+            ff_out,
+            r0,
+            r1,
+            swiglu_alpha,
+            swiglu_limit,
+        ),
+        CpuIsaTier::Avx2 => ffi::ampllm_cpu_mm3_fused_gu_rows_avx2(
+            gate_type,
+            up_type,
+            gate_w,
+            up_w,
+            gate_row_bytes,
+            up_row_bytes,
+            n_in,
+            x_q8k,
+            nt,
+            ff_out,
+            r0,
+            r1,
+            swiglu_alpha,
+            swiglu_limit,
+        ),
+        CpuIsaTier::Scalar => ffi::ampllm_cpu_mm3_fused_gu_rows_scalar(
+            gate_type,
+            up_type,
+            gate_w,
+            up_w,
+            gate_row_bytes,
+            up_row_bytes,
+            n_in,
+            x_q8k,
+            nt,
+            ff_out,
+            r0,
+            r1,
+            swiglu_alpha,
+            swiglu_limit,
+        ),
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn ampllm_cpu_mm3_down_rows(
+    down_type: i32,
+    down_w: *const u8,
+    row_bytes: usize,
+    n_in: i32,
+    ff_q8k: *const *const c_void,
+    nt: i32,
+    out: *const *mut f32,
+    r0: i32,
+    r1: i32,
+    weight_scale: f32,
+    accumulate: i32,
+) {
+    match active_cpu_isa() {
+        CpuIsaTier::Avx512 => ffi::ampllm_cpu_mm3_down_rows(
+            down_type,
+            down_w,
+            row_bytes,
+            n_in,
+            ff_q8k,
+            nt,
+            out,
+            r0,
+            r1,
+            weight_scale,
+            accumulate,
+        ),
+        CpuIsaTier::Avx2 => ffi::ampllm_cpu_mm3_down_rows_avx2(
+            down_type,
+            down_w,
+            row_bytes,
+            n_in,
+            ff_q8k,
+            nt,
+            out,
+            r0,
+            r1,
+            weight_scale,
+            accumulate,
+        ),
+        CpuIsaTier::Scalar => ffi::ampllm_cpu_mm3_down_rows_scalar(
+            down_type,
+            down_w,
+            row_bytes,
+            n_in,
+            ff_q8k,
+            nt,
+            out,
+            r0,
+            r1,
+            weight_scale,
+            accumulate,
+        ),
+    }
+}
+
+#[inline(always)]
+unsafe fn ampllm_cpu_mm3_q6_k_row_to_f32(src: *const u8, k: i32, dst_f32: *mut f32) {
+    match active_cpu_isa() {
+        CpuIsaTier::Avx512 => ffi::ampllm_cpu_mm3_q6_k_row_to_f32(src, k, dst_f32),
+        CpuIsaTier::Avx2 => ffi::ampllm_cpu_mm3_q6_k_row_to_f32_avx2(src, k, dst_f32),
+        CpuIsaTier::Scalar => ffi::ampllm_cpu_mm3_q6_k_row_to_f32_scalar(src, k, dst_f32),
+    }
 }
 
 /// Dequantize a single `Q6_K` embedding / weight row on CPU into `dst_f32`.
