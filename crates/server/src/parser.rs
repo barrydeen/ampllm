@@ -46,6 +46,15 @@ pub enum ParsedEvent {
         name: String,
         arguments: String,
     },
+    ToolCallStart {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    ToolCallArgsDelta {
+        index: usize,
+        delta: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,6 +62,39 @@ enum GlmState {
     Think,
     Text,
     InToolCall,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+enum GlmToolPhase {
+    #[default]
+    SeekingName,
+    SeekingKey {
+        fn_name: String,
+        call_index: usize,
+        has_args: bool,
+    },
+    SeekingArgValueTag {
+        fn_name: String,
+        call_index: usize,
+        has_args: bool,
+        key: String,
+    },
+    InArgValueString {
+        fn_name: String,
+        call_index: usize,
+    },
+    InArgValueBuffered {
+        fn_name: String,
+        call_index: usize,
+        has_args: bool,
+        key: String,
+    },
+    FallbackBuffered,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GlmToolStream {
+    phase: GlmToolPhase,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,6 +114,7 @@ enum ParserState {
         qwen4_xml_tools: bool,
         in_code_fence: bool,
         schemas: ToolParamSchema,
+        tool_stream: GlmToolStream,
     },
     Inkling2 {
         section: InkSection,
@@ -320,6 +363,465 @@ fn parse_inkling2_tool_json(body: &str, fallback_name: &str) -> Option<(String, 
     Some((name, args_json))
 }
 
+fn json_escape_str_inner(s: &str) -> String {
+    let encoded = serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_owned());
+    encoded[1..encoded.len() - 1].to_owned()
+}
+
+fn emit_glm5_complete_tool_call(
+    name: String,
+    arguments: String,
+    call_id_prefix: &str,
+    next_call_index: &mut usize,
+    emit: &mut impl FnMut(ParsedEvent),
+) {
+    let call_index = *next_call_index;
+    *next_call_index += 1;
+    emit(ParsedEvent::ToolCallStart {
+        index: call_index,
+        id: format!("{call_id_prefix}_{call_index}"),
+        name,
+    });
+    emit(ParsedEvent::ToolCallArgsDelta {
+        index: call_index,
+        delta: arguments,
+    });
+}
+
+fn format_coerced_arg_delta(
+    fn_name: &str,
+    key: &str,
+    raw: &str,
+    has_args: bool,
+    schemas: &ToolParamSchema,
+) -> Option<String> {
+    if key.is_empty() {
+        return None;
+    }
+    let expected_ty = schemas.get(fn_name).and_then(|m| m.get(key)).map(String::as_str);
+    let val = coerce_arg_value(raw, expected_ty);
+    let key_json = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_owned());
+    let val_json = serde_json::to_string(&val).unwrap_or_else(|_| "null".to_owned());
+    let comma = if has_args { "," } else { "" };
+    Some(format!("{comma}{key_json}:{val_json}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn step_glm5_tool_stream(
+    buf: &mut String,
+    state: &mut GlmState,
+    schemas: &ToolParamSchema,
+    tool_stream: &mut GlmToolStream,
+    call_id_prefix: &str,
+    next_call_index: &mut usize,
+    eof: bool,
+    emit: &mut impl FnMut(ParsedEvent),
+) -> bool {
+    const TOOL_CLOSE: &str = "</tool_call>";
+    const ARG_END_DELIMS: [&str; 2] = ["</arg_value>", TOOL_CLOSE];
+
+    loop {
+        let phase = std::mem::take(&mut tool_stream.phase);
+        match phase {
+            GlmToolPhase::SeekingName => {
+                match earliest_match(buf, &["<arg_key>", TOOL_CLOSE]) {
+                    Some((idx, "<arg_key>")) => {
+                        let fn_name = buf[..idx].trim().to_owned();
+                        if fn_name.is_empty() {
+                            tool_stream.phase = GlmToolPhase::FallbackBuffered;
+                            continue;
+                        }
+                        let call_index = *next_call_index;
+                        *next_call_index += 1;
+                        emit(ParsedEvent::ToolCallStart {
+                            index: call_index,
+                            id: format!("{call_id_prefix}_{call_index}"),
+                            name: fn_name.clone(),
+                        });
+                        emit(ParsedEvent::ToolCallArgsDelta {
+                            index: call_index,
+                            delta: "{".to_owned(),
+                        });
+                        buf.drain(..idx);
+                        tool_stream.phase = GlmToolPhase::SeekingKey {
+                            fn_name,
+                            call_index,
+                            has_args: false,
+                        };
+                        continue;
+                    }
+                    Some((idx, _)) => {
+                        let body = buf[..idx].to_owned();
+                        buf.drain(..idx + TOOL_CLOSE.len());
+                        *state = GlmState::Text;
+                        tool_stream.phase = GlmToolPhase::SeekingName;
+                        if let Some((name, arguments)) = parse_glm5_tool_body(&body, schemas) {
+                            emit_glm5_complete_tool_call(
+                                name,
+                                arguments,
+                                call_id_prefix,
+                                next_call_index,
+                                emit,
+                            );
+                        } else if !body.trim().is_empty() {
+                            emit(ParsedEvent::Token(format!("<tool_call>{body}</tool_call>")));
+                        }
+                        return true;
+                    }
+                    None => {
+                        if buf.trim_start().starts_with('{') {
+                            tool_stream.phase = GlmToolPhase::FallbackBuffered;
+                            continue;
+                        }
+                        if eof {
+                            let body = std::mem::take(buf);
+                            *state = GlmState::Text;
+                            tool_stream.phase = GlmToolPhase::SeekingName;
+                            if !body.contains('<') && !body.trim().is_empty() {
+                                if let Some((name, arguments)) =
+                                    parse_glm5_tool_body(&body, schemas)
+                                {
+                                    emit_glm5_complete_tool_call(
+                                        name,
+                                        arguments,
+                                        call_id_prefix,
+                                        next_call_index,
+                                        emit,
+                                    );
+                                    return false;
+                                }
+                            }
+                            if !body.is_empty() {
+                                emit(ParsedEvent::Token(format!("<tool_call>{body}")));
+                            }
+                            return false;
+                        }
+                        tool_stream.phase = GlmToolPhase::SeekingName;
+                        return false;
+                    }
+                }
+            }
+            GlmToolPhase::SeekingKey {
+                fn_name,
+                call_index,
+                has_args,
+            } => match earliest_match(buf, &["<arg_key>", TOOL_CLOSE]) {
+                Some((idx, delim)) if delim == TOOL_CLOSE => {
+                    emit(ParsedEvent::ToolCallArgsDelta {
+                        index: call_index,
+                        delta: "}".to_owned(),
+                    });
+                    buf.drain(..idx + TOOL_CLOSE.len());
+                    *state = GlmState::Text;
+                    tool_stream.phase = GlmToolPhase::SeekingName;
+                    return true;
+                }
+                Some((idx, _)) => {
+                    let after_ks = idx + "<arg_key>".len();
+                    if let Some(ke) = buf[after_ks..].find("</arg_key>") {
+                        let key = buf[after_ks..after_ks + ke].trim().to_owned();
+                        buf.drain(..after_ks + ke + "</arg_key>".len());
+                        tool_stream.phase = GlmToolPhase::SeekingArgValueTag {
+                            fn_name,
+                            call_index,
+                            has_args,
+                            key,
+                        };
+                        continue;
+                    }
+                    if eof {
+                        emit(ParsedEvent::ToolCallArgsDelta {
+                            index: call_index,
+                            delta: "}".to_owned(),
+                        });
+                        buf.clear();
+                        *state = GlmState::Text;
+                        tool_stream.phase = GlmToolPhase::SeekingName;
+                        return false;
+                    }
+                    tool_stream.phase = GlmToolPhase::SeekingKey {
+                        fn_name,
+                        call_index,
+                        has_args,
+                    };
+                    return false;
+                }
+                None => {
+                    if eof {
+                        emit(ParsedEvent::ToolCallArgsDelta {
+                            index: call_index,
+                            delta: "}".to_owned(),
+                        });
+                        buf.clear();
+                        *state = GlmState::Text;
+                        tool_stream.phase = GlmToolPhase::SeekingName;
+                        return false;
+                    }
+                    tool_stream.phase = GlmToolPhase::SeekingKey {
+                        fn_name,
+                        call_index,
+                        has_args,
+                    };
+                    return false;
+                }
+            },
+            GlmToolPhase::SeekingArgValueTag {
+                fn_name,
+                call_index,
+                has_args,
+                key,
+            } => match earliest_match(buf, &["<arg_value>", TOOL_CLOSE]) {
+                Some((idx, delim)) if delim == TOOL_CLOSE => {
+                    emit(ParsedEvent::ToolCallArgsDelta {
+                        index: call_index,
+                        delta: "}".to_owned(),
+                    });
+                    buf.drain(..idx + TOOL_CLOSE.len());
+                    *state = GlmState::Text;
+                    tool_stream.phase = GlmToolPhase::SeekingName;
+                    return true;
+                }
+                Some((idx, _)) => {
+                    buf.drain(..idx + "<arg_value>".len());
+                    let expected_ty = schemas
+                        .get(&fn_name)
+                        .and_then(|m| m.get(&key))
+                        .map(String::as_str);
+                    if !key.is_empty() && expected_ty == Some("string") {
+                        let key_json =
+                            serde_json::to_string(&key).unwrap_or_else(|_| "\"\"".to_owned());
+                        let comma = if has_args { "," } else { "" };
+                        emit(ParsedEvent::ToolCallArgsDelta {
+                            index: call_index,
+                            delta: format!("{comma}{key_json}:\""),
+                        });
+                        tool_stream.phase = GlmToolPhase::InArgValueString { fn_name, call_index };
+                    } else {
+                        tool_stream.phase = GlmToolPhase::InArgValueBuffered {
+                            fn_name,
+                            call_index,
+                            has_args,
+                            key,
+                        };
+                    }
+                    continue;
+                }
+                None => {
+                    if eof {
+                        emit(ParsedEvent::ToolCallArgsDelta {
+                            index: call_index,
+                            delta: "}".to_owned(),
+                        });
+                        buf.clear();
+                        *state = GlmState::Text;
+                        tool_stream.phase = GlmToolPhase::SeekingName;
+                        return false;
+                    }
+                    tool_stream.phase = GlmToolPhase::SeekingArgValueTag {
+                        fn_name,
+                        call_index,
+                        has_args,
+                        key,
+                    };
+                    return false;
+                }
+            },
+            GlmToolPhase::InArgValueString {
+                fn_name,
+                call_index,
+            } => match earliest_match(buf, &ARG_END_DELIMS) {
+                Some((idx, "</arg_value>")) => {
+                    let escaped = json_escape_str_inner(&buf[..idx]);
+                    buf.drain(..idx + "</arg_value>".len());
+                    emit(ParsedEvent::ToolCallArgsDelta {
+                        index: call_index,
+                        delta: format!("{escaped}\""),
+                    });
+                    tool_stream.phase = GlmToolPhase::SeekingKey {
+                        fn_name,
+                        call_index,
+                        has_args: true,
+                    };
+                    continue;
+                }
+                Some((idx, _)) => {
+                    let escaped = json_escape_str_inner(&buf[..idx]);
+                    buf.drain(..idx + TOOL_CLOSE.len());
+                    emit(ParsedEvent::ToolCallArgsDelta {
+                        index: call_index,
+                        delta: format!("{escaped}\"}}"),
+                    });
+                    *state = GlmState::Text;
+                    tool_stream.phase = GlmToolPhase::SeekingName;
+                    return true;
+                }
+                None => {
+                    if eof {
+                        let rest = std::mem::take(buf);
+                        let escaped = json_escape_str_inner(&rest);
+                        emit(ParsedEvent::ToolCallArgsDelta {
+                            index: call_index,
+                            delta: format!("{escaped}\"}}"),
+                        });
+                        *state = GlmState::Text;
+                        tool_stream.phase = GlmToolPhase::SeekingName;
+                        return false;
+                    }
+                    let keep = trailing_delim_prefix_len(buf, &ARG_END_DELIMS);
+                    let flush = floor_char_boundary(buf, buf.len() - keep);
+                    if flush > 0 {
+                        let escaped = json_escape_str_inner(&buf[..flush]);
+                        buf.drain(..flush);
+                        if !escaped.is_empty() {
+                            emit(ParsedEvent::ToolCallArgsDelta {
+                                index: call_index,
+                                delta: escaped,
+                            });
+                        }
+                    }
+                    tool_stream.phase = GlmToolPhase::InArgValueString { fn_name, call_index };
+                    return false;
+                }
+            },
+            GlmToolPhase::InArgValueBuffered {
+                fn_name,
+                call_index,
+                has_args,
+                key,
+            } => match earliest_match(buf, &ARG_END_DELIMS) {
+                Some((idx, delim)) => {
+                    let raw = buf[..idx].to_owned();
+                    buf.drain(..idx + delim.len());
+                    let mut delta =
+                        format_coerced_arg_delta(&fn_name, &key, &raw, has_args, schemas)
+                            .unwrap_or_default();
+                    let new_has_args = has_args || !delta.is_empty();
+                    if delim == TOOL_CLOSE {
+                        delta.push('}');
+                        emit(ParsedEvent::ToolCallArgsDelta {
+                            index: call_index,
+                            delta,
+                        });
+                        *state = GlmState::Text;
+                        tool_stream.phase = GlmToolPhase::SeekingName;
+                        return true;
+                    }
+                    if !delta.is_empty() {
+                        emit(ParsedEvent::ToolCallArgsDelta {
+                            index: call_index,
+                            delta,
+                        });
+                    }
+                    tool_stream.phase = GlmToolPhase::SeekingKey {
+                        fn_name,
+                        call_index,
+                        has_args: new_has_args,
+                    };
+                    continue;
+                }
+                None => {
+                    if eof {
+                        let raw = std::mem::take(buf);
+                        let mut delta =
+                            format_coerced_arg_delta(&fn_name, &key, &raw, has_args, schemas)
+                                .unwrap_or_default();
+                        delta.push('}');
+                        emit(ParsedEvent::ToolCallArgsDelta {
+                            index: call_index,
+                            delta,
+                        });
+                        *state = GlmState::Text;
+                        tool_stream.phase = GlmToolPhase::SeekingName;
+                        return false;
+                    }
+                    let expected_ty = schemas
+                        .get(&fn_name)
+                        .and_then(|m| m.get(&key))
+                        .map(String::as_str);
+                    if !key.is_empty() && expected_ty.is_none() && buf.len() >= 64 {
+                        let trimmed = buf.trim_start();
+                        let could_be_json = trimmed.is_empty()
+                            || trimmed.starts_with('{')
+                            || trimmed.starts_with('[')
+                            || trimmed.starts_with('"')
+                            || trimmed.starts_with("true")
+                            || trimmed.starts_with("false")
+                            || trimmed.starts_with("null")
+                            || trimmed.starts_with('-')
+                            || trimmed.as_bytes()[0].is_ascii_digit();
+                        if !could_be_json {
+                            let key_json =
+                                serde_json::to_string(&key).unwrap_or_else(|_| "\"\"".to_owned());
+                            let comma = if has_args { "," } else { "" };
+                            emit(ParsedEvent::ToolCallArgsDelta {
+                                index: call_index,
+                                delta: format!("{comma}{key_json}:\""),
+                            });
+                            tool_stream.phase = GlmToolPhase::InArgValueString {
+                                fn_name,
+                                call_index,
+                            };
+                            continue;
+                        }
+                    }
+                    tool_stream.phase = GlmToolPhase::InArgValueBuffered {
+                        fn_name,
+                        call_index,
+                        has_args,
+                        key,
+                    };
+                    return false;
+                }
+            },
+            GlmToolPhase::FallbackBuffered => {
+                if let Some(idx) = buf.find(TOOL_CLOSE) {
+                    let body = buf[..idx].to_owned();
+                    buf.drain(..idx + TOOL_CLOSE.len());
+                    *state = GlmState::Text;
+                    tool_stream.phase = GlmToolPhase::SeekingName;
+                    if let Some((name, arguments)) = parse_glm5_tool_body(&body, schemas) {
+                        emit_glm5_complete_tool_call(
+                            name,
+                            arguments,
+                            call_id_prefix,
+                            next_call_index,
+                            emit,
+                        );
+                    } else if !body.trim().is_empty() {
+                        emit(ParsedEvent::Token(format!("<tool_call>{body}</tool_call>")));
+                    }
+                    return true;
+                }
+                if eof {
+                    let body = std::mem::take(buf);
+                    *state = GlmState::Text;
+                    tool_stream.phase = GlmToolPhase::SeekingName;
+                    if (body.contains("</arg_value>") || !body.contains('<'))
+                        && !body.trim().is_empty()
+                    {
+                        if let Some((name, arguments)) = parse_glm5_tool_body(&body, schemas) {
+                            emit_glm5_complete_tool_call(
+                                name,
+                                arguments,
+                                call_id_prefix,
+                                next_call_index,
+                                emit,
+                            );
+                            return false;
+                        }
+                    }
+                    if !body.is_empty() {
+                        emit(ParsedEvent::Token(format!("<tool_call>{body}")));
+                    }
+                    return false;
+                }
+                tool_stream.phase = GlmToolPhase::FallbackBuffered;
+                return false;
+            }
+        }
+    }
+}
+
 impl OutputParser {
     pub fn new(mode: ChatOutputMode, call_id_prefix: String) -> Self {
         let (inner, init_buf) = match mode {
@@ -348,6 +850,7 @@ impl OutputParser {
                         qwen4_xml_tools: false,
                         in_code_fence: false,
                         schemas,
+                        tool_stream: GlmToolStream::default(),
                     },
                     prefill,
                 )
@@ -370,6 +873,7 @@ impl OutputParser {
                         qwen4_xml_tools: true,
                         in_code_fence: false,
                         schemas,
+                        tool_stream: GlmToolStream::default(),
                     },
                     prefill,
                 )
@@ -458,6 +962,7 @@ impl OutputParser {
                     qwen4_xml_tools,
                     in_code_fence,
                     schemas,
+                    tool_stream,
                 } => match *state {
                     GlmState::Think => {
                         const THINK_CLOSE: &str = "</think>";
@@ -556,6 +1061,7 @@ impl OutputParser {
                                     }
                                     self.buf.drain(..idx + "<tool_call>".len());
                                     *state = GlmState::InToolCall;
+                                    *tool_stream = GlmToolStream::default();
                                     continue;
                                 }
                             }
@@ -576,6 +1082,21 @@ impl OutputParser {
                         return;
                     }
                     GlmState::InToolCall => {
+                        if !*qwen4_xml_tools {
+                            if step_glm5_tool_stream(
+                                &mut self.buf,
+                                state,
+                                schemas,
+                                tool_stream,
+                                &self.call_id_prefix,
+                                &mut self.next_call_index,
+                                eof,
+                                emit,
+                            ) {
+                                continue;
+                            }
+                            return;
+                        }
                         const TOOL_CLOSE: &str = "</tool_call>";
                         if let Some(idx) = self.buf.find(TOOL_CLOSE) {
                             let body = self.buf[..idx].to_owned();

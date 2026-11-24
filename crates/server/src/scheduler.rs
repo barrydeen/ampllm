@@ -1080,12 +1080,13 @@ impl<B: InferenceBackend> SlotScheduler<B> {
             true
         };
 
+        let multi_slot = self.slots.len() > 1;
         let mut should_yield_cb = |n_gen_in_quantum: usize| -> bool {
             if resp_tx.is_closed() {
                 yielded_by_cancel = true;
                 return true;
             }
-            if n_gen_in_quantum < quantum_limit {
+            if !multi_slot || n_gen_in_quantum < quantum_limit {
                 return false;
             }
             other_slots_pending || has_waiters_now || pending_ref.load(Ordering::Relaxed) > 0

@@ -57,6 +57,12 @@ pub(crate) fn forward_parsed_event(ev: ParsedEvent, tx: &mpsc::UnboundedSender<S
                 arguments,
             });
         }
+        ParsedEvent::ToolCallStart { index, id, name } => {
+            let _ = tx.send(StreamEvent::ToolCallStart { index, id, name });
+        }
+        ParsedEvent::ToolCallArgsDelta { index, delta } => {
+            let _ = tx.send(StreamEvent::ToolCallArgsDelta { index, delta });
+        }
     }
 }
 
@@ -293,13 +299,17 @@ mod tests {
             parser.push(ch, &mut |ev| match ev {
                 ParsedEvent::Reasoning(s) => r.push_str(&s),
                 ParsedEvent::Token(s) => c.push_str(&s),
-                ParsedEvent::ToolCall { .. } => panic!("unexpected tool call"),
+                ParsedEvent::ToolCall { .. }
+                | ParsedEvent::ToolCallStart { .. }
+                | ParsedEvent::ToolCallArgsDelta { .. } => panic!("unexpected tool call"),
             });
         }
         parser.finish(&mut |ev| match ev {
             ParsedEvent::Reasoning(s) => r.push_str(&s),
             ParsedEvent::Token(s) => c.push_str(&s),
-            ParsedEvent::ToolCall { .. } => panic!("unexpected tool call"),
+            ParsedEvent::ToolCall { .. }
+            | ParsedEvent::ToolCallStart { .. }
+            | ParsedEvent::ToolCallArgsDelta { .. } => panic!("unexpected tool call"),
         });
         assert_eq!(r, "thinking");
         assert_eq!(c, "\nanswer");
@@ -394,21 +404,8 @@ mod tests {
         let raw = "checking</think>Here is an example:\n```xml\n<tool_call>ignored</tool_call>\n```\n<tool_call>calc\n<arg_key>a</arg_key><arg_value>7</arg_value><arg_key>b</arg_key><arg_value>6</arg_value><arg_key>tag</arg_key><arg_value>007</arg_value></tool_call><tool_call>calc<arg_key>a</arg_key><arg_value>1</arg_value><arg_key>b</arg_key><arg_value>2</arg_value></tool_call>";
         let mut reasoning = String::new();
         let mut text = String::new();
-        let mut calls = Vec::new();
-        for ch in raw.as_bytes().chunks(5) {
-            let piece = std::str::from_utf8(ch).unwrap();
-            p.push(piece, &mut |ev| match ev {
-                ParsedEvent::Reasoning(s) => reasoning.push_str(&s),
-                ParsedEvent::Token(s) => text.push_str(&s),
-                ParsedEvent::ToolCall {
-                    index,
-                    id,
-                    name,
-                    arguments,
-                } => calls.push((index, id, name, arguments)),
-            });
-        }
-        p.finish(&mut |ev| match ev {
+        let mut calls: Vec<(usize, String, String, String)> = Vec::new();
+        let mut push_ev = |ev: ParsedEvent| match ev {
             ParsedEvent::Reasoning(s) => reasoning.push_str(&s),
             ParsedEvent::Token(s) => text.push_str(&s),
             ParsedEvent::ToolCall {
@@ -417,7 +414,20 @@ mod tests {
                 name,
                 arguments,
             } => calls.push((index, id, name, arguments)),
-        });
+            ParsedEvent::ToolCallStart { index, id, name } => {
+                calls.push((index, id, name, String::new()));
+            }
+            ParsedEvent::ToolCallArgsDelta { index, delta } => {
+                if let Some(c) = calls.iter_mut().find(|c| c.0 == index) {
+                    c.3.push_str(&delta);
+                }
+            }
+        };
+        for ch in raw.as_bytes().chunks(5) {
+            let piece = std::str::from_utf8(ch).unwrap();
+            p.push(piece, &mut push_ev);
+        }
+        p.finish(&mut push_ev);
         assert_eq!(reasoning, "checking");
         assert!(text.contains("<tool_call>ignored</tool_call>"));
         assert_eq!(calls.len(), 2);
@@ -428,6 +438,103 @@ mod tests {
         assert_eq!(a0, json!({"a": 7, "b": 6, "tag": "007"}));
         let a1: serde_json::Value = serde_json::from_str(&calls[1].3).unwrap();
         assert_eq!(a1, json!({"a": 1, "b": 2}));
+    }
+
+    #[test]
+    fn test_glm5_incremental_tool_call_streaming() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filePath": { "type": "string" },
+                        "content": { "type": "string" },
+                        "line": { "type": "integer" }
+                    }
+                }
+            }
+        })];
+        let schemas = extract_tool_schemas(Some(&tools));
+        let mut p = OutputParser::new(
+            ChatOutputMode::Glm5 {
+                expect_think_close: false,
+                parse_tools: true,
+                prefill: String::new(),
+                schemas,
+            },
+            "call_inc".to_owned(),
+        );
+
+        let mut events = Vec::new();
+        p.push("<tool_call>write_file\n<arg_key>filePath</arg_key><arg_value>", &mut |ev| {
+            events.push(ev);
+        });
+        assert!(
+            matches!(
+                events.first(),
+                Some(ParsedEvent::ToolCallStart { index: 0, name, .. }) if name == "write_file"
+            ),
+            "expected ToolCallStart before closing </tool_call>, got: {events:?}"
+        );
+
+        let deltas_before_close = |evs: &[ParsedEvent]| -> usize {
+            evs.iter()
+                .filter(|e| matches!(e, ParsedEvent::ToolCallArgsDelta { .. }))
+                .count()
+        };
+        let count_0 = deltas_before_close(&events);
+        p.push("src/ma", &mut |ev| events.push(ev));
+        p.push("in.rs</arg_value><arg_key>content</arg_key><arg_value>", &mut |ev| {
+            events.push(ev);
+        });
+        assert!(
+            deltas_before_close(&events) > count_0,
+            "expected streamed argument deltas mid-tool-call"
+        );
+
+        let count_1 = deltas_before_close(&events);
+        p.push("fn main() {\n    println!(\"hi</arg", &mut |ev| events.push(ev));
+        assert!(
+            deltas_before_close(&events) > count_1,
+            "expected long string body to stream before </arg_value>"
+        );
+        // Partial closing tag `</arg` must be held back, not leaked into JSON args
+        let partial_args: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ParsedEvent::ToolCallArgsDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !partial_args.contains("</arg"),
+            "held-back tag prefix leaked: {partial_args:?}"
+        );
+
+        p.push(
+            "_not_tag\\n\");\n}</arg_value><arg_key>line</arg_key><arg_value>42</arg_value></tool_call>",
+            &mut |ev| events.push(ev),
+        );
+        p.finish(&mut |ev| events.push(ev));
+
+        let final_args: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ParsedEvent::ToolCallArgsDelta { index: 0, delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        let parsed: serde_json::Value = serde_json::from_str(&final_args).unwrap();
+        assert_eq!(
+            parsed,
+            json!({
+                "filePath": "src/main.rs",
+                "content": "fn main() {\n    println!(\"hi</arg_not_tag\\n\");\n}",
+                "line": 42
+            })
+        );
     }
 
     #[test]
@@ -486,6 +593,14 @@ mod tests {
                     name,
                     arguments,
                 } => calls.push((index, id, name, arguments)),
+                ParsedEvent::ToolCallStart { index, id, name } => {
+                    calls.push((index, id, name, String::new()));
+                }
+                ParsedEvent::ToolCallArgsDelta { index, delta } => {
+                    if let Some(call) = calls.iter_mut().find(|x| x.0 == index) {
+                        call.3.push_str(&delta);
+                    }
+                }
             });
         }
         parser.finish(&mut |_| {});
@@ -651,30 +766,29 @@ mod tests {
         );
         let decoded_aliased = "thinking</think><tool_call>calc<arg_key>a</arg_key><arg_value>7</arg_value><arg_key>b</arg_key><arg_value>6</arg_value></tool_call>";
         let mut r = String::new();
-        let mut calls = Vec::new();
-        for ch in decoded_aliased.as_bytes().chunks(6) {
-            parser.push(std::str::from_utf8(ch).unwrap(), &mut |ev| match ev {
-                ParsedEvent::Reasoning(s) => r.push_str(&s),
-                ParsedEvent::Token(_) => {}
-                ParsedEvent::ToolCall {
-                    index,
-                    id,
-                    name,
-                    arguments,
-                } => calls.push((index, id, name, arguments)),
-            });
-        }
-        parser.finish(&mut |ev| {
-            if let ParsedEvent::ToolCall {
+        let mut calls: Vec<(usize, String, String, String)> = Vec::new();
+        let mut push_ev = |ev: ParsedEvent| match ev {
+            ParsedEvent::Reasoning(s) => r.push_str(&s),
+            ParsedEvent::Token(_) => {}
+            ParsedEvent::ToolCall {
                 index,
                 id,
                 name,
                 arguments,
-            } = ev
-            {
-                calls.push((index, id, name, arguments));
+            } => calls.push((index, id, name, arguments)),
+            ParsedEvent::ToolCallStart { index, id, name } => {
+                calls.push((index, id, name, String::new()));
             }
-        });
+            ParsedEvent::ToolCallArgsDelta { index, delta } => {
+                if let Some(call) = calls.iter_mut().find(|c| c.0 == index) {
+                    call.3.push_str(&delta);
+                }
+            }
+        };
+        for ch in decoded_aliased.as_bytes().chunks(6) {
+            parser.push(std::str::from_utf8(ch).unwrap(), &mut push_ev);
+        }
+        parser.finish(&mut push_ev);
         assert_eq!(r, "thinking");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].2, "calc");
@@ -809,6 +923,14 @@ mod tests {
                     name,
                     arguments,
                 } => calls.push((index, id, name, arguments)),
+                ParsedEvent::ToolCallStart { index, id, name } => {
+                    calls.push((index, id, name, String::new()));
+                }
+                ParsedEvent::ToolCallArgsDelta { index, delta } => {
+                    if let Some(c) = calls.iter_mut().find(|x| x.0 == index) {
+                        c.3.push_str(&delta);
+                    }
+                }
             });
         }
         parser.finish(&mut |_| {});
@@ -928,6 +1050,14 @@ mod tests {
                     name,
                     arguments,
                 } => calls.push((index, id, name, arguments)),
+                ParsedEvent::ToolCallStart { index, id, name } => {
+                    calls.push((index, id, name, String::new()));
+                }
+                ParsedEvent::ToolCallArgsDelta { index, delta } => {
+                    if let Some(c) = calls.iter_mut().find(|x| x.0 == index) {
+                        c.3.push_str(&delta);
+                    }
+                }
             });
         }
         parser.finish(&mut |_| {});

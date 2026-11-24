@@ -49,6 +49,15 @@ pub enum StreamEvent {
         name: String,
         arguments: String,
     },
+    ToolCallStart {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    ToolCallArgsDelta {
+        index: usize,
+        delta: String,
+    },
     Done {
         prompt_tokens: usize,
         completion_tokens: usize,
@@ -2286,6 +2295,61 @@ pub async fn chat_completions(
                     });
                     events.push(Ok(Event::default().data(p2.to_string())));
                 }
+                StreamEvent::ToolCallStart { index, id, name } => {
+                    let mut d1 = serde_json::Map::new();
+                    if !sent_role {
+                        d1.insert(
+                            "role".to_owned(),
+                            serde_json::Value::String("assistant".to_owned()),
+                        );
+                        sent_role = true;
+                    }
+                    d1.insert(
+                        "tool_calls".to_owned(),
+                        serde_json::json!([{
+                            "index": index,
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": ""
+                            }
+                        }]),
+                    );
+                    let p1 = serde_json::json!({
+                        "id": req_id_c,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_c,
+                        "choices": [{
+                            "index": 0,
+                            "delta": serde_json::Value::Object(d1),
+                            "finish_reason": serde_json::Value::Null
+                        }]
+                    });
+                    events.push(Ok(Event::default().data(p1.to_string())));
+                }
+                StreamEvent::ToolCallArgsDelta { index, delta } => {
+                    let p2 = serde_json::json!({
+                        "id": req_id_c,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_c,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": index,
+                                    "function": {
+                                        "arguments": delta
+                                    }
+                                }]
+                            },
+                            "finish_reason": serde_json::Value::Null
+                        }]
+                    });
+                    events.push(Ok(Event::default().data(p2.to_string())));
+                }
                 StreamEvent::Done {
                     prompt_tokens,
                     completion_tokens,
@@ -2368,6 +2432,24 @@ pub async fn chat_completions(
                         "arguments": arguments
                     }
                 }));
+            }
+            StreamEvent::ToolCallStart { id, name, .. } => {
+                tool_calls.push(serde_json::json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": ""
+                    }
+                }));
+            }
+            StreamEvent::ToolCallArgsDelta { index, delta } => {
+                if let Some(serde_json::Value::String(args)) = tool_calls
+                    .get_mut(index)
+                    .and_then(|entry| entry.pointer_mut("/function/arguments"))
+                {
+                    args.push_str(&delta);
+                }
             }
             StreamEvent::Done {
                 prompt_tokens,
@@ -2485,7 +2567,9 @@ pub async fn completions(
                     })
                     .to_string(),
                 ),
-                StreamEvent::ToolCall { .. } => {
+                StreamEvent::ToolCall { .. }
+                | StreamEvent::ToolCallStart { .. }
+                | StreamEvent::ToolCallArgsDelta { .. } => {
                     return futures::stream::iter(Vec::<Result<Event, Infallible>>::new());
                 }
                 StreamEvent::Done {
@@ -2552,7 +2636,9 @@ pub async fn completions(
     while let Some(ev) = resp_rx.recv().await {
         match ev {
             StreamEvent::Token(t) | StreamEvent::Reasoning(t) => text.push_str(&t),
-            StreamEvent::ToolCall { .. } => {}
+            StreamEvent::ToolCall { .. }
+            | StreamEvent::ToolCallStart { .. }
+            | StreamEvent::ToolCallArgsDelta { .. } => {}
             StreamEvent::Done {
                 prompt_tokens,
                 completion_tokens,
