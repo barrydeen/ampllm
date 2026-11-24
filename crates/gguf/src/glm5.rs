@@ -1,4 +1,4 @@
-use crate::format::{GgufError, GgufFile};
+use crate::format::{GgufError, GgufFile, GgufValue};
 
 /// Architecture configuration for GLM-5.3-Flash (`glm5-next`: HC-4 + Hybrid KDA/DSA + MoE + NextN MTP).
 #[derive(Debug, Clone)]
@@ -183,5 +183,180 @@ impl Glm5Config {
     #[inline]
     pub fn d_inner(&self) -> usize {
         self.n_head * self.kda_head_dim
+    }
+}
+
+/// GLM-5.3-Flash (`glm5next`) Vision Tower + SwiGLU merger configuration from `mmproj` GGUF.
+#[derive(Debug, Clone)]
+pub struct Glm5VisionConfig {
+    pub dim: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub ff: usize,
+    pub layers: usize,
+    pub patch_size: usize,
+    pub spatial_merge: usize,
+    pub image_size: usize,
+    pub out_dim: usize,
+    pub merger_ff: usize,
+    pub eps: f32,
+    pub ffn_clamp: f32,
+    pub min_tokens: usize,
+    pub max_tokens: usize,
+    pub min_pixels: usize,
+    pub max_pixels: usize,
+    pub image_mean: [f32; 3],
+    pub image_std: [f32; 3],
+    pub image_token_id: u32,
+    pub vision_start_id: u32,
+    pub vision_end_id: u32,
+}
+
+impl Glm5VisionConfig {
+    #[inline]
+    pub fn factor(&self) -> usize {
+        self.patch_size * self.spatial_merge
+    }
+
+    #[inline]
+    pub fn image_tokens(&self, width: usize, height: usize) -> usize {
+        let f = self.factor();
+        if width == 0 || height == 0 || width % f != 0 || height % f != 0 {
+            return 0;
+        }
+        let n_tok = (height / f) * (width / f);
+        if n_tok > self.max_tokens {
+            return 0;
+        }
+        n_tok
+    }
+
+    pub fn from_mmproj(
+        mmproj: &GgufFile,
+        vocab_tokens: &[String],
+        n_embd: usize,
+    ) -> Result<Self, GgufError> {
+        let proj_ty = mmproj.metadata.get("clip.projector_type").and_then(|v| v.as_str());
+        if let Some(p) = proj_ty {
+            if p != "glm5next" {
+                return Err(GgufError::MetadataTypeMismatch {
+                    key: "clip.projector_type".to_owned(),
+                    expected: "glm5next",
+                });
+            }
+        }
+        let clip_val = |k: &str| -> Option<&GgufValue> {
+            mmproj
+                .metadata
+                .get(&format!("clip.vision.{k}"))
+                .or_else(|| mmproj.metadata.get(&format!("clip.{k}")))
+        };
+        let get_u = |k: &str, d: Option<usize>| -> Result<usize, GgufError> {
+            match clip_val(k).and_then(|v| v.as_u64()) {
+                Some(n) => Ok(n as usize),
+                None => d.ok_or_else(|| GgufError::MissingMetadata(format!("clip.vision.{k}"))),
+            }
+        };
+        let get_f = |k: &str, d: f32| -> f32 {
+            clip_val(k).and_then(|v| v.as_f32()).unwrap_or(d)
+        };
+        let get_f3 = |k: &str, d: [f32; 3]| -> [f32; 3] {
+            if let Some(arr) = clip_val(k).and_then(|v| v.as_array()) {
+                if arr.len() >= 3 {
+                    return [
+                        arr[0].as_f32().unwrap_or(d[0]),
+                        arr[1].as_f32().unwrap_or(d[1]),
+                        arr[2].as_f32().unwrap_or(d[2]),
+                    ];
+                }
+            }
+            d
+        };
+
+        let dim = get_u("embedding_length", None)?;
+        let heads = get_u("attention.head_count", None)?;
+        let ff = get_u("feed_forward_length", None)?;
+        let layers = get_u("block_count", None)?;
+        let patch_size = get_u("patch_size", None)?;
+        let spatial_merge = get_u("spatial_merge_size", Some(2))?;
+        let image_size = get_u("image_size", Some(448))?;
+        let out_dim = get_u("projection_dim", None)?;
+        let eps = get_f("attention.layer_norm_epsilon", 1e-5);
+        let ffn_clamp = get_f("ffn_clamp", 10.0);
+        let min_tokens = get_u("image_min_tokens", Some(16))?;
+        let meta_max_tokens = get_u("image_max_tokens", Some(8000))?;
+        let max_tokens = std::env::var("AMPLLM_VISION_MAX_TOKENS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or_else(|| meta_max_tokens.min(2560))
+            .clamp(min_tokens, meta_max_tokens);
+        let image_mean = get_f3("image_mean", [0.48145467, 0.4578275, 0.40821072]);
+        let image_std = get_f3("image_std", [0.26862955, 0.2613026, 0.2757771]);
+
+        for req in [
+            "v.patch_embd.weight",
+            "v.patch_embd.weight.1",
+            "v.patch_embd.bias",
+            "v.post_ln.weight",
+            "mm.patch_merger.weight",
+            "mm.patch_merger.bias",
+            "mm.model.fc.weight",
+            "mm.post_norm.weight",
+            "mm.post_norm.bias",
+            "mm.gate.weight",
+            "mm.up.weight",
+            "mm.down.weight",
+        ] {
+            let _ = mmproj.tensor_info(req)?;
+        }
+        let merger_ff = mmproj
+            .tensor_info("mm.gate.weight")?
+            .dims
+            .get(1)
+            .copied()
+            .unwrap_or(0) as usize;
+        if out_dim != n_embd || spatial_merge != 2 || dim % heads != 0 || merger_ff == 0 {
+            return Err(GgufError::MetadataTypeMismatch {
+                key: "clip.vision".to_owned(),
+                expected: "matching glm5next vision geometry",
+            });
+        }
+
+        let factor = patch_size * spatial_merge;
+        let factor_sq = factor * factor;
+        let min_pixels = min_tokens * factor_sq;
+        let max_pixels = max_tokens * factor_sq;
+
+        let find_tok = |exact: &str, default_id: u32| -> u32 {
+            vocab_tokens
+                .iter()
+                .position(|s| s == exact)
+                .map(|i| i as u32)
+                .unwrap_or(default_id)
+        };
+
+        Ok(Self {
+            dim,
+            heads,
+            head_dim: dim / heads,
+            ff,
+            layers,
+            patch_size,
+            spatial_merge,
+            image_size,
+            out_dim,
+            merger_ff,
+            eps,
+            ffn_clamp,
+            min_tokens,
+            max_tokens,
+            min_pixels,
+            max_pixels,
+            image_mean,
+            image_std,
+            image_token_id: find_tok("<|image|>", 154854),
+            vision_start_id: find_tok("<|begin_of_image|>", 154830),
+            vision_end_id: find_tok("<|end_of_image|>", 154831),
+        })
     }
 }

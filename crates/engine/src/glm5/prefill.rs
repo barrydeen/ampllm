@@ -1,11 +1,12 @@
 use crate::glm5::cache::{LayerCacheMeta, LentPoolTail};
 use crate::glm5::decode::{
     decode_token_m1, dequant_embed_to_host, enqueue_layer_m1, hop_gpu0_to_gpu1_r0,
-    mtp_cache_entry_m1,
+    mtp_cache_entry_m1_with_images,
 };
 use crate::glm5::state::{
     DoorbellActiveGuard, DsaLayerState, Glm5State, GpuScratch, KdaLayerState,
 };
+use crate::glm5::vision::Glm5ImageSpan;
 use crate::glm5::weights::{DevWeight, Glm5LayerWeights, Glm5ModelWeights};
 use ampllm_cpu_kernels::glm5_cpu::{
     quantize_glm5_cpu_x_q8k, run_glm5_cpu_moe_grouped_prequant, Glm5CpuGroupedExpert,
@@ -2748,6 +2749,34 @@ fn run_half_layers_split(ctx: &mut HalfPrefillCtx<'_>, pos0: usize, m: usize) ->
     Ok(())
 }
 
+#[inline]
+pub(crate) fn image_span_covers(images: &[Glm5ImageSpan], n_embd: usize, pos: usize) -> bool {
+    images
+        .iter()
+        .any(|span| pos >= span.start_pos && pos < span.start_pos + span.n_tokens(n_embd))
+}
+
+#[inline]
+pub(crate) fn fill_token_embed_host(
+    gguf: &GgufFile,
+    weights: &Glm5ModelWeights,
+    token: u32,
+    pos: usize,
+    images: &[Glm5ImageSpan],
+    dst: &mut [f32],
+) -> Result<()> {
+    let n_embd = weights.cfg.n_embd;
+    for span in images {
+        let n_tok = span.n_tokens(n_embd);
+        if pos >= span.start_pos && pos < span.start_pos + n_tok {
+            let local = pos - span.start_pos;
+            dst.copy_from_slice(&span.rows[local * n_embd..(local + 1) * n_embd]);
+            return Ok(());
+        }
+    }
+    dequant_embed_to_host(gguf, weights, token, dst)
+}
+
 unsafe fn mtp_cache_chunk_split(
     gguf: &GgufFile,
     weights: &Glm5ModelWeights,
@@ -2758,6 +2787,7 @@ unsafe fn mtp_cache_chunk_split(
     mtp_cached_pos: &mut usize,
     pos0: usize,
     next_toks: &[u32],
+    images: &[Glm5ImageSpan],
 ) -> Result<()> {
     let Some(mtp_l) = weights.cfg.mtp_layer else {
         return Ok(());
@@ -2773,7 +2803,14 @@ unsafe fn mtp_cache_chunk_split(
     let stream = &sc.stream;
 
     for (j, &nt) in next_toks.iter().enumerate() {
-        dequant_embed_to_host(gguf, weights, nt, &mut hop_emb_pin1[j * n_embd..(j + 1) * n_embd])?;
+        fill_token_embed_host(
+            gguf,
+            weights,
+            nt,
+            pos0 + j + 1,
+            images,
+            &mut hop_emb_pin1[j * n_embd..(j + 1) * n_embd],
+        )?;
     }
     let emb_bytes = std::slice::from_raw_parts(hop_emb_pin1.as_ptr().cast::<u8>(), n_mtp * n_embd * 4);
     sc.emb.copy_from_host_async(emb_bytes, stream)?;
@@ -2905,6 +2942,7 @@ unsafe fn compute_final_head_and_mtp(
     hop_emb_pin1: &mut [f32],
     mtp_cached_pos: &mut usize,
     tokens: &[u32],
+    images: &[Glm5ImageSpan],
     pos0: usize,
     next_tok_after_chunk: Option<u32>,
     is_final_chunk: bool,
@@ -2998,6 +3036,7 @@ unsafe fn compute_final_head_and_mtp(
                     mtp_cached_pos,
                     first_pos.unwrap(),
                     &mtp_next_toks,
+                    images,
                 )?;
             }
         }
@@ -3019,6 +3058,7 @@ pub fn prefill_chunk(
     weights: &Glm5ModelWeights,
     state: &mut Glm5State,
     tokens: &[u32],
+    images: &[Glm5ImageSpan],
     pos0: usize,
     next_tok_after_chunk: Option<u32>,
     is_final_chunk: bool,
@@ -3046,18 +3086,24 @@ pub fn prefill_chunk(
 
     if let Some(prev_p) = state.head_x_pos {
         if prev_p + 1 == pos0 && state.mtp_cached_pos == prev_p {
-            mtp_cache_entry_m1(
+            mtp_cache_entry_m1_with_images(
                 gguf,
                 weights,
                 state,
                 prev_p,
                 state.head_x.ptr.cast(),
                 tokens[0],
+                images,
             )?;
         }
     }
 
-    if m == 1 && next_tok_after_chunk.is_none() && is_final_chunk && lent_views.is_none() {
+    if m == 1
+        && next_tok_after_chunk.is_none()
+        && is_final_chunk
+        && lent_views.is_none()
+        && !image_span_covers(images, weights.cfg.n_embd, pos0)
+    {
         let res = decode_token_m1(gguf, weights, state, tokens[0], need_logits)?;
         return Ok(Some(res));
     }
@@ -3094,7 +3140,14 @@ pub fn prefill_chunk(
             let ms = (m - s_off).min(max_slice);
             let dst = &mut state.hop_emb_pin0.as_mut_slice()[..ms * n_embd];
             for (i, &tok) in tokens[s_off..s_off + ms].iter().enumerate() {
-                dequant_embed_to_host(gguf, weights, tok, &mut dst[i * n_embd..(i + 1) * n_embd])?;
+                fill_token_embed_host(
+                    gguf,
+                    weights,
+                    tok,
+                    pos0 + s_off + i,
+                    images,
+                    &mut dst[i * n_embd..(i + 1) * n_embd],
+                )?;
             }
             let emb_bytes =
                 std::slice::from_raw_parts(state.hop_emb_pin0.host_ptr().cast::<u8>(), ms * n_embd * 4);
@@ -3291,6 +3344,7 @@ pub fn prefill_chunk(
             hop_emb1,
             &mut mtp_pos,
             tokens,
+            images,
             pos0,
             next_tok_after_chunk,
             is_final_chunk,
@@ -3339,6 +3393,7 @@ pub fn prefill_slice_pipelined(
     weights: &Glm5ModelWeights,
     state: &mut Glm5State,
     tokens: &[u32],
+    images: &[Glm5ImageSpan],
     chunk_size: usize,
     need_logits: bool,
     lent_views: Option<(&PrefillViews, &PrefillViews)>,
@@ -3365,13 +3420,14 @@ pub fn prefill_slice_pipelined(
     if let Some(prev_p) = state.head_x_pos {
         if prev_p + 1 == base_pos0 && state.mtp_cached_pos == prev_p {
             let _active_guard = DoorbellActiveGuard::new(&state.doorbell.active);
-            mtp_cache_entry_m1(
+            mtp_cache_entry_m1_with_images(
                 gguf,
                 weights,
                 state,
                 prev_p,
                 state.head_x.ptr.cast(),
                 tokens[0],
+                images,
             )?;
         }
     }
@@ -3480,10 +3536,12 @@ pub fn prefill_slice_pipelined(
                             .iter()
                             .enumerate()
                         {
-                            dequant_embed_to_host(
+                            fill_token_embed_host(
                                 gguf,
                                 weights,
                                 tok,
+                                pos0_c + s_off + i,
+                                images,
                                 &mut hop_emb_pin0_slice[i * n_embd..(i + 1) * n_embd],
                             )?;
                         }
@@ -3671,6 +3729,7 @@ pub fn prefill_slice_pipelined(
                         hop_emb_pin1_slice,
                         &mut mtp_cached_pos,
                         &tokens[msg.off..msg.end],
+                        images,
                         pos0_c,
                         next_after,
                         is_final,

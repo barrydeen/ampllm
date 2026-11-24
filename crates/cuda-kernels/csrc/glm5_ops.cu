@@ -7388,3 +7388,123 @@ extern "C" void launch_glm5_moe_prefill_small_down_det(
         d_type, exp_ptrs, slot_off, slot_nt, pair_all, wts_all,
         d_off, d_row_bytes, inter_q8, pair_out_f32, n_embd, n_ff, n_jobs, stream);
 }
+
+// -----------------------------------------------------------------------------
+// GLM-5.3 Vision Tower Helpers (per-head Q/K RMSNorm & LayerNorm + GELU-erf F16)
+// -----------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(32) glm5_vis_qk_rmsnorm_inplace_kernel(
+    float* __restrict__ qkv,
+    const float* __restrict__ q_norm_w,
+    const float* __restrict__ k_norm_w,
+    int heads,
+    int hd,
+    float eps
+) {
+    const int h = (int)blockIdx.x;
+    const int n = (int)blockIdx.y;
+    const int lane = (int)threadIdx.x;
+    const size_t D = (size_t)heads * (size_t)hd;
+    float* q_head = qkv + (size_t)n * 3 * D + (size_t)h * (size_t)hd;
+    float* k_head = q_head + D;
+
+    float q_sq = 0.0f;
+    float k_sq = 0.0f;
+    for (int i = lane; i < hd; i += 32) {
+        const float qv = q_head[i];
+        const float kv = k_head[i];
+        q_sq += qv * qv;
+        k_sq += kv * kv;
+    }
+    const float q_inv = rsqrtf(warp_reduce_sum(q_sq) / (float)hd + eps);
+    const float k_inv = rsqrtf(warp_reduce_sum(k_sq) / (float)hd + eps);
+    for (int i = lane; i < hd; i += 32) {
+        q_head[i] = q_head[i] * q_inv * q_norm_w[i];
+        k_head[i] = k_head[i] * k_inv * k_norm_w[i];
+    }
+}
+
+extern "C" void launch_glm5_vis_qk_rmsnorm_inplace(
+    float* qkv,
+    const float* q_norm_w,
+    const float* k_norm_w,
+    int n_patches,
+    int heads,
+    int hd,
+    float eps,
+    cudaStream_t stream
+) {
+    if (n_patches <= 0 || heads <= 0 || hd <= 0) return;
+    dim3 grid((unsigned)heads, (unsigned)n_patches, 1);
+    glm5_vis_qk_rmsnorm_inplace_kernel<<<grid, 32, 0, stream>>>(
+        qkv, q_norm_w, k_norm_w, heads, hd, eps);
+}
+
+__global__ void __launch_bounds__(256) glm5_vis_layernorm_gelu_erf_f16_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    const float* __restrict__ b,
+    int d,
+    float eps,
+    uint16_t* __restrict__ out_f16
+) {
+    const float* r = x + (size_t)blockIdx.x * (size_t)d;
+    const int tid = (int)threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    __shared__ float sm_sum[8];
+    __shared__ float sm_sq[8];
+
+    float s = 0.0f;
+    for (int i = tid; i < d; i += 256) {
+        s += r[i];
+    }
+    s = warp_reduce_sum(s);
+    if (lane == 0) sm_sum[warp] = s;
+    __syncthreads();
+    if (warp == 0) {
+        float tot = (lane < 8) ? sm_sum[lane] : 0.0f;
+        tot = warp_reduce_sum(tot);
+        if (lane == 0) sm_sum[0] = tot / (float)d;
+    }
+    __syncthreads();
+    const float mean = sm_sum[0];
+
+    float q = 0.0f;
+    for (int i = tid; i < d; i += 256) {
+        const float dv = r[i] - mean;
+        q += dv * dv;
+    }
+    q = warp_reduce_sum(q);
+    if (lane == 0) sm_sq[warp] = q;
+    __syncthreads();
+    if (warp == 0) {
+        float tot = (lane < 8) ? sm_sq[lane] : 0.0f;
+        tot = warp_reduce_sum(tot);
+        if (lane == 0) sm_sq[0] = rsqrtf(tot / (float)d + eps);
+    }
+    __syncthreads();
+    const float inv = sm_sq[0];
+
+    uint16_t* dst = out_f16 + (size_t)blockIdx.x * (size_t)d;
+    for (int i = tid; i < d; i += 256) {
+        const float v = (r[i] - mean) * inv * w[i] + b[i];
+        const float g = 0.5f * v * (1.0f + erff(v * 0.7071067811865475f));
+        dst[i] = f32_to_fp16_bits(g);
+    }
+}
+
+extern "C" void launch_glm5_vis_layernorm_gelu_erf_f16(
+    const float* x,
+    const float* w,
+    const float* b,
+    int rows,
+    int d,
+    float eps,
+    uint16_t* out_f16,
+    cudaStream_t stream
+) {
+    if (rows <= 0 || d <= 0) return;
+    glm5_vis_layernorm_gelu_erf_f16_kernel<<<(unsigned)rows, 256, 0, stream>>>(
+        x, w, b, d, eps, out_f16);
+}

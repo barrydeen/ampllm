@@ -6574,6 +6574,124 @@ fn test_glm5_stage_c9_kernels_parity_and_bench() {
     }
 }
 
+#[test]
+fn test_glm5_vis_kernels_parity() {
+    let _gpu_guard = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    ampllm_cuda_kernels::set_device(0).unwrap();
+    let stream = CudaStream::new(0).unwrap();
+    let mut rng = Rng(0x9a8b7c6d5e4f3210);
+
+    // 1. vis_qk_rmsnorm_inplace
+    let n_patches = 64usize;
+    let heads = 16usize;
+    let hd = 64usize;
+    let d = heads * hd;
+    let eps = 1e-5f32;
+    let mut h_qkv: Vec<f32> = (0..(n_patches * 3 * d)).map(|_| rng.next_f32() * 1.5).collect();
+    let q_nw: Vec<f32> = (0..hd).map(|_| 0.7 + rng.next_f32() * 0.6).collect();
+    let k_nw: Vec<f32> = (0..hd).map(|_| 0.7 + rng.next_f32() * 0.6).collect();
+
+    let mut ref_qkv = h_qkv.clone();
+    for n in 0..n_patches {
+        for h in 0..heads {
+            let q_off = n * 3 * d + h * hd;
+            let k_off = q_off + d;
+            let q_sq: f64 = ref_qkv[q_off..q_off + hd].iter().map(|&v| (v as f64) * (v as f64)).sum();
+            let k_sq: f64 = ref_qkv[k_off..k_off + hd].iter().map(|&v| (v as f64) * (v as f64)).sum();
+            let q_inv = 1.0 / (q_sq / (hd as f64) + eps as f64).sqrt();
+            let k_inv = 1.0 / (k_sq / (hd as f64) + eps as f64).sqrt();
+            for i in 0..hd {
+                ref_qkv[q_off + i] = (ref_qkv[q_off + i] as f64 * q_inv * q_nw[i] as f64) as f32;
+                ref_qkv[k_off + i] = (ref_qkv[k_off + i] as f64 * k_inv * k_nw[i] as f64) as f32;
+            }
+        }
+    }
+
+    let d_qkv = DeviceBuffer::alloc(0, h_qkv.len() * 4).unwrap();
+    let d_qnw = DeviceBuffer::alloc(0, q_nw.len() * 4).unwrap();
+    let d_knw = DeviceBuffer::alloc(0, k_nw.len() * 4).unwrap();
+    d_qkv.copy_from_host(bytemuck::cast_slice(&h_qkv)).unwrap();
+    d_qnw.copy_from_host(bytemuck::cast_slice(&q_nw)).unwrap();
+    d_knw.copy_from_host(bytemuck::cast_slice(&k_nw)).unwrap();
+    unsafe {
+        glm5::vis_qk_rmsnorm_inplace(
+            d_qkv.ptr.cast(),
+            d_qnw.ptr.cast(),
+            d_knw.ptr.cast(),
+            n_patches as i32,
+            heads as i32,
+            hd as i32,
+            eps,
+            &stream,
+        );
+    }
+    stream.sync().unwrap();
+    d_qkv.copy_to_host(bytemuck::cast_slice_mut(&mut h_qkv)).unwrap();
+    let max_qk = h_qkv
+        .iter()
+        .zip(ref_qkv.iter())
+        .map(|(&a, &b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_qk < 1e-5, "vis_qk_rmsnorm_inplace max_abs_err={max_qk}");
+
+    // 2. vis_layernorm_gelu_erf_f16
+    let rows = 32usize;
+    let dim = 4096usize;
+    let x: Vec<f32> = (0..(rows * dim)).map(|_| rng.next_f32() * 2.0).collect();
+    let w: Vec<f32> = (0..dim).map(|_| 0.8 + rng.next_f32() * 0.4).collect();
+    let b: Vec<f32> = (0..dim).map(|_| rng.next_f32() * 0.2).collect();
+
+    fn erf_approx(z: f64) -> f64 {
+        let sign = if z < 0.0 { -1.0 } else { 1.0 };
+        let ax = z.abs();
+        let t = 1.0 / (1.0 + 0.3275911 * ax);
+        let y = 1.0
+            - (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t
+                + 0.254829592)
+                * t)
+                * (-ax * ax).exp();
+        sign * y
+    }
+
+    let mut ref_out = vec![0.0f32; rows * dim];
+    for r in 0..rows {
+        let row = &x[r * dim..(r + 1) * dim];
+        let mean = row.iter().map(|&v| v as f64).sum::<f64>() / dim as f64;
+        let var = row.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / dim as f64;
+        let inv = 1.0 / (var + eps as f64).sqrt();
+        for c in 0..dim {
+            let v = (row[c] as f64 - mean) * inv * (w[c] as f64) + (b[c] as f64);
+            ref_out[r * dim + c] = (0.5 * v * (1.0 + erf_approx(v * std::f64::consts::FRAC_1_SQRT_2))) as f32;
+        }
+    }
+
+    let d_x = DeviceBuffer::alloc(0, x.len() * 4).unwrap();
+    let d_w = DeviceBuffer::alloc(0, w.len() * 4).unwrap();
+    let d_b = DeviceBuffer::alloc(0, b.len() * 4).unwrap();
+    let d_out16 = DeviceBuffer::alloc(0, rows * dim * 2).unwrap();
+    d_x.copy_from_host(bytemuck::cast_slice(&x)).unwrap();
+    d_w.copy_from_host(bytemuck::cast_slice(&w)).unwrap();
+    d_b.copy_from_host(bytemuck::cast_slice(&b)).unwrap();
+    unsafe {
+        glm5::vis_layernorm_gelu_erf_f16(
+            d_x.ptr.cast(),
+            d_w.ptr.cast(),
+            d_b.ptr.cast(),
+            rows as i32,
+            dim as i32,
+            eps,
+            d_out16.ptr,
+            &stream,
+        );
+    }
+    stream.sync().unwrap();
+    let mut got_u16 = vec![0u16; rows * dim];
+    d_out16.copy_to_host(bytemuck::cast_slice_mut(&mut got_u16)).unwrap();
+    let got_f32: Vec<f32> = got_u16.iter().map(|&u| half::f16::from_bits(u).to_f32()).collect();
+    let re_ln = rel_err(&got_f32, &ref_out);
+    assert!(re_ln < 2e-3, "vis_layernorm_gelu_erf_f16 rel_err={re_ln}");
+}
+
 
 
 

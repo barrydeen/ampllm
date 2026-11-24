@@ -966,13 +966,135 @@ impl OutputParser {
                 } => match *state {
                     GlmState::Think => {
                         const THINK_CLOSE: &str = "</think>";
-                        if let Some(idx) = self.buf.find(THINK_CLOSE) {
-                            if idx > 0 {
-                                emit(ParsedEvent::Reasoning(self.buf[..idx].to_owned()));
+                        if !*parse_tools {
+                            if let Some(idx) = self.buf.find(THINK_CLOSE) {
+                                if idx > 0 {
+                                    emit(ParsedEvent::Reasoning(self.buf[..idx].to_owned()));
+                                }
+                                self.buf.drain(..idx + THINK_CLOSE.len());
+                                *state = GlmState::Text;
+                                continue;
                             }
-                            self.buf.drain(..idx + THINK_CLOSE.len());
-                            *state = GlmState::Text;
-                            continue;
+                            if eof {
+                                if !self.buf.is_empty() {
+                                    emit(ParsedEvent::Reasoning(std::mem::take(&mut self.buf)));
+                                }
+                                return;
+                            }
+                            let keep = trailing_delim_prefix_len(&self.buf, &[THINK_CLOSE]);
+                            let flush = floor_char_boundary(&self.buf, self.buf.len() - keep);
+                            if flush > 0 {
+                                emit(ParsedEvent::Reasoning(self.buf[..flush].to_owned()));
+                                self.buf.drain(..flush);
+                            }
+                            return;
+                        }
+
+                        if *in_code_fence {
+                            const THINK_FENCE_DELIMS: [&str; 2] = [THINK_CLOSE, "```"];
+                            if let Some((idx, pat)) = earliest_match(&self.buf, &THINK_FENCE_DELIMS) {
+                                match pat {
+                                    THINK_CLOSE => {
+                                        if idx > 0 {
+                                            emit(ParsedEvent::Reasoning(self.buf[..idx].to_owned()));
+                                        }
+                                        self.buf.drain(..idx + THINK_CLOSE.len());
+                                        *in_code_fence = false;
+                                        *state = GlmState::Text;
+                                        continue;
+                                    }
+                                    _ => {
+                                        let end = idx + 3;
+                                        emit(ParsedEvent::Reasoning(self.buf[..end].to_owned()));
+                                        self.buf.drain(..end);
+                                        *in_code_fence = false;
+                                        continue;
+                                    }
+                                }
+                            }
+                            if eof {
+                                if !self.buf.is_empty() {
+                                    emit(ParsedEvent::Reasoning(std::mem::take(&mut self.buf)));
+                                }
+                                return;
+                            }
+                            let keep = trailing_delim_prefix_len(&self.buf, &THINK_FENCE_DELIMS);
+                            let flush = floor_char_boundary(&self.buf, self.buf.len() - keep);
+                            if flush > 0 {
+                                emit(ParsedEvent::Reasoning(self.buf[..flush].to_owned()));
+                                self.buf.drain(..flush);
+                            }
+                            return;
+                        }
+
+                        const THINK_DELIMS: [&str; 3] = [THINK_CLOSE, "<tool_call>", "```"];
+                        if let Some((idx, pat)) = earliest_match(&self.buf, &THINK_DELIMS) {
+                            match pat {
+                                THINK_CLOSE => {
+                                    if idx > 0 {
+                                        emit(ParsedEvent::Reasoning(self.buf[..idx].to_owned()));
+                                    }
+                                    self.buf.drain(..idx + THINK_CLOSE.len());
+                                    *state = GlmState::Text;
+                                    continue;
+                                }
+                                "```" => {
+                                    let end = idx + 3;
+                                    emit(ParsedEvent::Reasoning(self.buf[..end].to_owned()));
+                                    self.buf.drain(..end);
+                                    *in_code_fence = true;
+                                    continue;
+                                }
+                                _ => {
+                                    const TC: &str = "<tool_call>";
+                                    let after = &self.buf[idx + TC.len()..];
+                                    let probe_end = if *qwen4_xml_tools {
+                                        earliest_match(after, &["<function=", THINK_CLOSE, "</tool_call>"])
+                                    } else {
+                                        earliest_match(after, &["<arg_key>", "</tool_call>", THINK_CLOSE])
+                                    };
+                                    if let Some((a_idx, delim)) = probe_end {
+                                        if delim != THINK_CLOSE {
+                                            let fn_name = after[..a_idx].trim();
+                                            let valid_implicit = if *qwen4_xml_tools {
+                                                delim == "<function=" && fn_name.is_empty()
+                                            } else {
+                                                !fn_name.is_empty()
+                                                    && fn_name.len() <= 128
+                                                    && fn_name.chars().all(|c| {
+                                                        !c.is_whitespace() && c != '<' && c != '>'
+                                                    })
+                                            };
+                                            if valid_implicit {
+                                                if idx > 0 {
+                                                    emit(ParsedEvent::Reasoning(
+                                                        self.buf[..idx].to_owned(),
+                                                    ));
+                                                }
+                                                self.buf.drain(..idx + TC.len());
+                                                *state = GlmState::InToolCall;
+                                                *tool_stream = GlmToolStream::default();
+                                                continue;
+                                            }
+                                        }
+                                        let end = idx + TC.len();
+                                        emit(ParsedEvent::Reasoning(self.buf[..end].to_owned()));
+                                        self.buf.drain(..end);
+                                        continue;
+                                    }
+                                    if eof || after.len() > 128 {
+                                        let end = idx + TC.len();
+                                        emit(ParsedEvent::Reasoning(self.buf[..end].to_owned()));
+                                        self.buf.drain(..end);
+                                        continue;
+                                    }
+                                    if idx > 0 {
+                                        emit(ParsedEvent::Reasoning(self.buf[..idx].to_owned()));
+                                        self.buf.drain(..idx);
+                                    }
+                                    return;
+                                }
+                            }
                         }
                         if eof {
                             if !self.buf.is_empty() {
@@ -980,7 +1102,7 @@ impl OutputParser {
                             }
                             return;
                         }
-                        let keep = trailing_delim_prefix_len(&self.buf, &[THINK_CLOSE]);
+                        let keep = trailing_delim_prefix_len(&self.buf, &THINK_DELIMS);
                         let flush = floor_char_boundary(&self.buf, self.buf.len() - keep);
                         if flush > 0 {
                             emit(ParsedEvent::Reasoning(self.buf[..flush].to_owned()));

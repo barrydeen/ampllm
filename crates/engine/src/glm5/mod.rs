@@ -2,7 +2,10 @@ pub mod cache;
 pub mod decode;
 pub mod prefill;
 pub mod state;
+pub mod vision;
 pub mod weights;
+
+pub use vision::{Glm5ImageSpan, Glm5Vision};
 
 use crate::config::EngineConfig;
 use crate::glm5::decode::{
@@ -26,7 +29,7 @@ use crate::snapshot::{
 use ampllm_cache::{CacheProfile, CacheStats};
 use ampllm_cpu_kernels::CpuThreadPool;
 use ampllm_cuda_kernels::set_device;
-use ampllm_gguf::{GgufFile, Glm5Config};
+use ampllm_gguf::{GgufFile, Glm5Config, Glm5VisionConfig};
 use ampllm_tokenizer::BpeTokenizer;
 use anyhow::Result;
 use std::path::PathBuf;
@@ -89,10 +92,12 @@ fn ngram_predict(history: &[u32], prefix: &[u32]) -> Option<u32> {
 /// GLM-5.3-Flash engine owning state, weights, and mmap'd GGUF.
 /// Field order enforces safe Drop sequence:
 /// 1. `state` (joins `DoorbellWorker` thread first),
-/// 2. `weights` (releases `DeviceBuffer`s & `CpuColdArena` second),
-/// 3. `gguf` (unmaps GGUF shard mmaps last).
+/// 2. `vision` (releases GPU 0 vision buffers),
+/// 3. `weights` (releases `DeviceBuffer`s & `CpuColdArena`),
+/// 4. `gguf` (unmaps GGUF shard mmaps last).
 pub struct Glm5Engine {
     state: Glm5State,
+    vision: Option<Glm5Vision>,
     weights: Glm5ModelWeights,
     gguf: GgufFile,
     pub max_ctx: usize,
@@ -113,6 +118,21 @@ impl Glm5Engine {
             Some(p) => Some(CacheProfile::load(p)?),
             None => None,
         };
+        let vision = if let Some(mm_path) = gguf
+            .shard_paths
+            .first()
+            .map(|p| ampllm_gguf::discover_glm5_mmproj(p, None))
+            .transpose()?
+            .flatten()
+        {
+            let mm_gguf = GgufFile::open(&mm_path)?;
+            let vcfg = Glm5VisionConfig::from_mmproj(&mm_gguf, tok.vocab(), gcfg.n_embd)?;
+            let vis = Glm5Vision::load(&mm_gguf, vcfg, 0)?;
+            tracing::info!("GLM-5.3 vision loaded from {}", mm_path.display());
+            Some(vis)
+        } else {
+            None
+        };
         let cpu_pool = Arc::new(CpuThreadPool::new(cfg.cpu_threads));
         let weights = Glm5ModelWeights::load(&gguf, tok, &gcfg, max_ctx, profile.as_ref(), None)?;
         let state = Glm5State::alloc(&weights, cpu_pool, max_ctx)?;
@@ -121,6 +141,7 @@ impl Glm5Engine {
 
         Ok(Self {
             state,
+            vision,
             weights,
             gguf,
             max_ctx,
@@ -132,6 +153,27 @@ impl Glm5Engine {
             committed_tokens: Vec::new(),
             prefix_reuse_tokens_total: 0,
         })
+    }
+
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    pub fn vision_config(&self) -> Option<&Glm5VisionConfig> {
+        self.vision.as_ref().map(|v| &v.cfg)
+    }
+
+    pub fn encode_image(
+        &mut self,
+        rgb: &[u8],
+        width: usize,
+        height: usize,
+    ) -> Result<(usize, usize, Vec<f32>)> {
+        let vis = self
+            .vision
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("GLM-5 model loaded without mmproj vision weights"))?;
+        vis.encode_image(rgb, width, height, &self.state.sc0.stream)
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -360,7 +402,7 @@ impl Glm5Engine {
 
     pub fn cache_summary(&self) -> String {
         format!(
-            "GLM-5.3 split_layer={} | VRAM experts {}/{} ({:.1}%) | GPU0={} MiB, GPU1={} MiB | dsa_res_cap={} | spec={} | graph={}",
+            "GLM-5.3 split_layer={} | VRAM experts {}/{} ({:.1}%) | GPU0={} MiB, GPU1={} MiB | dsa_res_cap={} | spec={} | graph={} | vision={}",
             self.weights.split_layer,
             self.weights.vram_resident_experts,
             self.weights.total_routed_experts,
@@ -371,12 +413,22 @@ impl Glm5Engine {
             self.weights.dsa_res_cap,
             self.use_spec,
             self.use_cuda_graph,
+            self.has_vision(),
         )
     }
 
     fn prefill_slice(
         &mut self,
         tokens: &[u32],
+        need_logits: bool,
+    ) -> Result<(u32, Option<Vec<f32>>)> {
+        self.prefill_slice_with_images(tokens, &[], need_logits)
+    }
+
+    fn prefill_slice_with_images(
+        &mut self,
+        tokens: &[u32],
+        images: &[Glm5ImageSpan],
         need_logits: bool,
     ) -> Result<(u32, Option<Vec<f32>>)> {
         let total = tokens.len();
@@ -390,6 +442,7 @@ impl Glm5Engine {
                 &self.weights,
                 &mut self.state,
                 tokens,
+                images,
                 pos0,
                 None,
                 true,
@@ -495,6 +548,7 @@ impl Glm5Engine {
                     &self.weights,
                     &mut self.state,
                     tokens,
+                    images,
                     chunk_size,
                     need_logits,
                     Some((&views0, &views1)),
@@ -506,6 +560,7 @@ impl Glm5Engine {
                     &self.weights,
                     &mut self.state,
                     tokens,
+                    images,
                     pos0,
                     None,
                     true,
@@ -566,8 +621,30 @@ impl Glm5Engine {
         F: FnMut(u32) -> bool,
     {
         let mut no_yield = |_: usize| false;
-        let qres = self.generate_stream_quantum(
+        let qres = self.generate_stream_quantum_with_images(
             prompt_tokens,
+            &[],
+            params,
+            QuantumOptions::no_yield(&mut no_yield),
+            on_token,
+        )?;
+        Ok(qres.result)
+    }
+
+    pub fn generate_stream_with_images<F>(
+        &mut self,
+        prompt_tokens: &[u32],
+        images: &[Glm5ImageSpan],
+        params: &SamplingParams,
+        on_token: F,
+    ) -> Result<StreamGenerateResult>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        let mut no_yield = |_: usize| false;
+        let qres = self.generate_stream_quantum_with_images(
+            prompt_tokens,
+            images,
             params,
             QuantumOptions::no_yield(&mut no_yield),
             on_token,
@@ -580,6 +657,20 @@ impl Glm5Engine {
         prompt_tokens: &[u32],
         params: &SamplingParams,
         opts: QuantumOptions<'_>,
+        on_token: F,
+    ) -> Result<QuantumGenerateResult>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        self.generate_stream_quantum_with_images(prompt_tokens, &[], params, opts, on_token)
+    }
+
+    pub fn generate_stream_quantum_with_images<F>(
+        &mut self,
+        prompt_tokens: &[u32],
+        images: &[Glm5ImageSpan],
+        params: &SamplingParams,
+        opts: QuantumOptions<'_>,
         mut on_token: F,
     ) -> Result<QuantumGenerateResult>
     where
@@ -589,11 +680,12 @@ impl Glm5Engine {
             anyhow::bail!("empty prompt tokens");
         }
 
-        let reused = if !self.committed_tokens.is_empty()
+        let can_reuse = images.is_empty()
+            && !self.committed_tokens.is_empty()
             && self.committed_tokens.len() == self.state.cur_pos
             && prompt_tokens.len() > self.committed_tokens.len()
-            && prompt_tokens.starts_with(&self.committed_tokens)
-        {
+            && prompt_tokens.starts_with(&self.committed_tokens);
+        let reused = if can_reuse {
             self.committed_tokens.len()
         } else {
             if !self.committed_tokens.is_empty() || self.state.cur_pos > 0 {
@@ -614,7 +706,8 @@ impl Glm5Engine {
             (suffix[0], 0usize, 0.0f64, None)
         } else {
             let t0 = Instant::now();
-            let (greedy_first, logits_opt) = self.prefill_slice(suffix, need_logits)?;
+            let (greedy_first, logits_opt) =
+                self.prefill_slice_with_images(suffix, images, need_logits)?;
             let prefill_s = t0.elapsed().as_secs_f64();
             let first_tok = if let Some(ref logits) = logits_opt {
                 sample_next_token(logits, params, &mut rng)
@@ -622,7 +715,7 @@ impl Glm5Engine {
                 greedy_first
             };
             let prefill_snapshot = if opts.capture_prefill_snap {
-                Some(self.capture_snapshot(false)?)
+                Some(self.capture_snapshot(!images.is_empty())?)
             } else {
                 None
             };

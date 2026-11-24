@@ -1,4 +1,4 @@
-use ampllm_gguf::{Hy4VisionConfig, Mm3VisionConfig, Qwen4VisionConfig};
+use ampllm_gguf::{Glm5VisionConfig, Hy4VisionConfig, Mm3VisionConfig, Qwen4VisionConfig};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use image::imageops::FilterType;
@@ -348,6 +348,114 @@ pub fn prepare_and_encode_mm3_images(
         spans.push(ampllm_engine::Mm3ImageSpan {
             start_pos,
             n_tokens: pic.n_tokens,
+            rows,
+        });
+    }
+    Ok((expanded_ids, spans))
+}
+
+fn decode_and_prepare_with_filter(
+    bytes: &[u8],
+    factor: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+    filter: FilterType,
+    tokens_fn: impl FnOnce(usize, usize) -> usize,
+) -> Result<PreparedImage> {
+    let dyn_img = image::load_from_memory(bytes).context("decoding image bytes")?;
+    let rgba = dyn_img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+
+    let mut rgb_raw = vec![0u8; w * h * 3];
+    for (dst, px) in rgb_raw.chunks_exact_mut(3).zip(rgba.pixels()) {
+        let [r, g, b, a] = px.0;
+        if a == 255 {
+            dst[0] = r;
+            dst[1] = g;
+            dst[2] = b;
+        } else {
+            let af = a as u16;
+            let inv = 255u16 - af;
+            dst[0] = ((r as u16 * af + 255 * inv + 127) / 255) as u8;
+            dst[1] = ((g as u16 * af + 255 * inv + 127) / 255) as u8;
+            dst[2] = ((b as u16 * af + 255 * inv + 127) / 255) as u8;
+        }
+    }
+
+    let (h_bar, w_bar) = smart_resize(h, w, factor, min_pixels, max_pixels)?;
+    let rgb_img =
+        RgbImage::from_raw(w as u32, h as u32, rgb_raw).context("RGB image buffer geometry")?;
+    let final_rgb = if w_bar != w || h_bar != h {
+        image::imageops::resize(&rgb_img, w_bar as u32, h_bar as u32, filter).into_raw()
+    } else {
+        rgb_img.into_raw()
+    };
+
+    let n_tokens = tokens_fn(w_bar, h_bar);
+    anyhow::ensure!(
+        n_tokens > 0,
+        "prepared image {w_bar}x{h_bar} produced 0 vision tokens"
+    );
+
+    Ok(PreparedImage {
+        rgb: final_rgb,
+        width: w_bar,
+        height: h_bar,
+        n_tokens,
+    })
+}
+
+/// Decode encoded image bytes (PNG/JPEG/GIF/BMP/WebP), alpha-composite transparency
+/// onto white, and bicubic-resize to `Glm5VisionConfig` grid multiples (`factor = 28`).
+pub fn decode_and_prepare_glm5_image(bytes: &[u8], cfg: &Glm5VisionConfig) -> Result<PreparedImage> {
+    decode_and_prepare_with_filter(
+        bytes,
+        cfg.factor(),
+        cfg.min_pixels,
+        cfg.max_pixels,
+        FilterType::CatmullRom,
+        |w, h| cfg.image_tokens(w, h),
+    )
+}
+
+/// Replace each `<|begin_of_image|><|image|><|end_of_image|>` in `ids` with `pics[k].n_tokens`
+/// copies of `cfg.image_token_id` and return `(expanded_ids, image_start_positions)`.
+pub fn expand_glm5_image_tokens(
+    ids: &[u32],
+    pics: &[PreparedImage],
+    cfg: &Glm5VisionConfig,
+) -> Result<(Vec<u32>, Vec<usize>)> {
+    expand_image_tokens_with(
+        ids,
+        pics,
+        cfg.vision_start_id,
+        cfg.image_token_id,
+        cfg.vision_end_id,
+    )
+}
+
+/// Load, preprocess, expand `<|image|>` placeholders, and encode GLM-5 images on GPU 0 vision tower.
+pub fn prepare_and_encode_glm5_images(
+    engine: &mut ampllm_engine::AnyEngine,
+    prompt_ids: &[u32],
+    image_sources: &[String],
+) -> Result<(Vec<u32>, Vec<ampllm_engine::Glm5ImageSpan>)> {
+    let Some(vcfg) = engine.glm5_vision_config().cloned() else {
+        bail!("model was loaded without mmproj vision weights");
+    };
+    let mut pics = Vec::with_capacity(image_sources.len());
+    for src in image_sources {
+        let raw = load_image_source(src)?;
+        pics.push(decode_and_prepare_glm5_image(&raw, &vcfg)?);
+    }
+    let (expanded_ids, starts) = expand_glm5_image_tokens(prompt_ids, &pics, &vcfg)?;
+    let mut spans = Vec::with_capacity(pics.len());
+    for (pic, start_pos) in pics.iter().zip(starts) {
+        let (nx, ny, rows) = engine.encode_glm5_image(&pic.rgb, pic.width, pic.height)?;
+        spans.push(ampllm_engine::Glm5ImageSpan {
+            start_pos,
+            nx,
+            ny,
             rows,
         });
     }

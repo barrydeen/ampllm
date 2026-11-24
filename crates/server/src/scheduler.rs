@@ -106,6 +106,7 @@ pub trait BackendImages: Send + 'static {
 
 pub enum RealImages {
     None,
+    Glm5(Vec<ampllm_engine::Glm5ImageSpan>),
     Hy4(Vec<Hy4ImageSpan>),
     Qwen4(Vec<Qwen4ImageSpan>),
     Mm3(Vec<Mm3ImageSpan>),
@@ -181,10 +182,7 @@ impl RealBackend {
         model_kind: ServerModelKind,
         hy4_tag_suffix: &str,
     ) -> Self {
-        let glm5_stops = collect_stop_ids(
-            &tokenizer,
-            &["<|endoftext|>", "<|user|>", "<|observation|>", "<|system|>"],
-        );
+        let glm5_stops = crate::glm5_stop_ids(&tokenizer);
         let hy4_stops = hy4_stop_ids(&tokenizer, hy4_tag_suffix);
         let qwen4_stops = qwen4_stop_ids(&tokenizer);
         let mm3_stops = mm3_stop_ids(&tokenizer);
@@ -280,6 +278,14 @@ impl InferenceBackend for RealBackend {
             return Ok((prompt_ids.to_vec(), RealImages::None));
         }
         match self.model_kind {
+            ServerModelKind::Glm5 => {
+                let (ids, spans) = vision::prepare_and_encode_glm5_images(
+                    &mut self.engine,
+                    prompt_ids,
+                    image_sources,
+                )?;
+                Ok((ids, RealImages::Glm5(spans)))
+            }
             ServerModelKind::Mm3 => {
                 let (ids, spans) =
                     vision::prepare_and_encode_mm3_images(&mut self.engine, prompt_ids, image_sources)?;
@@ -338,6 +344,13 @@ impl InferenceBackend for RealBackend {
                 self.engine
                     .generate_stream_quantum(prompt_tokens, params, opts, |t| on_token(t))?
             }
+            RealImages::Glm5(spans) => self.engine.generate_stream_quantum_with_glm5_images(
+                prompt_tokens,
+                spans,
+                params,
+                opts,
+                |t| on_token(t),
+            )?,
             RealImages::Hy4(spans) => self.engine.generate_stream_quantum_with_hy4_images(
                 prompt_tokens,
                 spans,

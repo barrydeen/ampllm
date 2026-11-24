@@ -1471,6 +1471,20 @@ pub fn mtp_cache_entry_m1(
     head_x_dev: *const f32,
     next_tok: u32,
 ) -> Result<()> {
+    mtp_cache_entry_m1_with_images(gguf, weights, state, pos, head_x_dev, next_tok, &[])
+}
+
+/// Write blk.45 MTP DSA cache entry at position `pos`, overriding `next_tok` embedding if `pos + 1`
+/// falls inside a multimodal image span.
+pub fn mtp_cache_entry_m1_with_images(
+    gguf: &GgufFile,
+    weights: &Glm5ModelWeights,
+    state: &mut Glm5State,
+    pos: usize,
+    head_x_dev: *const f32,
+    next_tok: u32,
+    images: &[crate::glm5::vision::Glm5ImageSpan],
+) -> Result<()> {
     let Some(mtp_l) = weights.cfg.mtp_layer else {
         return Ok(());
     };
@@ -1479,7 +1493,14 @@ pub fn mtp_cache_entry_m1(
     let dst = state.dsa[mtp_l].as_ref().unwrap();
     let n_embd = cfg.n_embd;
 
-    dequant_embed_to_host(gguf, weights, next_tok, &mut state.hop_emb_pin1.as_mut_slice()[..n_embd])?;
+    crate::glm5::prefill::fill_token_embed_host(
+        gguf,
+        weights,
+        next_tok,
+        pos + 1,
+        images,
+        &mut state.hop_emb_pin1.as_mut_slice()[..n_embd],
+    )?;
     set_device(1)?;
     let stream = &state.sc1.stream;
     let emb_bytes = unsafe {

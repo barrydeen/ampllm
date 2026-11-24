@@ -1345,6 +1345,28 @@ extern "C" {
         stream: CudaStreamHandle,
     );
 
+    pub fn launch_glm5_vis_qk_rmsnorm_inplace(
+        qkv: *mut f32,
+        q_norm_w: *const f32,
+        k_norm_w: *const f32,
+        n_patches: i32,
+        heads: i32,
+        hd: i32,
+        eps: f32,
+        stream: CudaStreamHandle,
+    );
+
+    pub fn launch_glm5_vis_layernorm_gelu_erf_f16(
+        x: *const f32,
+        w: *const f32,
+        b: *const f32,
+        rows: i32,
+        d: i32,
+        eps: f32,
+        out_f16: *mut c_void,
+        stream: CudaStreamHandle,
+    );
+
     pub fn launch_glm5_scatter_weighted_add_f32(
         src: *const f32,
         rows: *const i32,

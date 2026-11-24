@@ -66,6 +66,14 @@ pub(crate) fn forward_parsed_event(ev: ParsedEvent, tx: &mpsc::UnboundedSender<S
     }
 }
 
+/// Collect stop token IDs for GLM-5.3-Flash turn boundaries and end-of-sequence tokens.
+pub fn glm5_stop_ids(tokenizer: &BpeTokenizer) -> Vec<u32> {
+    collect_stop_ids(
+        tokenizer,
+        &["<|endoftext|>", "<|user|>", "<|observation|>", "<|system|>"],
+    )
+}
+
 /// Collect stop token IDs for Hy4-Flash turn boundaries and end-of-sequence tokens.
 pub fn hy4_stop_ids(tokenizer: &BpeTokenizer, hytk: &str) -> Vec<u32> {
     let hy_end = format!("<｜hy_end{hytk}｜>");
@@ -253,15 +261,18 @@ mod tests {
         assert_eq!(eff, "Low");
 
         let msgs = vec![user_msg("Hi")];
-        let (p_off, exp_off, pf_off) = format_glm5_chat(&msgs, None, None, false, "Low");
+        let (p_off, exp_off, pf_off, imgs_off) =
+            format_glm5_chat(&msgs, None, None, false, "Low", false).unwrap();
         assert!(!exp_off);
         assert!(pf_off.is_empty());
+        assert!(imgs_off.is_empty());
         assert_eq!(
             p_off,
             "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>Hi<|assistant|><think></think>"
         );
 
-        let (p_on, exp_on, pf_on) = format_glm5_chat(&msgs, None, None, true, "Max");
+        let (p_on, exp_on, pf_on, _) =
+            format_glm5_chat(&msgs, None, None, true, "Max", false).unwrap();
         assert!(exp_on);
         assert!(pf_on.is_empty());
         assert_eq!(
@@ -278,7 +289,7 @@ mod tests {
             },
             user_msg("Next?"),
         ];
-        let (p_t2, _, _) = format_glm5_chat(&msgs2, None, None, false, "Low");
+        let (p_t2, _, _, _) = format_glm5_chat(&msgs2, None, None, false, "Low", false).unwrap();
         assert!(
             p_t2.starts_with(&p_off),
             "GLM-5 multi-turn should preserve exact prefix"
@@ -374,8 +385,8 @@ mod tests {
             },
         ];
 
-        let (prompt, expect_think, prefill) =
-            format_glm5_chat(&msgs, Some(&tools), None, true, "High");
+        let (prompt, expect_think, prefill, _) =
+            format_glm5_chat(&msgs, Some(&tools), None, true, "High", false).unwrap();
         assert!(expect_think);
         assert!(prefill.is_empty());
         assert!(prompt.contains("<tools>\n{\"description\":\"Multiply integers\",\"name\":\"calc\""));
@@ -384,8 +395,9 @@ mod tests {
         assert!(prompt.contains("<|observation|><tool_response>42</tool_response><tool_response>6</tool_response><|assistant|><think>"));
 
         let forced_tc = json!({"type": "function", "function": {"name": "calc"}});
-        let (fp, f_think, f_prefill) =
-            format_glm5_chat(&[user_msg("go")], Some(&tools), Some(&forced_tc), true, "Max");
+        let (fp, f_think, f_prefill, _) =
+            format_glm5_chat(&[user_msg("go")], Some(&tools), Some(&forced_tc), true, "Max", false)
+                .unwrap();
         assert!(!f_think);
         assert_eq!(f_prefill, "<tool_call>calc");
         assert!(fp.ends_with("<|assistant|><think></think><tool_call>calc"));
@@ -534,6 +546,113 @@ mod tests {
                 "content": "fn main() {\n    println!(\"hi</arg_not_tag\\n\");\n}",
                 "line": 42
             })
+        );
+    }
+
+    #[test]
+    fn test_glm5_think_missing_close_before_tool_call() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                }
+            }
+        })];
+        let schemas = extract_tool_schemas(Some(&tools));
+        let mut p = OutputParser::new(
+            ChatOutputMode::Glm5 {
+                expect_think_close: true,
+                parse_tools: true,
+                prefill: String::new(),
+                schemas: schemas.clone(),
+            },
+            "call_miss".to_owned(),
+        );
+        let raw = "Checking chromium logs,Desktop reviewed:<tool_call>read<arg_key>path</arg_key><arg_value>/tmp/a.png</arg_value></tool_call><tool_call>read<arg_key>path</arg_key><arg_value>/tmp/b.png</arg_value></tool_call>";
+        let mut reasoning = String::new();
+        let mut text = String::new();
+        let mut calls: Vec<(usize, String, String, String)> = Vec::new();
+        let mut push_ev = |ev: ParsedEvent| match ev {
+            ParsedEvent::Reasoning(s) => reasoning.push_str(&s),
+            ParsedEvent::Token(s) => text.push_str(&s),
+            ParsedEvent::ToolCall {
+                index,
+                id,
+                name,
+                arguments,
+            } => calls.push((index, id, name, arguments)),
+            ParsedEvent::ToolCallStart { index, id, name } => {
+                calls.push((index, id, name, String::new()));
+            }
+            ParsedEvent::ToolCallArgsDelta { index, delta } => {
+                if let Some(c) = calls.iter_mut().find(|c| c.0 == index) {
+                    c.3.push_str(&delta);
+                }
+            }
+        };
+        for ch in raw.as_bytes().chunks(7) {
+            p.push(std::str::from_utf8(ch).unwrap(), &mut push_ev);
+        }
+        p.finish(&mut push_ev);
+        assert!(p.has_tool_calls());
+        assert_eq!(reasoning, "Checking chromium logs,Desktop reviewed:");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].2, "read");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].3).unwrap(),
+            json!({"path": "/tmp/a.png"})
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[1].3).unwrap(),
+            json!({"path": "/tmp/b.png"})
+        );
+
+        // Prose <tool_call> mention + fenced <tool_call> inside <think> must remain reasoning
+        let mut p2 = OutputParser::new(
+            ChatOutputMode::Glm5 {
+                expect_think_close: true,
+                parse_tools: true,
+                prefill: String::new(),
+                schemas,
+            },
+            "call_prose".to_owned(),
+        );
+        let raw2 = "I should emit a <tool_call> block, or like:\n```xml\n<tool_call>read<arg_key>path</arg_key><arg_value>/tmp/fake.png</arg_value></tool_call>\n```\nNow call it.</think><tool_call>read<arg_key>path</arg_key><arg_value>/tmp/real.png</arg_value></tool_call>";
+        let mut r2 = String::new();
+        let mut calls2: Vec<(usize, String, String, String)> = Vec::new();
+        let mut push2 = |ev: ParsedEvent| match ev {
+            ParsedEvent::Reasoning(s) => r2.push_str(&s),
+            ParsedEvent::Token(_) => {}
+            ParsedEvent::ToolCall {
+                index,
+                id,
+                name,
+                arguments,
+            } => calls2.push((index, id, name, arguments)),
+            ParsedEvent::ToolCallStart { index, id, name } => {
+                calls2.push((index, id, name, String::new()));
+            }
+            ParsedEvent::ToolCallArgsDelta { index, delta } => {
+                if let Some(c) = calls2.iter_mut().find(|c| c.0 == index) {
+                    c.3.push_str(&delta);
+                }
+            }
+        };
+        for ch in raw2.as_bytes().chunks(6) {
+            p2.push(std::str::from_utf8(ch).unwrap(), &mut push2);
+        }
+        p2.finish(&mut push2);
+        assert!(r2.contains("<tool_call>read"));
+        assert!(r2.ends_with("Now call it."));
+        assert_eq!(calls2.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls2[0].3).unwrap(),
+            json!({"path": "/tmp/real.png"})
         );
     }
 
@@ -1134,5 +1253,99 @@ mod tests {
         assert_eq!(expanded.len(), 2 + 1 + 100 + 1);
         assert_eq!(expanded[1], vcfg.image_start_token_id);
         assert_eq!(expanded[102], vcfg.image_end_token_id);
+    }
+
+    #[test]
+    fn test_glm5_vision_chat_format_and_token_expand() {
+        let msgs = vec![
+            ChatMessage {
+                role: "user".to_owned(),
+                content: Some(json!([
+                    {"type": "image_url", "image_url": {"url": "/tmp/user.png"}},
+                    {"type": "text", "text": "Inspect this"}
+                ])),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "assistant".to_owned(),
+                content: None,
+                tool_calls: Some(vec![
+                    json!({"id": "c1", "function": {"name": "read", "arguments": "{\"path\":\"/tmp/a.png\"}"}}),
+                    json!({"id": "c2", "function": {"name": "read", "arguments": "{\"path\":\"/tmp/b.png\"}"}}),
+                ]),
+                ..Default::default()
+            },
+            // Out-of-order tool results with images: both prompt order and image_sources must reorder cleanly
+            ChatMessage {
+                role: "tool".to_owned(),
+                tool_call_id: Some("c2".to_owned()),
+                content: Some(json!([
+                    {"type": "image_url", "image_url": {"url": "/tmp/b.png"}},
+                    {"type": "text", "text": "imgB"}
+                ])),
+                ..Default::default()
+            },
+            ChatMessage {
+                role: "tool".to_owned(),
+                tool_call_id: Some("c1".to_owned()),
+                content: Some(json!([
+                    {"type": "image_url", "image_url": {"url": "/tmp/a.png"}},
+                    {"type": "text", "text": "imgA"}
+                ])),
+                ..Default::default()
+            },
+        ];
+
+        let (prompt, expect_think, _, imgs) =
+            format_glm5_chat(&msgs, None, None, true, "Max", true).unwrap();
+        assert!(expect_think);
+        assert_eq!(imgs, vec!["/tmp/user.png", "/tmp/a.png", "/tmp/b.png"]);
+        assert!(prompt.contains("<|user|><|begin_of_image|><|image|><|end_of_image|>Inspect this"));
+        assert!(prompt.contains(
+            "<|observation|><tool_response><|begin_of_image|><|image|><|end_of_image|>imgA</tool_response><tool_response><|begin_of_image|><|image|><|end_of_image|>imgB</tool_response>"
+        ));
+
+        let vcfg = ampllm_gguf::Glm5VisionConfig {
+            dim: 1024,
+            heads: 16,
+            head_dim: 64,
+            ff: 4096,
+            layers: 24,
+            patch_size: 14,
+            spatial_merge: 2,
+            image_size: 448,
+            out_dim: 4096,
+            merger_ff: 10240,
+            eps: 1e-5,
+            ffn_clamp: 10.0,
+            min_tokens: 16,
+            max_tokens: 2560,
+            min_pixels: 16 * 28 * 28,
+            max_pixels: 2560 * 28 * 28,
+            image_mean: [0.48145467, 0.4578275, 0.40821072],
+            image_std: [0.26862955, 0.2613026, 0.2757771],
+            image_token_id: 154854,
+            vision_start_id: 154830,
+            vision_end_id: 154831,
+        };
+        let rgba = image::RgbaImage::from_pixel(448, 448, image::Rgba([40, 80, 120, 255]));
+        let mut png_bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut png_bytes, image::ImageFormat::Png)
+            .unwrap();
+        let pic = crate::vision::decode_and_prepare_glm5_image(png_bytes.get_ref(), &vcfg).unwrap();
+        assert_eq!((pic.width, pic.height, pic.n_tokens), (448, 448, 256));
+        let (expanded, starts) = crate::vision::expand_glm5_image_tokens(
+            &[10, vcfg.vision_start_id, vcfg.image_token_id, vcfg.vision_end_id, 11],
+            std::slice::from_ref(&pic),
+            &vcfg,
+        )
+        .unwrap();
+        assert_eq!(starts, vec![2]);
+        assert_eq!(expanded.len(), 2 + 256 + 2);
+        assert_eq!(expanded[1], vcfg.vision_start_id);
+        assert_eq!(expanded[2], vcfg.image_token_id);
+        assert_eq!(expanded[257], vcfg.image_token_id);
+        assert_eq!(expanded[258], vcfg.vision_end_id);
     }
 }

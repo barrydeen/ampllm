@@ -18,7 +18,7 @@ pub mod weights;
 
 pub use ampllm_cache::CacheStats;
 pub use config::{EngineConfig, MultiGpuMode};
-pub use glm5::Glm5Engine;
+pub use glm5::{Glm5Engine, Glm5ImageSpan};
 pub use hy4::{Hy4Engine, Hy4ImageSpan};
 pub use inkling2::{Inkling2Engine, StreamGenerateResult};
 pub use kv_cache::{KvConvCache, KvQuantMode};
@@ -58,10 +58,18 @@ impl AnyEngine {
 
     pub fn has_vision(&self) -> bool {
         match self {
+            AnyEngine::Glm5(e) => e.has_vision(),
             AnyEngine::Hy4(e) => e.has_vision(),
             AnyEngine::Qwen4(e) => e.has_vision(),
             AnyEngine::Mm3(e) => e.has_vision(),
             _ => false,
+        }
+    }
+
+    pub fn glm5_vision_config(&self) -> Option<&ampllm_gguf::Glm5VisionConfig> {
+        match self {
+            AnyEngine::Glm5(e) => e.vision_config(),
+            _ => None,
         }
     }
 
@@ -88,10 +96,23 @@ impl AnyEngine {
 
     pub fn encode_image(&mut self, rgb: &[u8], width: usize, height: usize) -> Result<Vec<f32>> {
         match self {
+            AnyEngine::Glm5(e) => Ok(e.encode_image(rgb, width, height)?.2),
             AnyEngine::Hy4(e) => e.encode_image(rgb, width, height),
             AnyEngine::Qwen4(e) => Ok(e.encode_image(rgb, width, height)?.2),
             AnyEngine::Mm3(e) => e.encode_image(rgb, width, height),
             _ => anyhow::bail!("model does not support vision"),
+        }
+    }
+
+    pub fn encode_glm5_image(
+        &mut self,
+        rgb: &[u8],
+        width: usize,
+        height: usize,
+    ) -> Result<(usize, usize, Vec<f32>)> {
+        match self {
+            AnyEngine::Glm5(e) => e.encode_image(rgb, width, height),
+            _ => anyhow::bail!("model is not GLM-5 vision"),
         }
     }
 
@@ -392,6 +413,53 @@ impl AnyEngine {
                     self.generate_stream_quantum(prompt_tokens, params, opts, on_token)
                 } else {
                     anyhow::bail!("model is not MM3 vision")
+                }
+            }
+        }
+    }
+
+    pub fn generate_stream_with_glm5_images<F>(
+        &mut self,
+        prompt_tokens: &[u32],
+        images: &[Glm5ImageSpan],
+        params: &SamplingParams,
+        on_token: F,
+    ) -> Result<StreamGenerateResult>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        match self {
+            AnyEngine::Glm5(e) => e.generate_stream_with_images(prompt_tokens, images, params, on_token),
+            _ => {
+                if images.is_empty() {
+                    self.generate_stream(prompt_tokens, params, on_token)
+                } else {
+                    anyhow::bail!("model is not GLM-5 vision")
+                }
+            }
+        }
+    }
+
+    pub fn generate_stream_quantum_with_glm5_images<F>(
+        &mut self,
+        prompt_tokens: &[u32],
+        images: &[Glm5ImageSpan],
+        params: &SamplingParams,
+        opts: QuantumOptions<'_>,
+        on_token: F,
+    ) -> Result<QuantumGenerateResult>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        match self {
+            AnyEngine::Glm5(e) => {
+                e.generate_stream_quantum_with_images(prompt_tokens, images, params, opts, on_token)
+            }
+            _ => {
+                if images.is_empty() {
+                    self.generate_stream_quantum(prompt_tokens, params, opts, on_token)
+                } else {
+                    anyhow::bail!("model is not GLM-5 vision")
                 }
             }
         }

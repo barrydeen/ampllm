@@ -675,6 +675,79 @@ pub fn discover_qwen4_aux_files(
     Ok((mtp_out, mmproj_out))
 }
 
+/// Auto-discover GLM-5.3-Flash `mmproj` GGUF (`clip.projector_type = "glm5next"`).
+/// Respects explicit path or `AMPLLM_MMPROJ` (`"0"` / `"none"` disables auto-discovery).
+pub fn discover_glm5_mmproj(
+    model_path: &Path,
+    explicit_mmproj: Option<&Path>,
+) -> Result<Option<PathBuf>, GgufError> {
+    if let Some(p) = explicit_mmproj {
+        if !p.exists() {
+            return Err(GgufError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("GLM-5 mmproj file not found: {}", p.display()),
+            )));
+        }
+        return Ok(Some(p.to_path_buf()));
+    }
+    if let Ok(env_val) = std::env::var("AMPLLM_MMPROJ") {
+        let trimmed = env_val.trim();
+        if trimmed.is_empty()
+            || trimmed == "0"
+            || trimmed.eq_ignore_ascii_case("none")
+            || trimmed.eq_ignore_ascii_case("false")
+        {
+            return Ok(None);
+        }
+        let p = PathBuf::from(trimmed);
+        if !p.exists() {
+            return Err(GgufError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("AMPLLM_MMPROJ file not found: {}", p.display()),
+            )));
+        }
+        return Ok(Some(p));
+    }
+
+    let model_dir = model_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut search_dirs = vec![model_dir.to_path_buf(), model_dir.join("vision")];
+    if let Some(parent) = model_dir.parent() {
+        search_dirs.push(parent.to_path_buf());
+        search_dirs.push(parent.join("vision"));
+    }
+
+    for dir in search_dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut cands: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok().map(|de| de.path()))
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("gguf"))
+            .collect();
+        cands.sort();
+        for cand in cands {
+            let lower = cand
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if !lower.contains("mmproj") {
+                continue;
+            }
+            if let Ok(meta) = read_gguf_metadata_only(&cand) {
+                let kind = meta.get("general.type").and_then(|v| v.as_str());
+                let arch = meta.get("general.architecture").and_then(|v| v.as_str());
+                let proj = meta.get("clip.projector_type").and_then(|v| v.as_str());
+                if (kind == Some("mmproj") || arch == Some("clip")) && proj == Some("glm5next") {
+                    return Ok(Some(cand));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 /// Companion and auxiliary files for MiniMax-M3.1-Flash (`minimax-m3`).
 #[derive(Debug, Clone, Default)]
 pub struct Mm3AuxFiles {

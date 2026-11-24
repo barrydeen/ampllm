@@ -1817,16 +1817,34 @@ pub fn format_mm3_chat(
 }
 
 /// Format OpenAI chat messages using GLM-5.3-Flash's exact GGUF chat_template (`[gMASK]<sop>...`).
-/// Returns `(rendered_prompt, expect_think_close, forced_prefill)`.
+fn render_glm5_content_value(
+    val: Option<&serde_json::Value>,
+    has_vision: bool,
+    is_system: bool,
+    image_sources: &mut Vec<String>,
+) -> Result<String, String> {
+    render_multimodal_content_value(
+        val,
+        "<|begin_of_image|><|image|><|end_of_image|>",
+        "Video inputs are not supported by ampllm GLM-5 server.",
+        has_vision,
+        is_system,
+        image_sources,
+    )
+}
+
+/// Returns `Ok((rendered_prompt, expect_think_close, forced_prefill, image_sources))`.
 pub fn format_glm5_chat(
     messages: &[ChatMessage],
     tools: Option<&[serde_json::Value]>,
     tool_choice: Option<&serde_json::Value>,
     enable_thinking: bool,
     effort_label: &str,
-) -> (String, bool, String) {
+    has_vision: bool,
+) -> Result<(String, bool, String, Vec<String>), String> {
     let tc_mode = parse_tool_choice(tool_choice);
     let mut out = String::new();
+    let mut image_sources = Vec::new();
     out.push_str("[gMASK]<sop><|system|>Reasoning Effort: ");
     out.push_str(effort_label);
 
@@ -1848,19 +1866,36 @@ pub fn format_glm5_chat(
     let mut idx = 0;
     while idx < messages.len() {
         let msg = &messages[idx];
-        let raw = extract_visible_text(msg);
         match msg.role.as_str() {
             "system" | "developer" => {
+                let raw = render_glm5_content_value(
+                    msg.content.as_ref(),
+                    has_vision,
+                    true,
+                    &mut image_sources,
+                )?;
                 out.push_str("<|system|>");
                 out.push_str(&raw);
                 idx += 1;
             }
             "user" => {
+                let raw = render_glm5_content_value(
+                    msg.content.as_ref(),
+                    has_vision,
+                    false,
+                    &mut image_sources,
+                )?;
                 out.push_str("<|user|>");
                 out.push_str(&raw);
                 idx += 1;
             }
             "assistant" => {
+                let raw = render_glm5_content_value(
+                    msg.content.as_ref(),
+                    has_vision,
+                    false,
+                    &mut image_sources,
+                )?;
                 out.push_str("<|assistant|>");
                 if let Some(rc) = msg.reasoning_content.as_deref() {
                     out.push_str("<think>");
@@ -1924,13 +1959,25 @@ pub fn format_glm5_chat(
                 let order = order_tool_responses(run, &last_assistant_call_ids);
                 out.push_str("<|observation|>");
                 for &i in &order {
+                    let body = render_glm5_content_value(
+                        run[i].content.as_ref(),
+                        has_vision,
+                        false,
+                        &mut image_sources,
+                    )?;
                     out.push_str("<tool_response>");
-                    out.push_str(&extract_visible_text(&run[i]));
+                    out.push_str(&body);
                     out.push_str("</tool_response>");
                 }
                 idx = end;
             }
             _ => {
+                let raw = render_glm5_content_value(
+                    msg.content.as_ref(),
+                    has_vision,
+                    false,
+                    &mut image_sources,
+                )?;
                 out.push_str("<|user|>");
                 out.push_str(&raw);
                 idx += 1;
@@ -1946,13 +1993,13 @@ pub fn format_glm5_chat(
     if !forced_prefill.is_empty() {
         out.push_str("<|assistant|><think></think>");
         out.push_str(&forced_prefill);
-        (out, false, forced_prefill)
+        Ok((out, false, forced_prefill, image_sources))
     } else if enable_thinking {
         out.push_str("<|assistant|><think>");
-        (out, true, String::new())
+        Ok((out, true, String::new(), image_sources))
     } else {
         out.push_str("<|assistant|><think></think>");
-        (out, false, String::new())
+        Ok((out, false, String::new(), image_sources))
     }
 }
 
@@ -2104,16 +2151,20 @@ pub async fn chat_completions(
                 req.chat_template_kwargs.as_ref(),
                 req.reasoning_effort.as_ref(),
             );
-            let (p, expect_think_close, prefill) = format_glm5_chat(
+            let (p, expect_think_close, prefill, imgs) = match format_glm5_chat(
                 &req.messages,
                 req.tools.as_deref(),
                 req.tool_choice.as_ref(),
                 enable_thinking,
                 effort_label,
-            );
+                st.has_vision,
+            ) {
+                Ok(v) => v,
+                Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+            };
             (
                 p,
-                Vec::new(),
+                imgs,
                 ChatOutputMode::Glm5 {
                     expect_think_close,
                     parse_tools,

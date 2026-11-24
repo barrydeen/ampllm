@@ -1472,3 +1472,40 @@ pub unsafe fn dsa_mla_prefill_mma(
         stream.raw,
     );
 }
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn vis_qk_rmsnorm_inplace(
+    qkv: *mut f32,
+    q_norm_w: *const f32,
+    k_norm_w: *const f32,
+    n_patches: i32,
+    heads: i32,
+    hd: i32,
+    eps: f32,
+    stream: &CudaStream,
+) {
+    ffi::launch_glm5_vis_qk_rmsnorm_inplace(
+        qkv,
+        q_norm_w,
+        k_norm_w,
+        n_patches,
+        heads,
+        hd,
+        eps,
+        stream.raw,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn vis_layernorm_gelu_erf_f16(
+    x: *const f32,
+    w: *const f32,
+    b: *const f32,
+    rows: i32,
+    d: i32,
+    eps: f32,
+    out_f16: *mut c_void,
+    stream: &CudaStream,
+) {
+    ffi::launch_glm5_vis_layernorm_gelu_erf_f16(x, w, b, rows, d, eps, out_f16, stream.raw);
+}

@@ -8,11 +8,11 @@ pub mod quants;
 pub mod qwen4;
 
 pub use format::{
-    discover_hy4_aux_files, discover_mm3_aux_files, discover_qwen4_aux_files,
-    read_gguf_metadata_only, GgmlType, GgufError, GgufFile, GgufTensorInfo, GgufValue, Mm3AuxFiles,
-    ModelArch,
+    discover_glm5_mmproj, discover_hy4_aux_files, discover_mm3_aux_files,
+    discover_qwen4_aux_files, read_gguf_metadata_only, GgmlType, GgufError, GgufFile,
+    GgufTensorInfo, GgufValue, Mm3AuxFiles, ModelArch,
 };
-pub use glm5::Glm5Config;
+pub use glm5::{Glm5Config, Glm5VisionConfig};
 pub use hy4::{Hy4Config, Hy4EngramConfig, Hy4VisionConfig};
 pub use inkling2::{Inkling2Config, LogicalLayerInfo};
 pub use mm3::{

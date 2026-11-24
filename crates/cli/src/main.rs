@@ -312,6 +312,15 @@ fn main() -> Result<()> {
                         cfg.n_ff_dense,
                         cfg.idx_top_k
                     );
+                    if let Ok(mm_opt) = ampllm_gguf::discover_glm5_mmproj(&model, None) {
+                        println!(
+                            "Aux files: mmproj={}",
+                            mm_opt
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "none".to_owned())
+                        );
+                    }
                 }
                 ModelArch::Hy4 => {
                     let cfg = Hy4Config::from_gguf(&gguf)?;
@@ -709,6 +718,36 @@ fn main() -> Result<()> {
                         stop_token_ids: ampllm_server::mm3_stop_ids(&tok),
                     };
                     let res = engine.generate_stream_with_mm3_images(
+                        &eval_ids,
+                        &spans,
+                        &params,
+                        |_| true,
+                    )?;
+                    (res.generated_tokens, res.prefill_tps, res.decode_tps, res.draft_n, res.draft_accepted)
+                } else if arch == ModelArch::Glm5 {
+                    let (rendered, _, _, img_sources) = ampllm_server::routes::format_glm5_chat(
+                        &[msg],
+                        None,
+                        None,
+                        true,
+                        "Max",
+                        true,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let raw_ids = tok.encode(&rendered, true)?;
+                    let (eval_ids, spans) = ampllm_server::vision::prepare_and_encode_glm5_images(
+                        &mut engine,
+                        &raw_ids,
+                        &img_sources,
+                    )?;
+                    let params = SamplingParams {
+                        temperature: 0.0,
+                        top_p: 1.0,
+                        seed: 42,
+                        max_tokens,
+                        stop_token_ids: ampllm_server::glm5_stop_ids(&tok),
+                    };
+                    let res = engine.generate_stream_with_glm5_images(
                         &eval_ids,
                         &spans,
                         &params,
