@@ -498,6 +498,7 @@ fn build_draft_vocab(
     let ttypes = tok.token_types();
     let n_vocab = cfg.n_vocab;
     if vocab.len() < n_vocab || n_vocab < 4096 {
+        tracing::info!("GLM-5.3 draft_vocab: disabled (vocab={}, n_vocab={n_vocab})", vocab.len());
         return Ok(DraftVocab {
             n_lead: n_vocab,
             extra_ids: Vec::new(),
@@ -523,6 +524,7 @@ fn build_draft_vocab(
         chunk_start += 1024;
     }
     if n_lead == 0 || n_lead * 8 < n_vocab {
+        tracing::info!("GLM-5.3 draft_vocab: disabled (n_lead={n_lead}/{n_vocab})");
         return Ok(DraftVocab {
             n_lead: n_vocab,
             extra_ids: Vec::new(),
@@ -542,6 +544,7 @@ fn build_draft_vocab(
     }
     let total_draft = n_lead + extra_ids.len();
     if total_draft * 10 > n_vocab * 9 {
+        tracing::info!("GLM-5.3 draft_vocab: disabled (total={total_draft}/{n_vocab})");
         return Ok(DraftVocab {
             n_lead: n_vocab,
             extra_ids: Vec::new(),
@@ -578,6 +581,13 @@ fn build_draft_vocab(
         (None, None)
     };
     let _ = output_weight_dev;
+    tracing::info!(
+        "GLM-5.3 draft_vocab: n_lead={}, extra={}, total={}/{}",
+        n_lead,
+        extra_ids.len(),
+        total_draft,
+        n_vocab
+    );
 
     Ok(DraftVocab {
         n_lead,
@@ -613,7 +623,17 @@ impl Glm5ModelWeights {
 
         // Determine per-layer fixed dense + state VRAM cost
         let n_tot = cfg.n_layer_total;
-        let dsa_res_cap = if max_ctx <= 24576 { max_ctx } else { 24576 };
+        let k_spares = std::env::var("AMPLLM_K_SPARES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|k| k.min(8))
+            .unwrap_or(K_SPARES);
+        let env_dsa_res_cap = std::env::var("AMPLLM_DSA_RES_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(24576)
+            .clamp(4096usize.min(max_ctx), max_ctx);
+        let dsa_res_cap = max_ctx.min(env_dsa_res_cap);
         let pool_cap = (max_ctx + cfg.idx_kpool - 1) / cfg.idx_kpool;
 
         let mut layer_fixed_bytes = vec![0usize; n_tot];
@@ -729,7 +749,7 @@ impl Glm5ModelWeights {
                 layer_d_off[l] = d_off;
                 layer_blob_stride[l] = blob_stride;
                 layer_exp_bytes[l] = blob_stride;
-                fix += K_SPARES * blob_stride;
+                fix += k_spares * blob_stride;
             }
             if is_mtp {
                 for suf in [
@@ -750,8 +770,16 @@ impl Glm5ModelWeights {
             + 128 * 1024 * 1024; // includes draft_vocab extra rows + logits_dev + mtp scratch
         // Reserve 850 MiB on GPU 0 (headroom for dynamic carveout/scratch),
         // 1384 MiB on GPU 1 (Hyprland/desktop + shrunk phase_arena + GpuScratch + >= 768 MiB free floor)
-        let reserve0 = 850usize << 20;
-        let reserve1 = 1384usize << 20;
+        let reserve0_mb = std::env::var("AMPLLM_RESERVE0_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(850);
+        let reserve1_mb = std::env::var("AMPLLM_RESERVE1_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1384);
+        let reserve0 = reserve0_mb << 20;
+        let reserve1 = reserve1_mb << 20;
         let avail0 = free0.saturating_sub(reserve0);
         let avail1 = free1.saturating_sub(reserve1 + head_bytes);
 
@@ -937,7 +965,7 @@ impl Glm5ModelWeights {
                 }
             }
             if layer_res_ids[l].len() < cfg.n_expert {
-                layer_k_spares[l] = K_SPARES;
+                layer_k_spares[l] = k_spares;
             }
         }
 
@@ -1476,7 +1504,12 @@ impl Glm5ModelWeights {
             }
             Ok(ptrs)
         };
-        let trunk_ptrs = alloc_backup_tier(TRUNK_BACKUP_SLOTS, trunk_max_stride)?;
+        let trunk_backup_slots = std::env::var("AMPLLM_BACKUP_SLOTS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(TRUNK_BACKUP_SLOTS)
+            .clamp(LEND_RESERVED_TRUNK_SLOTS + 64, 4096);
+        let trunk_ptrs = alloc_backup_tier(trunk_backup_slots, trunk_max_stride)?;
         let mtp_ptrs = alloc_backup_tier(MTP_BACKUP_SLOTS, mtp_max_stride)?;
         let trunk_free: Vec<usize> = (0..trunk_ptrs.len()).rev().collect();
         let mtp_free: Vec<usize> = (0..mtp_ptrs.len()).rev().collect();

@@ -57,6 +57,11 @@ pub struct GpuScratch {
     pub hc_ctr_dev: DeviceBuffer,// [1] u64 HC grid-barrier counter
     pub pf_stream: CudaStream,    // side stream for lookahead/prefill expert PCIe streaming
     pub d2h_stream: CudaStream,   // dedicated D2H DMA stream so prefill x_f32 D2H never waits behind H2D
+    pub promo_stream: CudaStream, // async promotion DMA stream overlapped with next layers
+    pub ev_promo_start: CudaEvent,
+    pub ev_promo_done: CudaEvent,
+    pub promo_src_dev: DeviceBuffer, // [48] u64 per-layer async promotion RAM src
+    pub promo_dst_dev: DeviceBuffer, // [48] u64 per-layer async promotion VRAM dst
     pub ev_pf_start: CudaEvent,
     pub ev_pf_done: [CudaEvent; 2],
     pub ev_stream_copy: CudaEvent,
@@ -76,6 +81,7 @@ pub struct GpuScratch {
     pub moe_scratch_ptrs_dev: DeviceBuffer, // [16] u64 (8 default slots; rewritten to 16 when lent)
     pub moe_plan_ptrs_dev: DeviceBuffer,    // [32] u64 (m * topk, up to M=4)
     pub moe_fetch_src_dev: DeviceBuffer,    // [8] u64
+    pub moe_fetch_dst_dev: DeviceBuffer,    // [8] u64
     pub moe_route_cnt_dev: DeviceBuffer,    // [1] u32
     // Shared phase-aliased scratch backing KDA / DSA / FFN+MoE / mma_b_f16 (~140 MiB instead of ~285 MiB)
     pub _phase_arena: DeviceBuffer,
@@ -286,9 +292,15 @@ impl GpuScratch {
         moe_scratch_ptrs_dev.copy_from_host_async(bytemuck::cast_slice(&scratch_ptrs_h), &stream)?;
         let moe_plan_ptrs_dev = DeviceBuffer::alloc_zeroed(dev, 32 * 8)?;
         let moe_fetch_src_dev = DeviceBuffer::alloc_zeroed(dev, 8 * 8)?;
+        let moe_fetch_dst_dev = DeviceBuffer::alloc_zeroed(dev, 8 * 8)?;
         let moe_route_cnt_dev = DeviceBuffer::alloc_zeroed(dev, 4)?;
         let pf_stream = CudaStream::new(dev)?;
         let d2h_stream = CudaStream::new(dev)?;
+        let promo_stream = CudaStream::new(dev)?;
+        let ev_promo_start = CudaEvent::new(dev)?;
+        let ev_promo_done = CudaEvent::new(dev)?;
+        let promo_src_dev = DeviceBuffer::alloc_zeroed(dev, 48 * 8)?;
+        let promo_dst_dev = DeviceBuffer::alloc_zeroed(dev, 48 * 8)?;
         let ev_pf_start = CudaEvent::new(dev)?;
         let ev_pf_done = [CudaEvent::new(dev)?, CudaEvent::new(dev)?];
         let ev_stream_copy = CudaEvent::new(dev)?;
@@ -362,6 +374,11 @@ impl GpuScratch {
             hc_ctr_dev: DeviceBuffer::alloc_zeroed(dev, 8)?,
             pf_stream,
             d2h_stream,
+            promo_stream,
+            ev_promo_start,
+            ev_promo_done,
+            promo_src_dev,
+            promo_dst_dev,
             ev_pf_start,
             ev_pf_done,
             ev_stream_copy,
@@ -381,6 +398,7 @@ impl GpuScratch {
             moe_scratch_ptrs_dev,
             moe_plan_ptrs_dev,
             moe_fetch_src_dev,
+            moe_fetch_dst_dev,
             moe_route_cnt_dev,
 
             q_p: GpuRegion::sub(&phase_arena, o_qp, sz_qp),
@@ -496,6 +514,7 @@ fn spawn_db_worker(
     is_db0: bool,
     db_addr: usize,
     pool_w: Arc<CpuThreadPool>,
+    pool_all: Arc<CpuThreadPool>,
     active_w: Arc<AtomicBool>,
     stop_w: Arc<AtomicBool>,
     miss_exp_w: Arc<AtomicU64>,
@@ -651,7 +670,7 @@ fn spawn_db_worker(
                                         }
                                     }
                                     run_glm5_cpu_moe_grouped(
-                                        &pool_w,
+                                        &pool_all,
                                         &mut scratch,
                                         gu_type,
                                         d_type,
@@ -725,6 +744,24 @@ impl DoorbellWorker {
             ampllm_cpu_kernels::pool::discover_ccd_split_cores()
         };
         tracing::info!("GLM-5.3 CPU pools: GPU0={cores0:?}, GPU1={cores1:?}");
+        let c0_pin = cores0.first().copied();
+        let c1_pin = cores1.first().copied();
+        let mut batch_cores = Vec::with_capacity(cores0.len() + cores1.len());
+        if let Some(c) = c0_pin.or(c1_pin) {
+            batch_cores.push(c);
+        }
+        for &c in cores0.iter().chain(cores1.iter()) {
+            let start = 1.min(batch_cores.len());
+            if Some(c) != c0_pin && Some(c) != c1_pin && !batch_cores[start..].contains(&c) {
+                batch_cores.push(c);
+            }
+        }
+        tracing::info!(
+            "GLM-5.3 batch CPU pool ({} threads): workers={:?}",
+            batch_cores.len(),
+            &batch_cores[1.min(batch_cores.len())..],
+        );
+        let batch_pool = Arc::new(CpuThreadPool::from_cores(batch_cores));
         let pool0 = Arc::new(CpuThreadPool::from_cores(cores0));
         let pool1 = Arc::new(CpuThreadPool::from_cores(cores1));
 
@@ -742,6 +779,7 @@ impl DoorbellWorker {
             true,
             db0.host_ptr() as usize,
             Arc::clone(&pool0),
+            Arc::clone(&batch_pool),
             Arc::clone(&active),
             Arc::clone(&stop),
             Arc::clone(&miss_experts_total),
@@ -758,6 +796,7 @@ impl DoorbellWorker {
             false,
             db1.host_ptr() as usize,
             Arc::clone(&pool1),
+            Arc::clone(&batch_pool),
             Arc::clone(&active),
             Arc::clone(&stop),
             Arc::clone(&miss_experts_total),
@@ -1057,6 +1096,8 @@ pub struct Glm5State {
     pub decode_graph1_greedy: Option<CudaGraphExec>,
     pub decode_graph1_logits: Option<CudaGraphExec>,
     pub mtp_graph_dv: Option<CudaGraphExec>,
+    pub mtp_graph_dv_logits: Option<CudaGraphExec>,
+    pub last_mtp_used_dv: bool,
     pub mtp_graph_full_greedy: Option<CudaGraphExec>,
     pub mtp_graph_full_logits: Option<CudaGraphExec>,
     pub snap_kda0_graph: Option<CudaGraphExec>,
@@ -1074,6 +1115,8 @@ pub struct Glm5State {
     pub mtp_keep: i32,
     pub max_pf: i32,
     pub pf_at_fetch: bool,
+    pub batch_pci: i32,
+    pub async_promo: bool,
     // Optional per-phase CUDA-event profiler (AMPLLM_PHASE_PROFILE=1)
     pub phase_prof: Option<PhaseProfiler>,
     // Doorbell worker (must drop AFTER GPU finishes, BEFORE arena!)
@@ -1103,10 +1146,14 @@ impl Glm5State {
             .map(|lw| lw.blob_stride)
             .max()
             .unwrap_or(0);
-        let cpu_plan = std::env::var("AMPLLM_CPU_PLAN")
+        let mut cpu_plan = std::env::var("AMPLLM_CPU_PLAN")
             .ok()
             .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-            .unwrap_or(0x654432210u64);
+            .unwrap_or(0x654432210u64)
+            & !(1u64 << 63);
+        if std::env::var("AMPLLM_DIRECT_PCIE").is_ok_and(|v| v == "1") {
+            cpu_plan |= 1u64 << 63;
+        }
         let promote_min = std::env::var("AMPLLM_PROMOTE_MIN")
             .ok()
             .and_then(|s| s.parse::<i32>().ok())
@@ -1124,6 +1171,12 @@ impl Glm5State {
         let pf_at_fetch = std::env::var("AMPLLM_PF_AT")
             .map(|s| s.eq_ignore_ascii_case("fetch"))
             .unwrap_or(false);
+        let batch_pci = std::env::var("AMPLLM_BATCH_PCI")
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(2)
+            .clamp(0, 6);
+        let async_promo = std::env::var("AMPLLM_ASYNC_PROMO").is_ok_and(|v| v == "1");
 
         let mmq_ok_w = |w: &crate::glm5::weights::DevWeight| -> bool {
             matches!(
@@ -1393,6 +1446,8 @@ impl Glm5State {
             decode_graph1_greedy: None,
             decode_graph1_logits: None,
             mtp_graph_dv: None,
+            mtp_graph_dv_logits: None,
+            last_mtp_used_dv: false,
             mtp_graph_full_greedy: None,
             mtp_graph_full_logits: None,
             snap_kda0_graph: None,
@@ -1407,6 +1462,8 @@ impl Glm5State {
             mtp_keep,
             max_pf,
             pf_at_fetch,
+            batch_pci,
+            async_promo,
             phase_prof,
             doorbell,
         })
@@ -1416,6 +1473,7 @@ impl Glm5State {
         self.cur_pos = 0;
         self.head_x_pos = None;
         self.mtp_cached_pos = 0;
+        self.last_mtp_used_dv = false;
         {
             let db0 = &mut self.doorbell.db0.as_mut_slice()[0];
             db0.cancel_flag = 0;

@@ -117,8 +117,13 @@ pub struct DynamicExpertCache {
     pub tick: u64,
     pub promotions_total: u64,
     pub evictions_total: u64,
+    pub d2h_evictions_total: u64,
     pub freeze: bool,
+    pub keep_cold_ram: bool,
     pub has_profile: bool,
+    pub evict_policy: u8,
+    pub heat_decay: f32,
+    pub evict_guard: u64,
 }
 
 impl DynamicExpertCache {
@@ -168,6 +173,28 @@ impl DynamicExpertCache {
         let mover0 = DevAsyncMover::new(0, n_expert)?;
         let mover1 = DevAsyncMover::new(1, n_expert)?;
         let freeze = std::env::var_os("AMPLLM_FREEZE_CACHE").is_some();
+        let keep_cold_ram = std::env::var("AMPLLM_KEEP_COLD_RAM")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let evict_policy = match std::env::var("AMPLLM_EVICT_POLICY")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("heat") => 1u8,
+            Some("hybrid") => 2u8,
+            _ => 0u8,
+        };
+        let heat_decay = std::env::var("AMPLLM_HEAT_DECAY")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(0.992)
+            .clamp(0.5, 0.9999);
+        let evict_guard = std::env::var("AMPLLM_EVICT_GUARD")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1);
 
         Ok(Self {
             layers,
@@ -175,8 +202,13 @@ impl DynamicExpertCache {
             tick: 1000,
             promotions_total: 0,
             evictions_total: 0,
+            d2h_evictions_total: 0,
             freeze,
+            keep_cold_ram,
             has_profile: weights.has_profile,
+            evict_policy,
+            heat_decay,
+            evict_guard,
         })
     }
 
@@ -216,6 +248,9 @@ impl DynamicExpertCache {
         pairs: &[(usize, usize)],
         mut dev_set: bool,
     ) -> Result<bool> {
+        if self.keep_cold_ram {
+            return Ok(dev_set);
+        }
         let d = dev as usize;
         for &(l, e) in pairs {
             if self.layers[l].res_mask_host[e] != 0 && arena.release_ram_slot(l, e) {
@@ -336,6 +371,7 @@ impl DynamicExpertCache {
                 lc.spare_ptrs[p.spare_idx] = p.vic_ptr;
             }
             self.evictions_total += 1;
+            self.d2h_evictions_total += 1;
         }
         Ok(())
     }
@@ -437,7 +473,7 @@ impl DynamicExpertCache {
         let promos_seen = promoted.len() as u64;
         let d = dev as usize;
         let mut dev_set = false;
-        if !promoted.is_empty() {
+        if !self.keep_cold_ram && !promoted.is_empty() {
             set_device(dev)?;
             dev_set = true;
             let ev = self.movers[d]
@@ -480,12 +516,12 @@ impl DynamicExpertCache {
                 let can_d2h = self.movers[d].draining.len() < MAX_CONCURRENT_D2H
                     && !self.movers[d].event_pool.is_empty()
                     && arena.backup_free_count_for_layer(l) > 0;
-                let min_recent_cut = self.tick.saturating_sub(1);
+                let min_recent_cut = self.tick.saturating_sub(self.evict_guard);
 
                 let vic_opt = {
                     let lc = &self.layers[l];
                     let draining = &self.movers[d].draining;
-                    let mut best: Option<(u64, f32, usize)> = None;
+                    let mut best: Option<(u64, f32, f32, usize)> = None;
                     for slot in 0..lc.total_pool_slots {
                         let oe_raw = lc.expert_of_slot[slot];
                         if oe_raw < 0 {
@@ -504,15 +540,24 @@ impl DynamicExpertCache {
                             continue;
                         }
                         let h = lc.heat[oe];
+                        let score = if self.evict_policy == 2 {
+                            h / (1.0 + (self.tick.saturating_sub(lu) as f32) * 0.015625)
+                        } else {
+                            0.0
+                        };
                         let replace = match best {
                             None => true,
-                            Some((blu, bh, _)) => lu < blu || (lu == blu && h < bh),
+                            Some((blu, bh, bs, _)) => match self.evict_policy {
+                                1 => h < bh || (h == bh && lu < blu),
+                                2 => score < bs || (score == bs && lu < blu),
+                                _ => lu < blu || (lu == blu && h < bh),
+                            },
                         };
                         if replace {
-                            best = Some((lu, h, slot));
+                            best = Some((lu, h, score, slot));
                         }
                     }
-                    best.map(|(_, _, slot)| slot)
+                    best.map(|(_, _, _, slot)| slot)
                 };
 
                 let Some(vic_slot) = vic_opt else {
@@ -1226,7 +1271,7 @@ impl DynamicExpertCache {
                     set_device(d as i32)?;
                     self.movers[d].copy_stream.sync()?;
                     for &(l, new_e) in &promoted_wave[d] {
-                        if arena.release_ram_slot(l, new_e) {
+                        if !self.keep_cold_ram && arena.release_ram_slot(l, new_e) {
                             ram_updates[d].push((l, new_e, 0u64));
                         }
                     }

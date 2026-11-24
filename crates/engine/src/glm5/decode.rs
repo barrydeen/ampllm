@@ -723,6 +723,19 @@ pub fn enqueue_layer_m1(
                     sc.pf_ptrs[slot].ptr.cast(),
                     sc.pf_n[slot].ptr.cast(),
                 )
+            } else if state.async_promo && state.max_pf == 0 {
+                (
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    -1,
+                    sc.promo_src_dev.ptr.cast::<u64>().add(l),
+                    sc.promo_dst_dev.ptr.cast::<u64>().add(l),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
             } else {
                 (
                     std::ptr::null(),
@@ -793,6 +806,18 @@ pub fn enqueue_layer_m1(
             );
             if let Some(ev) = layer_evs {
                 ev[5].record(stream)?;
+            }
+            if state.async_promo && state.max_pf == 0 {
+                sc.ev_promo_start.record(stream)?;
+                sc.promo_stream.wait_event(&sc.ev_promo_start)?;
+                glm5::moe_fetch_nblocks(
+                    sc.promo_src_dev.ptr.cast::<u64>().add(l),
+                    sc.promo_dst_dev.ptr.cast::<u64>().add(l),
+                    1,
+                    lw.blob_stride,
+                    8,
+                    &sc.promo_stream,
+                );
             }
 
             let fork_prefetch = |nl: usize| -> Result<()> {
@@ -1071,6 +1096,10 @@ fn enqueue_layer_range_m1(
             next_pf_layer,
             &sc.stream,
         )?;
+    }
+    if state.async_promo && state.max_pf == 0 {
+        sc.ev_promo_done.record(&sc.promo_stream)?;
+        sc.stream.wait_event(&sc.ev_promo_done)?;
     }
     Ok(())
 }
@@ -1776,32 +1805,59 @@ pub fn enqueue_layer_batch_m(
         } else {
             let ginp = lw.ffn_gate_inp.as_ref().unwrap();
             linear_q8_m(ginp, sc.x_q8.ptr, sc.x_f32.ptr.cast(), sc.moe_logits.ptr.cast(), cfg.n_expert, n_embd, m, stream);
-            sc.moe_rows_dev.copy_from_host_async(&state.expert_cache.layers[l].res_mask_host, stream)?;
             let exp_seq_ptr = sc.db_expected_seq.ptr.cast::<u64>().add(l);
-            glm5::router_sigmoid_probe(
-                sc.moe_logits.ptr.cast(), lw.exp_probs_bias.unwrap() as *const f32,
-                cfg.n_expert as i32, cfg.n_expert_used as i32, cfg.expert_weights_scale, cfg.expert_weights_norm,
-                sc.moe_rows_dev.ptr.cast(), sc.x_f32.ptr.cast(),
-                n_embd as i32, cfg.n_ff_exp as i32, l as i32, lw.gu_type as i32, lw.d_type as i32,
-                cfg.swiglu_clamp_exp, sc.moe_ids.ptr.cast(), sc.moe_rw.ptr.cast(),
-                db_dev, sc.db_seq_state.ptr.cast(), exp_seq_ptr, m as i32, stream,
-            );
-            let mut ids_h = vec![0i32; m * cfg.n_expert_used];
-            ampllm_cuda_kernels::copy_d2h_raw_async(
-                bytemuck::cast_slice_mut(&mut ids_h),
-                sc.moe_ids.ptr,
+            let spares_ptr = lw
+                .spares_dev
+                .as_ref()
+                .map_or(std::ptr::null_mut(), |b| b.ptr.cast());
+            glm5::router_dual_lane_batch_m(
+                sc.moe_logits.ptr.cast(),
+                lw.exp_probs_bias.unwrap() as *const f32,
+                cfg.n_expert as i32,
+                cfg.n_expert_used as i32,
+                cfg.expert_weights_scale,
+                cfg.expert_weights_norm,
+                lw.vram_ptrs_dev.as_ref().unwrap().ptr.cast(),
+                lw.ram_ptrs_dev.as_ref().unwrap().ptr.cast(),
+                spares_ptr,
+                lw.k_spares as i32,
+                lw.dcnt_dev.as_ref().unwrap().ptr.cast(),
+                sc.moe_route_cnt_dev.ptr.cast(),
+                sc.moe_scratch_ptrs_dev.ptr.cast(),
+                state.batch_pci,
+                state.promote_min,
+                sc.moe_plan_ptrs_dev.ptr.cast(),
+                sc.moe_fetch_src_dev.ptr.cast(),
+                sc.moe_fetch_dst_dev.ptr.cast(),
+                sc.x_f32.ptr.cast(),
+                n_embd as i32,
+                cfg.n_ff_exp as i32,
+                l as i32,
+                lw.gu_type as i32,
+                lw.d_type as i32,
+                cfg.swiglu_clamp_exp,
+                sc.moe_ids.ptr.cast(),
+                sc.moe_rw.ptr.cast(),
+                db_dev,
+                sc.db_seq_state.ptr.cast(),
+                exp_seq_ptr,
+                m as i32,
                 stream,
-            )?;
-            stream.sync()?;
-            let vp = &state.expert_cache.layers[l].vram_ptrs_host;
-            let mut plan_ptrs_h = vec![0u64; m * cfg.n_expert_used];
-            for (i, &eid) in ids_h.iter().enumerate() {
-                if eid >= 0 && (eid as usize) < vp.len() {
-                    plan_ptrs_h[i] = vp[eid as usize];
-                }
+            );
+
+            if state.batch_pci > 0 {
+                sc.ev_pf_start.record(stream)?;
+                sc.pf_stream.wait_event(&sc.ev_pf_start)?;
+                glm5::moe_fetch_nblocks(
+                    sc.moe_fetch_src_dev.ptr.cast(),
+                    sc.moe_fetch_dst_dev.ptr.cast(),
+                    8,
+                    lw.blob_stride,
+                    16,
+                    &sc.pf_stream,
+                );
+                sc.ev_pf_done[0].record(&sc.pf_stream)?;
             }
-            sc.moe_plan_ptrs_dev
-                .copy_from_host_async(bytemuck::cast_slice(&plan_ptrs_h), stream)?;
 
             let gs = lw.ffn_gate_sh.as_ref().unwrap();
             let us = lw.ffn_up_sh.as_ref().unwrap();
@@ -1814,6 +1870,10 @@ pub fn enqueue_layer_batch_m(
                 std::ptr::null_mut(), sc.h_q8.ptr, m as i32, stream,
             );
             linear_q8_m(ds, sc.h_q8.ptr, sc.h_f32.ptr.cast(), sc.sh_out.ptr.cast(), n_embd, n_ff_sh, m, stream);
+
+            if state.batch_pci > 0 {
+                stream.wait_event(&sc.ev_pf_done[0])?;
+            }
 
             let gu_rb = lw.gu_type.row_bytes(n_embd);
             let d_rb = lw.d_type.row_bytes(cfg.n_ff_exp);
@@ -2411,12 +2471,35 @@ pub fn enqueue_mtp_draft_on_gpu1(
     };
     state.sc1.emb.copy_from_host_async(emb_bytes, &state.sc1.stream)?;
 
-    let use_dv = !need_draft_logits && use_draft_vocab && weights.draft_vocab.n_lead < cfg.n_vocab;
+    let dv_logits_en = {
+        static EN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *EN.get_or_init(|| {
+            std::env::var("AMPLLM_MTP_DV_LOGITS")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        })
+    };
+    let use_dv = (!need_draft_logits || dv_logits_en)
+        && use_draft_vocab
+        && weights.draft_vocab.n_lead < cfg.n_vocab;
+    state.last_mtp_used_dv = use_dv;
     let hx_base = state.head_x.ptr.cast::<f32>();
     let prof = prof_enabled();
 
     if use_cuda_graph && head_x_dev == hx_base {
-        if need_draft_logits {
+        if need_draft_logits && use_dv {
+            if state.mtp_graph_dv_logits.is_none() {
+                let g = CudaGraphExec::capture(&state.sc1.stream, || {
+                    enqueue_mtp_draft_body_m1(weights, state, hx_base, true, true);
+                    Ok(())
+                })?;
+                state.mtp_graph_dv_logits = Some(g);
+            }
+            if prof {
+                state.prof_mtp_start.record(&state.sc1.stream)?;
+            }
+            state.mtp_graph_dv_logits.as_ref().unwrap().launch(&state.sc1.stream)?;
+        } else if need_draft_logits {
             if state.mtp_graph_full_logits.is_none() {
                 let g = CudaGraphExec::capture(&state.sc1.stream, || {
                     enqueue_mtp_draft_body_m1(weights, state, hx_base, false, true);
@@ -2461,10 +2544,15 @@ pub fn enqueue_mtp_draft_on_gpu1(
     }
 
     if need_draft_logits {
+        let copy_rows = if use_dv {
+            weights.draft_vocab.n_lead + weights.draft_vocab.extra_ids.len()
+        } else {
+            cfg.n_vocab
+        };
         unsafe {
             let lh = std::slice::from_raw_parts_mut(
                 state.mtp_logits_pin.host_ptr().cast::<u8>(),
-                cfg.n_vocab * 4,
+                copy_rows * 4,
             );
             state.logits_dev.copy_to_host_async(lh, &state.sc1.stream)?;
         }

@@ -281,6 +281,49 @@ pub unsafe fn moe_fetch_nblocks(
     ffi::launch_glm5_moe_fetch_nblocks(fetch_src, plan_ptrs, topk, blob_bytes, n_blocks, stream.raw);
 }
 
+pub unsafe fn router_dual_lane_batch_m(
+    logits: *const f32,
+    bias: *const f32,
+    n_expert: i32,
+    topk: i32,
+    w_scale: f32,
+    norm_w: bool,
+    vram_ptrs: *mut u64,
+    ram_ptrs: *const u64,
+    spares: *mut u64,
+    k_spares: i32,
+    dcnt: *mut u32,
+    route_cnt_dev: *mut u32,
+    scratch_ptrs: *const u64,
+    batch_pci: i32,
+    promote_min: i32,
+    plan_ptrs_out: *mut u64,
+    fetch_src_out: *mut u64,
+    fetch_dst_out: *mut u64,
+    x_f32: *const f32,
+    n_embd: i32,
+    n_ff: i32,
+    layer_idx: i32,
+    gu_type: i32,
+    d_type: i32,
+    clamp_lim: f32,
+    ids_out: *mut i32,
+    rw_out: *mut f32,
+    doorbell_mapped: *mut c_void,
+    seq_state_dev: *mut u64,
+    expected_seq_out: *mut u64,
+    m: i32,
+    stream: &CudaStream,
+) {
+    ffi::launch_glm5_router_dual_lane_batch(
+        logits, bias, n_expert, topk, w_scale, i32::from(norm_w),
+        vram_ptrs, ram_ptrs, spares, k_spares, dcnt, route_cnt_dev, scratch_ptrs,
+        batch_pci, promote_min, plan_ptrs_out, fetch_src_out, fetch_dst_out,
+        x_f32, n_embd, n_ff, layer_idx, gu_type, d_type, clamp_lim,
+        ids_out, rw_out, doorbell_mapped, seq_state_dev, expected_seq_out, m, stream.raw,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn router_dual_lane_pf(
     logits: *const f32,

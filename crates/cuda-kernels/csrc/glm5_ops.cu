@@ -2262,8 +2262,8 @@ extern "C" void launch_glm5_kda_prep_m1(
     );
 }
 
-// Fused single-pass KDA recurrence + RMSNorm + SiLU gate + Q8_1 (grid = n_head, block = 256)
-__global__ void __launch_bounds__(256) glm5_kda_rec_gate_q8_m1_kernel(
+// Fused single-pass KDA recurrence + RMSNorm + SiLU gate + Q8_1 (grid = n_head, block = 512)
+__global__ void __launch_bounds__(512) glm5_kda_rec_gate_q8_m1_kernel(
     const float* __restrict__ q,
     const float* __restrict__ k,
     const float* __restrict__ v,
@@ -2284,7 +2284,7 @@ __global__ void __launch_bounds__(256) glm5_kda_rec_gate_q8_m1_kernel(
     if (h >= n_head) return;
     const int t = threadIdx.x;
     const int j = t & 127;
-    const int half = t >> 7;
+    const int quad = t >> 7;
     const int lane = t & 31;
     const int warp = t >> 5;
 
@@ -2292,8 +2292,8 @@ __global__ void __launch_bounds__(256) glm5_kda_rec_gate_q8_m1_kernel(
     __shared__ float s_k[HD];
     __shared__ float s_dec[HD];
     __shared__ float s_del[HD];
-    __shared__ float s_acc[2][HD];
-    __shared__ float s_red[8];
+    __shared__ float s_acc[4][HD];
+    __shared__ float s_red[4];
 
     const size_t h_off = (size_t)h * HD;
     if (t < HD) {
@@ -2305,42 +2305,44 @@ __global__ void __launch_bounds__(256) glm5_kda_rec_gate_q8_m1_kernel(
     __syncthreads();
 
     float* S_h = state + (size_t)h * (HD * HD);
-    float reg[64];
+    float reg[32];
     float A = 0.0f;
     #pragma unroll
-    for (int ii = 0; ii < 64; ++ii) {
-        const int i = half * 64 + ii;
+    for (int ii = 0; ii < 32; ++ii) {
+        const int i = quad * 32 + ii;
         const float sv = S_h[i * HD + j] * s_dec[i];
         reg[ii] = sv;
         A += sv * s_k[i];
     }
-    s_acc[half][j] = A;
+    s_acc[quad][j] = A;
     __syncthreads();
-    if (half == 0) {
-        s_del[j] = b * (v[h_off + j] - (s_acc[0][j] + s_acc[1][j]));
+    if (quad == 0) {
+        s_del[j] = b * (v[h_off + j] - (s_acc[0][j] + s_acc[1][j] + s_acc[2][j] + s_acc[3][j]));
     }
     __syncthreads();
     const float dl = s_del[j];
     float O = 0.0f;
     #pragma unroll
-    for (int ii = 0; ii < 64; ++ii) {
-        const int i = half * 64 + ii;
+    for (int ii = 0; ii < 32; ++ii) {
+        const int i = quad * 32 + ii;
         const float s2 = reg[ii] + s_k[i] * dl;
         S_h[i * HD + j] = s2;
         O += s2 * s_q[i];
     }
     __syncthreads();
-    s_acc[half][j] = O;
+    s_acc[quad][j] = O;
     __syncthreads();
 
-    const float o = (s_acc[0][j] + s_acc[1][j]) * rsqrtf((float)HD);
-    float ss = (half == 0) ? (o * o) : 0.0f;
-    ss = warp_reduce_sum(ss);
-    if (lane == 0) s_red[warp] = ss;
+    float o = 0.0f;
+    if (quad == 0) {
+        o = (s_acc[0][j] + s_acc[1][j] + s_acc[2][j] + s_acc[3][j]) * rsqrtf((float)HD);
+        float ss = warp_reduce_sum(o * o);
+        if (lane == 0) s_red[warp] = ss;
+    }
     __syncthreads();
-    const float tot = s_red[0] + s_red[1] + s_red[2] + s_red[3];
-    const float inv = rsqrtf(tot / (float)HD + eps);
-    if (half == 0) {
+    if (quad == 0) {
+        const float tot = s_red[0] + s_red[1] + s_red[2] + s_red[3];
+        const float inv = rsqrtf(tot / (float)HD + eps);
         const float gv = o * inv * norm_w[j] * (1.0f / (1.0f + expf(-g2[h_off + j])));
         if (gated_f32_opt != nullptr) gated_f32_opt[h_off + j] = gv;
         if (gated_q8 != nullptr) warp_quantize_q8_1_store(gv, gated_q8 + (h * 4 + warp), lane);
@@ -2364,7 +2366,7 @@ extern "C" void launch_glm5_kda_rec_gate_q8_m1(
     cudaStream_t stream
 ) {
     if (n_head <= 0) return;
-    glm5_kda_rec_gate_q8_m1_kernel<<<n_head, 256, 0, stream>>>(
+    glm5_kda_rec_gate_q8_m1_kernel<<<n_head, 512, 0, stream>>>(
         q, k, v, g1, beta_raw, state, g2, norm_w, eps, n_head,
         gated_f32_opt, reinterpret_cast<block_q8_1*>(gated_q8), skip_dev
     );
@@ -5316,7 +5318,12 @@ __global__ void __launch_bounds__(256) glm5_router_dual_lane_kernel(
             plan_ptrs_out[tid] = 0ULL;
             fetch_src_out[tid] = 0ULL;
         }
-        if (tid < 2) {
+        if (max_pf == -1) {
+            if (tid == 0) {
+                if (pf_out_src != nullptr) pf_out_src[0] = 0ULL;
+                if (pf_out_dst != nullptr) pf_out_dst[0] = 0ULL;
+            }
+        } else if (tid < 2) {
             if (pf_out_eids != nullptr) pf_out_eids[tid] = -1;
             if (pf_out_ptrs != nullptr) pf_out_ptrs[tid] = 0ULL;
             if (pf_out_src != nullptr) pf_out_src[tid] = 0ULL;
@@ -5378,8 +5385,10 @@ __global__ void __launch_bounds__(256) glm5_router_dual_lane_kernel(
             }
         }
 
-        int to_cpu = (cpu_plan != 0ULL && f_ram > 0 && doorbell != nullptr)
-            ? (int)((cpu_plan >> (4 * f_ram)) & 15ULL)
+        const bool direct_pcie = (cpu_plan >> 63) != 0ULL;
+        const uint64_t cpu_plan_bits = cpu_plan & ~(1ULL << 63);
+        int to_cpu = (cpu_plan_bits != 0ULL && f_ram > 0 && doorbell != nullptr)
+            ? (int)((cpu_plan_bits >> (4 * f_ram)) & 15ULL)
             : 0;
         if (to_cpu > f_ram) to_cpu = f_ram;
 
@@ -5438,12 +5447,25 @@ __global__ void __launch_bounds__(256) glm5_router_dual_lane_kernel(
                         }
                     }
                 }
-                if (dst_slot == 0ULL && scratch_ptrs != nullptr && sc_idx < sc_cap) {
-                    dst_slot = scratch_ptrs[sc_idx++];
+                if (dst_slot == 0ULL) {
+                    if (direct_pcie) {
+                        plan_ptrs_out[k] = rp;
+                        fetch_src_out[k] = 0ULL;
+                        ++n_pci;
+                    } else if (scratch_ptrs != nullptr && sc_idx < sc_cap) {
+                        dst_slot = scratch_ptrs[sc_idx++];
+                        plan_ptrs_out[k] = dst_slot;
+                        fetch_src_out[k] = rp;
+                        ++n_pci;
+                    } else {
+                        plan_ptrs_out[k] = 0ULL;
+                        fetch_src_out[k] = 0ULL;
+                    }
+                } else {
+                    plan_ptrs_out[k] = dst_slot;
+                    fetch_src_out[k] = rp;
+                    ++n_pci;
                 }
-                plan_ptrs_out[k] = dst_slot;
-                fetch_src_out[k] = (dst_slot != 0ULL) ? rp : 0ULL;
-                if (dst_slot != 0ULL) ++n_pci;
             } else {
                 plan_ptrs_out[k] = 0ULL;
                 fetch_src_out[k] = 0ULL;
@@ -5452,6 +5474,45 @@ __global__ void __launch_bounds__(256) glm5_router_dual_lane_kernel(
         for (int k = topk; k < 8; ++k) {
             plan_ptrs_out[k] = 0ULL;
             fetch_src_out[k] = 0ULL;
+        }
+        if (max_pf == -1 && pf_out_src != nullptr && pf_out_dst != nullptr) {
+            uint64_t ap_src = 0ULL, ap_dst = 0ULL;
+            if (n_pci == 0 && mc > 0 && spares != nullptr && k_spares > 0) {
+                int best_e = -1;
+                uint32_t best_cnt = 0u;
+                for (int i = 0; i < mc; ++i) {
+                    int e = s_miss_ids[i];
+                    uint32_t rc = (dcnt != nullptr) ? dcnt[e] : 1u;
+                    if ((int)rc < promote_min) continue;
+                    if (ram_ptrs == nullptr || ram_ptrs[e] == 0ULL) continue;
+                    if (vram_ptrs[e] != 0ULL) continue;
+                    if (best_e < 0 || rc > best_cnt) {
+                        best_e = e;
+                        best_cnt = rc;
+                    }
+                }
+                if (best_e >= 0) {
+                    for (int s = 0; s < k_spares; ++s) {
+                        if (spares[s] != 0ULL) {
+                            uint64_t dst_slot = spares[s];
+                            spares[s] = 0ULL;
+                            vram_ptrs[best_e] = dst_slot;
+                            if (doorbell != nullptr && layer_idx >= 0 && layer_idx < 48 && s < 8 && np < 8) {
+                                s_promo_s[np] = s;
+                                s_promo_e[np] = best_e;
+                                s_promo_p[np] = dst_slot;
+                                ++np;
+                            }
+                            ap_src = ram_ptrs[best_e];
+                            ap_dst = dst_slot;
+                            ++n_pci;
+                            break;
+                        }
+                    }
+                }
+            }
+            pf_out_src[0] = ap_src;
+            pf_out_dst[0] = ap_dst;
         }
 
         uint64_t next_pci = 0ULL;
@@ -5963,6 +6024,302 @@ extern "C" void launch_glm5_router_sigmoid_probe(
     );
 }
 
+__global__ void __launch_bounds__(256) glm5_router_dual_lane_batch_kernel(
+    const float* __restrict__ logits,       // [M, n_expert]
+    const float* __restrict__ bias,         // nullable [n_expert]
+    int n_expert,
+    int topk,
+    float w_scale,
+    int norm_w,
+    uint64_t* __restrict__ vram_ptrs,       // [n_expert]
+    const uint64_t* __restrict__ ram_ptrs,  // [n_expert]
+    uint64_t* __restrict__ spares,          // [k_spares]
+    int k_spares,
+    uint32_t* __restrict__ dcnt,            // [n_expert]
+    uint32_t* __restrict__ route_cnt_dev,   // [1]
+    const uint64_t* __restrict__ scratch_ptrs, // [8]
+    int batch_pci,
+    int promote_min,
+    uint64_t* __restrict__ plan_ptrs_out,   // [M * topk]
+    uint64_t* __restrict__ fetch_src_out,   // [8]
+    uint64_t* __restrict__ fetch_dst_out,   // [8]
+    const float* __restrict__ x_f32,        // nullable [M, n_embd]
+    int n_embd,
+    int n_ff,
+    int layer_idx,
+    int32_t gu_type,
+    int32_t d_type,
+    float clamp_lim,
+    int32_t* __restrict__ ids_out,          // [M, topk]
+    float* __restrict__ rw_out,             // [M, topk]
+    Glm5Doorbell* __restrict__ doorbell,
+    uint64_t* __restrict__ seq_state_dev,
+    uint64_t* __restrict__ expected_seq_out,
+    int M
+) {
+    const int tid = threadIdx.x;
+    __shared__ float s_p[512];
+    __shared__ float s_sel[512];
+    __shared__ uint8_t s_used[512];
+    __shared__ float s_best_v[8];
+    __shared__ int32_t s_best_i[8];
+    __shared__ int32_t s_do_age;
+    __shared__ int32_t s_miss_cnt;
+    __shared__ uint64_t s_exp_seq;
+    __shared__ int32_t s_promo_s[8];
+    __shared__ int32_t s_promo_e[8];
+    __shared__ uint64_t s_promo_p[8];
+    __shared__ int32_t s_n_promo;
+
+    if (tid == 0) {
+        int32_t ag = 0;
+        if (route_cnt_dev != nullptr && dcnt != nullptr) {
+            uint32_t rc = *route_cnt_dev + (uint32_t)M;
+            *route_cnt_dev = rc;
+            if ((rc >> 12) != ((rc - (uint32_t)M) >> 12)) ag = 1;
+        }
+        s_do_age = ag;
+        s_miss_cnt = 0;
+        s_exp_seq = 0ULL;
+        s_n_promo = 0;
+    }
+    __syncthreads();
+
+    if (s_do_age != 0 && dcnt != nullptr) {
+        for (int e = tid; e < n_expert; e += 256) {
+            dcnt[e] >>= 1;
+        }
+        __syncthreads();
+    }
+
+    for (int t = 0; t < M; ++t) {
+        const float* lt = logits + (size_t)t * n_expert;
+        int32_t* io = ids_out + (size_t)t * topk;
+        float* ro = rw_out + (size_t)t * topk;
+        glm5_router_select_token_dev(
+            lt, bias, n_expert, topk, w_scale, norm_w,
+            io, ro, s_p, s_sel, s_used, s_best_v, s_best_i
+        );
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        int32_t u_eid[32];
+        int32_t u_mul[32];
+        uint32_t u_cnt[32];
+        uint64_t u_ptr[32];
+        int n_u = 0;
+
+        for (int t = 0; t < M; ++t) {
+            const int32_t* io = ids_out + (size_t)t * topk;
+            for (int k = 0; k < topk && k < 8; ++k) {
+                int e = io[k];
+                if (doorbell != nullptr && layer_idx >= 0 && layer_idx < 48 && t * topk + k < 32) {
+                    doorbell->routed_ids[layer_idx][t * topk + k] = e;
+                }
+                if (e >= 0 && e < n_expert) {
+                    if (dcnt != nullptr) dcnt[e] += 1u;
+                    uint64_t vp = vram_ptrs[e];
+                    uint64_t rp = (ram_ptrs != nullptr) ? ram_ptrs[e] : 0ULL;
+                    if (vp == 0ULL && rp != 0ULL) {
+                        int found = -1;
+                        for (int u = 0; u < n_u; ++u) {
+                            if (u_eid[u] == e) { found = u; break; }
+                        }
+                        if (found >= 0) {
+                            u_mul[found] += 1;
+                        } else if (n_u < 32) {
+                            u_eid[n_u] = e;
+                            u_mul[n_u] = 1;
+                            u_cnt[n_u] = (dcnt != nullptr) ? dcnt[e] : 1u;
+                            u_ptr[n_u] = 0ULL;
+                            ++n_u;
+                        }
+                    }
+                }
+            }
+        }
+
+        int n_f = 0;
+        int np = 0;
+        int sc_idx = 0;
+        int pci_lim = batch_pci;
+        if (pci_lim > 6) pci_lim = 6;
+        if (pci_lim > n_u) pci_lim = n_u;
+
+        for (int pf = 0; pf < pci_lim; ++pf) {
+            int best_u = -1;
+            for (int u = 0; u < n_u; ++u) {
+                if (u_ptr[u] != 0ULL) continue;
+                if (best_u < 0
+                    || u_mul[u] > u_mul[best_u]
+                    || (u_mul[u] == u_mul[best_u] && u_cnt[u] > u_cnt[best_u])) {
+                    best_u = u;
+                }
+            }
+            if (best_u < 0) break;
+            int e = u_eid[best_u];
+            uint64_t dst_slot = 0ULL;
+            uint32_t rc = u_cnt[best_u];
+            if (spares != nullptr && k_spares > 0 && (int)rc >= promote_min) {
+                for (int s = 0; s < k_spares; ++s) {
+                    if (spares[s] != 0ULL) {
+                        dst_slot = spares[s];
+                        spares[s] = 0ULL;
+                        vram_ptrs[e] = dst_slot;
+                        if (doorbell != nullptr && layer_idx >= 0 && layer_idx < 48 && s < 8 && np < 8) {
+                            s_promo_s[np] = s;
+                            s_promo_e[np] = e;
+                            s_promo_p[np] = dst_slot;
+                            ++np;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (dst_slot == 0ULL && scratch_ptrs != nullptr && sc_idx < 6) {
+                dst_slot = scratch_ptrs[sc_idx++];
+            }
+            if (dst_slot != 0ULL) {
+                u_ptr[best_u] = dst_slot;
+                fetch_src_out[n_f] = ram_ptrs[e];
+                fetch_dst_out[n_f] = dst_slot;
+                ++n_f;
+            }
+        }
+        for (int i = n_f; i < 8; ++i) {
+            fetch_src_out[i] = 0ULL;
+            fetch_dst_out[i] = 0ULL;
+        }
+        if (n_f > 0 && seq_state_dev != nullptr) {
+            uint64_t next_pci = seq_state_dev[1] + (uint64_t)n_f;
+            seq_state_dev[1] = next_pci;
+            if (doorbell != nullptr) doorbell->pci_fetch_total = next_pci;
+        }
+
+        int mc = 0;
+        for (int t = 0; t < M; ++t) {
+            const int32_t* io = ids_out + (size_t)t * topk;
+            const float* ro = rw_out + (size_t)t * topk;
+            for (int k = 0; k < topk && k < 8; ++k) {
+                int e = io[k];
+                uint64_t ptr = 0ULL;
+                if (e >= 0 && e < n_expert) {
+                    ptr = vram_ptrs[e];
+                    if (ptr == 0ULL) {
+                        for (int u = 0; u < n_u; ++u) {
+                            if (u_eid[u] == e) { ptr = u_ptr[u]; break; }
+                        }
+                    }
+                }
+                plan_ptrs_out[(size_t)t * topk + k] = ptr;
+                if (ptr == 0ULL && doorbell != nullptr && e >= 0 && e < n_expert
+                    && ram_ptrs != nullptr && ram_ptrs[e] != 0ULL && mc < 32) {
+                    doorbell->miss_tok[mc] = t;
+                    doorbell->miss_ids[mc] = e;
+                    doorbell->miss_weights[mc] = ro[k];
+                    ++mc;
+                }
+            }
+        }
+
+        uint64_t exp_seq = 0ULL;
+        if (doorbell != nullptr) {
+            doorbell->m_batch = M;
+            doorbell->miss_count = mc;
+            doorbell->x_q8k_valid = 0;
+            for (int i = 0; i < np; ++i) {
+                doorbell->promo_vram_ptr[layer_idx][s_promo_s[i]] = s_promo_p[i];
+            }
+            if (mc > 0 && seq_state_dev != nullptr) {
+                uint64_t next_s = seq_state_dev[0] + 1ULL;
+                seq_state_dev[0] = next_s;
+                doorbell->layer_idx = layer_idx;
+                doorbell->gu_type = gu_type;
+                doorbell->d_type = d_type;
+                doorbell->n_embd = n_embd;
+                doorbell->n_ff = n_ff;
+                doorbell->clamp_lim = clamp_lim;
+                exp_seq = next_s;
+            }
+        }
+        if (expected_seq_out != nullptr) *expected_seq_out = exp_seq;
+        s_miss_cnt = mc;
+        s_exp_seq = exp_seq;
+        s_n_promo = np;
+    }
+    __syncthreads();
+
+    if (s_miss_cnt > 0 && x_f32 != nullptr && doorbell != nullptr) {
+        const int tot_x = M * n_embd;
+        for (int e = tid; e < tot_x; e += 256) {
+            doorbell->x_in[e] = x_f32[e];
+        }
+    }
+    __syncthreads();
+
+    if (doorbell != nullptr && ((s_miss_cnt > 0 && x_f32 != nullptr) || s_n_promo > 0)) {
+        __threadfence_system();
+        __syncthreads();
+        if (tid == 0) {
+            for (int i = 0; i < s_n_promo; ++i) {
+                if (layer_idx >= 0 && layer_idx < 48) {
+                    doorbell->promo_eid[layer_idx][s_promo_s[i]] = s_promo_e[i];
+                }
+            }
+            if (s_miss_cnt > 0 && x_f32 != nullptr) {
+                doorbell->req_seq = s_exp_seq;
+            }
+            __threadfence_system();
+        }
+    }
+}
+
+extern "C" void launch_glm5_router_dual_lane_batch(
+    const float* logits,
+    const float* bias,
+    int n_expert,
+    int topk,
+    float w_scale,
+    int norm_w,
+    uint64_t* vram_ptrs,
+    const uint64_t* ram_ptrs,
+    uint64_t* spares,
+    int k_spares,
+    uint32_t* dcnt,
+    uint32_t* route_cnt_dev,
+    const uint64_t* scratch_ptrs,
+    int batch_pci,
+    int promote_min,
+    uint64_t* plan_ptrs_out,
+    uint64_t* fetch_src_out,
+    uint64_t* fetch_dst_out,
+    const float* x_f32,
+    int n_embd,
+    int n_ff,
+    int layer_idx,
+    int32_t gu_type,
+    int32_t d_type,
+    float clamp_lim,
+    int32_t* ids_out,
+    float* rw_out,
+    void* doorbell_mapped,
+    uint64_t* seq_state_dev,
+    uint64_t* expected_seq_out,
+    int M,
+    cudaStream_t stream
+) {
+    if (M <= 0 || n_expert <= 0 || topk <= 0) return;
+    glm5_router_dual_lane_batch_kernel<<<1, 256, 0, stream>>>(
+        logits, bias, n_expert, topk, w_scale, norm_w,
+        vram_ptrs, ram_ptrs, spares, k_spares, dcnt, route_cnt_dev, scratch_ptrs,
+        batch_pci, promote_min, plan_ptrs_out, fetch_src_out, fetch_dst_out,
+        x_f32, n_embd, n_ff, layer_idx, gu_type, d_type, clamp_lim,
+        ids_out, rw_out, reinterpret_cast<Glm5Doorbell*>(doorbell_mapped),
+        seq_state_dev, expected_seq_out, M
+    );
+}
+
 // Single-block (256 threads) wait + accumulate + HC post for M=1..4 (zero cross-block race)
 __global__ void __launch_bounds__(256) glm5_doorbell_wait_add_hc_post_kernel(
     const Glm5Doorbell* __restrict__ doorbell,
@@ -5990,7 +6347,7 @@ __global__ void __launch_bounds__(256) glm5_doorbell_wait_add_hc_post_kernel(
                 uint64_t cur = 0ULL;
                 asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(cur) : "l"(done_addr) : "memory");
                 if (cur >= exp) break;
-                __nanosleep(50);
+                __nanosleep(16);
             }
         }
     }
@@ -6075,7 +6432,7 @@ __global__ void __launch_bounds__(256) glm5_doorbell_wait_add_kernel(
                 uint64_t cur = 0ULL;
                 asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(cur) : "l"(done_addr) : "memory");
                 if (cur >= exp) break;
-                __nanosleep(50);
+                __nanosleep(16);
             }
         }
     }

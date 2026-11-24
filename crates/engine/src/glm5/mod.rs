@@ -16,8 +16,8 @@ use crate::glm5::state::{DoorbellActiveGuard, Glm5State};
 use crate::glm5::weights::Glm5ModelWeights;
 use crate::inkling2::StreamGenerateResult;
 use crate::sampling::{
-    build_top_p_probs, leviathan_verify_sample, sample_from_probs, sample_next_token,
-    SamplingParams,
+    build_top_p_probs, build_top_p_probs_mapped, leviathan_verify_sample, sample_from_probs,
+    sample_next_token, SamplingParams,
 };
 use crate::snapshot::{
     d2h_full, d2h_prefix, h2d_bytes, EngineSnapshotData, Glm5DsaSnap, Glm5KdaSnap, Glm5Snapshot,
@@ -33,6 +33,21 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
+
+#[inline]
+fn build_mtp_draft_probs(
+    weights: &Glm5ModelWeights,
+    state: &Glm5State,
+    params: &SamplingParams,
+) -> Vec<(u32, f32)> {
+    let dv = &weights.draft_vocab;
+    if state.last_mtp_used_dv && dv.n_lead < weights.cfg.n_vocab {
+        let len = dv.n_lead + dv.extra_ids.len();
+        build_top_p_probs_mapped(&state.mtp_logits_pin.as_slice()[..len], dv.n_lead, &dv.extra_ids, params)
+    } else {
+        build_top_p_probs(&state.mtp_logits_pin.as_slice()[..weights.cfg.n_vocab], params)
+    }
+}
 
 fn ngram_predict(history: &[u32], prefix: &[u32]) -> Option<u32> {
     let h_len = history.len();
@@ -718,7 +733,10 @@ impl Glm5Engine {
                         if let Some(ref mut pp) = self.state.phase_prof {
                             pp.accumulate_step(&self.weights, pos & 1)?;
                         }
-                        self.state.expert_cache.decay_all(0.992);
+                        {
+                            let decay = self.state.expert_cache.heat_decay;
+                            self.state.expert_cache.decay_all(decay);
+                        }
                         {
                             let db0 = &mut self.state.doorbell.db0.as_mut_slice()[0];
                             let (p, rp, vh) = self.state.expert_cache.sync_promos_and_refill_dev(
@@ -842,11 +860,7 @@ impl Glm5Engine {
                                     set_device(1)?;
                                     self.state.sc1.stream.sync()?;
                                     let d1 = if need_logits {
-                                        let nv = self.weights.cfg.n_vocab;
-                                        let pr = build_top_p_probs(
-                                            &self.state.mtp_logits_pin.as_slice()[..nv],
-                                            params,
-                                        );
+                                        let pr = build_mtp_draft_probs(&self.weights, &self.state, params);
                                         let t = sample_from_probs(&pr, &mut rng);
                                         draft_probs.push(pr);
                                         t
@@ -889,7 +903,7 @@ impl Glm5Engine {
                                     }
                                 }
                             }
-                            if next_d.is_none() && enable_chain && j == 1 {
+                            if next_d.is_none() && enable_chain {
                                 let prev_d = *batch_toks.last().unwrap();
                                 let chain_dv = step_use_dv
                                     && self
@@ -919,11 +933,7 @@ impl Glm5Engine {
                                         .note_layer_route(mtp_l, &db1.routed_ids[mtp_l][..8]);
                                 }
                                 let cd = if need_logits {
-                                    let nv = self.weights.cfg.n_vocab;
-                                    let pr = build_top_p_probs(
-                                        &self.state.mtp_logits_pin.as_slice()[..nv],
-                                        params,
-                                    );
+                                    let pr = build_mtp_draft_probs(&self.weights, &self.state, params);
                                     let t = sample_from_probs(&pr, &mut rng);
                                     Some((t, Some(pr)))
                                 } else {
@@ -966,16 +976,40 @@ impl Glm5Engine {
                             prof_steps += 1;
                         }
 
-                        self.state.expert_cache.decay_all(0.992);
                         {
-                            let n_r = m_cur * 8;
+                            let decay = self.state.expert_cache.heat_decay;
+                            self.state.expert_cache.decay_all(decay);
+                        }
+                        {
+                            let n_r = m_cur * self.weights.cfg.n_expert_used.min(8);
+                            let n_exp = self.weights.cfg.n_expert;
                             let db0 = &self.state.doorbell.db0.as_slice()[0];
                             for l in lead_dense..split_l {
-                                self.state.expert_cache.note_layer_route(l, &db0.routed_ids[l][..n_r]);
+                                let ids = &db0.routed_ids[l][..n_r];
+                                let lc = &self.state.expert_cache.layers[l];
+                                for &raw_id in ids {
+                                    if raw_id >= 0 && (raw_id as usize) < n_exp {
+                                        routed_pairs_prof += 1;
+                                        if lc.res_mask_host[raw_id as usize] != 0 {
+                                            vram_hits_prof += 1;
+                                        }
+                                    }
+                                }
+                                self.state.expert_cache.note_layer_route(l, ids);
                             }
                             let db1 = &self.state.doorbell.db1.as_slice()[0];
                             for l in split_l..n_layers {
-                                self.state.expert_cache.note_layer_route(l, &db1.routed_ids[l][..n_r]);
+                                let ids = &db1.routed_ids[l][..n_r];
+                                let lc = &self.state.expert_cache.layers[l];
+                                for &raw_id in ids {
+                                    if raw_id >= 0 && (raw_id as usize) < n_exp {
+                                        routed_pairs_prof += 1;
+                                        if lc.res_mask_host[raw_id as usize] != 0 {
+                                            vram_hits_prof += 1;
+                                        }
+                                    }
+                                }
+                                self.state.expert_cache.note_layer_route(l, ids);
                             }
                         }
                         {
@@ -1201,11 +1235,7 @@ impl Glm5Engine {
                             mtp_dev_n += 1;
                         }
                         if need_logits {
-                            let nv = self.weights.cfg.n_vocab;
-                            draft_probs = build_top_p_probs(
-                                &self.state.mtp_logits_pin.as_slice()[..nv],
-                                params,
-                            );
+                            draft_probs = build_mtp_draft_probs(&self.weights, &self.state, params);
                             draft_tok = sample_from_probs(&draft_probs, &mut rng);
                         } else {
                             draft_tok = self.state.mtp_tok_host.as_slice()[0] as u32;
@@ -1310,9 +1340,13 @@ impl Glm5Engine {
                                 set_device(0)?;
                                 self.state.sc0.stream.sync()?;
                                 self.state.sc0.pf_stream.sync()?;
+                                self.state.sc0.promo_stream.sync()?;
                                 write_cancel(0);
                             }
-                            self.state.expert_cache.decay_all(0.992);
+                            {
+                            let decay = self.state.expert_cache.heat_decay;
+                            self.state.expert_cache.decay_all(decay);
+                        }
                             {
                                 let db0 = &mut self.state.doorbell.db0.as_mut_slice()[0];
                                 let (p, rp, vh) = self.state.expert_cache.sync_promos_and_refill_dev(
@@ -1402,8 +1436,12 @@ impl Glm5Engine {
                                 set_device(0)?;
                                 self.state.sc0.stream.sync()?;
                                 self.state.sc0.pf_stream.sync()?;
+                                self.state.sc0.promo_stream.sync()?;
                                 write_cancel(0);
-                                self.state.expert_cache.decay_all(0.992);
+                                {
+                            let decay = self.state.expert_cache.heat_decay;
+                            self.state.expert_cache.decay_all(decay);
+                        }
                                 {
                                     let db0 = &mut self.state.doorbell.db0.as_mut_slice()[0];
                                     let (p, rp, vh) = self.state.expert_cache.sync_promos_and_refill_dev(
@@ -1478,7 +1516,10 @@ impl Glm5Engine {
 
                         // Hide host cache bookkeeping for GPU 0 behind GPU 1 MTP(pos) / GPU 0(pos+1) execution.
                         if !did_g0_cache {
-                            self.state.expert_cache.decay_all(0.992);
+                            {
+                            let decay = self.state.expert_cache.heat_decay;
+                            self.state.expert_cache.decay_all(decay);
+                        }
                             let db0 = &mut self.state.doorbell.db0.as_mut_slice()[0];
                             let (p, rp, vh) = self.state.expert_cache.sync_promos_and_refill_dev(
                                 0,
@@ -1517,11 +1558,7 @@ impl Glm5Engine {
                             }
 
                             if need_logits {
-                                let nv = self.weights.cfg.n_vocab;
-                                draft_probs = build_top_p_probs(
-                                    &self.state.mtp_logits_pin.as_slice()[..nv],
-                                    params,
-                                );
+                                draft_probs = build_mtp_draft_probs(&self.weights, &self.state, params);
                                 draft_tok = sample_from_probs(&draft_probs, &mut rng);
                             } else {
                                 draft_tok = self.state.mtp_tok_host.as_slice()[0] as u32;
@@ -1676,7 +1713,7 @@ impl Glm5Engine {
             let rej_ms = if rej_n > 0 { (rej_ns as f64) / 1e6 / (rej_n as f64) } else { 0.0 };
             let toks_emitted = generated.len().saturating_sub(1);
             eprintln!(
-                "AMPLLM_PROFILE batch_m={verify_m} steps={prof_steps} toks={toks_emitted} ({:.2}tok/step) draft={draft_accepted}/{draft_n}: avg_step={:.2}ms (gpu+ver={:.2}ms acc={acc_ms:.2}ms[{acc_n}] rej={rej_ms:.2}ms[{rej_n}] gpu0={:.2}ms mtp={:.2}ms host={:.2}ms cpu={:.2}ms[cpu0={:.2} cpu1={:.2}] ({:.3}ms/uexp)) total={:.2}ms/tok | vram_hit={hit_pct:.1}% cpu_pairs={:.1}/step pci_fetch={:.1}/step cpu_uniq={:.1}/step | promo={gpu_promos_prof}/{} evict={}",
+                "AMPLLM_PROFILE batch_m={verify_m} steps={prof_steps} toks={toks_emitted} ({:.2}tok/step) draft={draft_accepted}/{draft_n}: avg_step={:.2}ms (gpu+ver={:.2}ms acc={acc_ms:.2}ms[{acc_n}] rej={rej_ms:.2}ms[{rej_n}] gpu0={:.2}ms mtp={:.2}ms host={:.2}ms cpu={:.2}ms[cpu0={:.2} cpu1={:.2}] ({:.3}ms/uexp)) total={:.2}ms/tok | vram_hit={hit_pct:.1}% cpu_pairs={:.1}/step pci_fetch={:.1}/step cpu_uniq={:.1}/step | promo={gpu_promos_prof}/{} evict={} d2h_evict={}",
                 toks_emitted as f64 / prof_steps as f64,
                 decode_s * 1000.0 / prof_steps as f64,
                 (g1_ns as f64) / 1e6 / prof_steps as f64,
@@ -1693,6 +1730,7 @@ impl Glm5Engine {
                 (uniq_exp as f64) / prof_steps as f64,
                 self.state.expert_cache.promotions_total,
                 self.state.expert_cache.evictions_total,
+                self.state.expert_cache.d2h_evictions_total,
             );
         }
         if let Some(ref mut pp) = self.state.phase_prof {
@@ -1763,7 +1801,10 @@ impl Glm5Engine {
                     next_tok,
                     false,
                 )?;
-                self.state.expert_cache.decay_all(0.992);
+                {
+                            let decay = self.state.expert_cache.heat_decay;
+                            self.state.expert_cache.decay_all(decay);
+                        }
                 {
                     let db0 = &mut self.state.doorbell.db0.as_mut_slice()[0];
                     let _ = self.state.expert_cache.sync_promos_and_refill_dev(

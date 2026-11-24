@@ -41,10 +41,19 @@ fn argmax_id(logits: &[f32]) -> u32 {
     best_id as u32
 }
 
-/// Build normalized sparse top-p probability distribution `[(token_id, prob)]` sorted descending by prob.
-pub fn build_top_p_probs(logits: &[f32], params: &SamplingParams) -> Vec<(u32, f32)> {
+fn build_top_p_probs_inner(
+    logits: &[f32],
+    id_map: Option<(usize, &[i32])>,
+    params: &SamplingParams,
+) -> Vec<(u32, f32)> {
+    let map_id = |i: usize| -> u32 {
+        match id_map {
+            Some((n_lead, extra_ids)) if i >= n_lead => extra_ids[i - n_lead] as u32,
+            _ => i as u32,
+        }
+    };
     if params.temperature <= 0.0 {
-        return vec![(argmax_id(logits), 1.0)];
+        return vec![(map_id(argmax_id(logits) as usize), 1.0)];
     }
 
     let temp = params.temperature.max(1e-5);
@@ -67,12 +76,12 @@ pub fn build_top_p_probs(logits: &[f32], params: &SamplingParams) -> Vec<(u32, f
             sum += p as f64;
             if v > cut_keep {
                 kept_mass += p as f64;
-                probs.push((i as u32, p));
+                probs.push((map_id(i), p));
             }
         }
     }
     if sum <= 0.0 {
-        return vec![(0, 1.0)];
+        return vec![(map_id(0), 1.0)];
     }
     let need_full = params.top_p <= 0.0
         || params.top_p >= 1.0
@@ -82,12 +91,12 @@ pub fn build_top_p_probs(logits: &[f32], params: &SamplingParams) -> Vec<(u32, f
         probs.clear();
         for (i, &v) in logits.iter().enumerate() {
             if v > cut_sum {
-                probs.push((i as u32, ((v - max_l) * inv_t).exp()));
+                probs.push((map_id(i), ((v - max_l) * inv_t).exp()));
             }
         }
     }
     if probs.is_empty() {
-        return vec![(0, 1.0)];
+        return vec![(map_id(0), 1.0)];
     }
 
     probs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
@@ -116,6 +125,23 @@ pub fn build_top_p_probs(logits: &[f32], params: &SamplingParams) -> Vec<(u32, f
         }
     }
     probs
+}
+
+/// Build normalized sparse top-p probability distribution `[(token_id, prob)]` sorted descending by prob.
+pub fn build_top_p_probs(logits: &[f32], params: &SamplingParams) -> Vec<(u32, f32)> {
+    build_top_p_probs_inner(logits, None, params)
+}
+
+/// Build normalized sparse top-p probability distribution for compacted draft-vocab logits
+/// (`[0..n_lead)` followed by `extra_ids`).
+pub fn build_top_p_probs_mapped(
+    logits: &[f32],
+    n_lead: usize,
+    extra_ids: &[i32],
+    params: &SamplingParams,
+) -> Vec<(u32, f32)> {
+    debug_assert_eq!(logits.len(), n_lead + extra_ids.len());
+    build_top_p_probs_inner(logits, Some((n_lead, extra_ids)), params)
 }
 
 /// Sample one token from a normalized probability distribution `[(token_id, prob)]`.
@@ -244,5 +270,24 @@ mod tests {
             * 0.5;
         assert!(tv < 0.015, "Leviathan TV distance too large: {tv} (accepted {accepted}/{n_trials})");
         assert!(accepted > n_trials * 7 / 10, "unexpected low accept: {accepted}/{n_trials}");
+    }
+
+    #[test]
+    fn test_build_top_p_probs_mapped_matches_full() {
+        let full = vec![1.5f32, -100.0, 2.3, 0.4, -100.0, 2.1, -100.0, 1.9];
+        let compacted = vec![1.5f32, -100.0, 2.3, 2.1, 1.9];
+        let extra = [5i32, 7];
+        let params = SamplingParams {
+            temperature: 0.6,
+            top_p: 0.95,
+            ..Default::default()
+        };
+        let p_full = build_top_p_probs(&full, &params);
+        let p_map = build_top_p_probs_mapped(&compacted, 3, &extra, &params);
+        assert_eq!(p_full.len(), p_map.len());
+        for (a, b) in p_full.iter().zip(p_map.iter()) {
+            assert_eq!(a.0, b.0);
+            assert!((a.1 - b.1).abs() < 1e-6);
+        }
     }
 }
